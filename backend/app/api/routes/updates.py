@@ -863,21 +863,12 @@ async def apply_update(
             "is_ha_addon": True,
             "is_docker": True,
             "message": (
-                "Bambuddy is running as a Home Assistant addon. "
+                "PrintHive is running as a Home Assistant addon. "
                 "Updates are managed by the Home Assistant Supervisor "
-                "(Settings → Add-ons → Bambuddy → Update)."
+                "(Settings → Add-ons → PrintHive → Update)."
             ),
         }
-    if _is_docker_environment():
-        return {
-            "success": False,
-            "is_docker": True,
-            "message": (
-                "Docker installations cannot be updated in-app. "
-                "Please update via Docker Compose: "
-                "git pull && docker compose build --pull && docker compose up -d"
-            ),
-        }
+
     if _is_windows_installer_install():
         # The installer layout has no ``.git`` and no bundled ``git.exe`` —
         # the git-fetch path would fail. Frontend swaps the "Update now"
