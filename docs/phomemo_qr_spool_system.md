@@ -6,32 +6,44 @@
 
 This document outlines the complete implementation design for extending **PrintBuddy (Server)** and **BuddyDash (Android App)** to support:
 1. **Direct Phomemo Bluetooth Thermal Label Printing** for 30mm circular stickers directly from BuddyDash (without using the vendor Phomemo app).
-2. **Unified QR-to-NFC Translation Pipeline** on the PrintBuddy server, allowing inexpensive thermal QR stickers to act as drop-in replacements for NFC tags.
-3. **Comprehensive Multi-Brand NFC/RFID Spool Ecosystem Support** (OpenSpool, Prusament NFC, Anycubic RFID, and Bambu Lab RFID).
+2. **Automated Spool Tare & Remaining Weight Calculation** referencing PrintBuddy's 90+ catalog empty spool weights and FilamentColors.xyz APIs.
+3. **Bluetooth Connection Sprites & Animations** in BuddyDash for device searching, connecting, and disconnecting states.
+4. **Unified QR-to-NFC Translation Pipeline** on the PrintBuddy server, allowing inexpensive thermal QR stickers to act as drop-in replacements for NFC tags.
+5. **Comprehensive Multi-Brand NFC/RFID Spool Ecosystem Support** (OpenSpool, Prusament NFC, Anycubic RFID, and Bambu Lab RFID).
 
 ---
 
 ## Part 1: Complete End-to-End User Experience (UX) Guide
 
-### Scenario 1: Adding a New Spool & Printing a 30mm Thermal QR Label
+### Scenario 1: Adding a Used Spool, Auto-Calculating Weight & Printing 30mm QR Label
 
 ```
-[ Step 1: Open BuddyDash ] -> [ Step 2: Add Spool ] -> [ Step 3: 1-Tap Bluetooth Print ] -> [ Step 4: Stick Label ]
+[ Step 1: Add Spool ] -> [ Step 2: Auto Tare & Scale Weight ] -> [ Step 3: Animated Bluetooth Connect ] -> [ Step 4: Stick Label ]
 ```
 
 1. **Step 1 — Open Spool Inventory in BuddyDash**:
    - Open BuddyDash on your Android phone. Tap **Inventory** -> **+ Add New Spool**.
-2. **Step 2 — Enter Filament Details**:
-   - Select Brand (e.g., *Sunlu*), Material (*PLA*), Color (*Galaxy Black*, pick live color swatch), and Spool Weight (*1000g*).
+2. **Step 2 — Select Brand & Material (Automated Catalog Lookup)**:
+   - Select Brand (e.g., *Sunlu*) and Spool Type (*PLA - 1kg Plastic Spool*).
+   - **Automated Catalog Lookup**: BuddyDash queries PrintBuddy's built-in catalog defaults:
+     - **Auto-Fills Empty Spool Tare Weight**: `117g`
+     - **Auto-Fills Recommended Temps**: `210°C / 60°C`
+     - **Auto-Fills Hex Color Swatch**: `#1A1A1A` (Galaxy Black) via FilamentColors.xyz catalog.
+3. **Step 3 — Scale Weight Calculation (For Partially Used Spools)**:
+   - Put your spool on a digital kitchen scale and enter the gross weight (e.g., `617g`).
+   - BuddyDash automatically calculates:
+     $$\text{Remaining Filament} = \text{Gross Weight (617g)} - \text{Spool Tare (117g)} = \mathbf{500g}$$
    - Tap **Save Spool to PrintHive**.
-3. **Step 3 — Instant Print Dialog**:
-   - BuddyDash immediately presents a **"Print 30mm Label"** dialog showing a live graphic preview of your 30mm round sticker (QR code + brand, color swatch, and 210°C/60°C temp badges).
+4. **Step 4 — Animated Bluetooth Printer Connection**:
+   - BuddyDash pops up the **"Print 30mm Thermal Label"** modal with a live preview of the 240x240 px sticker.
    - Tap **Print via Bluetooth**.
-4. **Step 4 — Automatic Bluetooth Connection & Printing**:
-   - BuddyDash connects directly to your paired **Phomemo M110 / D30 / M220 / T02** thermal printer over Bluetooth (SPP/BLE).
-   - The printer feeds and prints a crisp 203 DPI 30mm circular label in under 2 seconds. No Phomemo app, no manual layout alignment required!
+   - **Device Connection Animation**:
+     - **Searching**: Pulsing radar wave animation sprite over the Phomemo printer icon.
+     - **Connecting**: Rotating progress spinner sprite with Bluetooth signal beams.
+     - **Connected & Printing**: Green checkmark burst sprite with animated paper feed motion.
+     - **Disconnected**: Subtle fade out indicator returning to ready state.
 5. **Step 5 — Apply Label**:
-   - Peel the 30mm round sticker and place it on the side of your filament spool.
+   - The Phomemo printer outputs the 30mm round sticker in under 2 seconds. Place it on your spool side!
 
 ---
 
@@ -47,7 +59,7 @@ This document outlines the complete implementation design for extending **PrintB
    - Point your phone camera at the 30mm QR sticker on the spool (or tap an NFC tag if using NFC).
 3. **Step 3 — Instant Recognition & 1-Tap Load**:
    - BuddyDash instantly detects the QR code, queries PrintHive, and displays a card:
-     > **Matched Spool**: Sunlu PLA (Galaxy Black) — 850g remaining
+     > **Matched Spool**: Sunlu PLA (Galaxy Black) — 500g remaining
    - Select Target Slot (e.g., *Bambu AMS Slot 2* or *Elegoo External Spool*) and tap **Load Spool**.
 4. **Step 4 — Server Synchronization**:
    - PrintHive updates the database, syncs with **Spoolman**, and sets the filament color/type on the printer.
@@ -109,6 +121,13 @@ PrintBuddy supports all major filament tag standards through a **Unified Transla
 #### [NEW] [StickerRenderer.kt](file:///Users/anuragdeshpande/IdeaProjects/BuddyDash/app/src/main/java/com/chronoswing/buddydash/printer/StickerRenderer.kt)
 - Uses ZXing (`com.google.zxing:core`) to render 240x240 px monochrome bitmaps for 30mm circular thermal labels.
 
+#### [NEW] [BluetoothConnectionAnimations.kt](file:///Users/anuragdeshpande/IdeaProjects/BuddyDash/app/src/main/java/com/chronoswing/buddydash/ui/components/BluetoothConnectionAnimations.kt)
+- Vector sprite & Lottie/Compose canvas animations for printer status transitions:
+  - `SearchingPrinterState`: Pulsing radar wave animation around Bluetooth logo.
+  - `ConnectingPrinterState`: Animated orbital progress spinner with signal indicator.
+  - `PrintingState`: Feed animation showing thermal sticker exiting printer.
+  - `DisconnectedState`: Soft fade out alert.
+
 #### [NEW] [QrCodeScannerActivity.kt](file:///Users/anuragdeshpande/IdeaProjects/BuddyDash/app/src/main/java/com/chronoswing/buddydash/ui/QrCodeScannerActivity.kt)
 - CameraX + Google ML Kit Barcode Scanning integration for instant, offline QR code scanning.
 
@@ -118,5 +137,6 @@ PrintBuddy supports all major filament tag standards through a **Unified Transla
 
 - [ ] Verify ESC/POS raster byte generation for 203 DPI Phomemo printers.
 - [ ] Verify offline CameraX QR scanning speed (< 100ms detection).
-- [ ] Verify seamless server translation of QR URIs to `nfc_tag_scanned` Spoolman events.
+- [ ] Verify automated tare weight subtraction ($617g - 117g = 500g$).
+- [ ] Verify smooth Bluetooth status animation transitions in Jetpack Compose.
 - [ ] Ensure Bluetooth SPP permissions (`BLUETOOTH_CONNECT`, `BLUETOOTH_SCAN`) follow Android 12+ runtime prompt rules.
