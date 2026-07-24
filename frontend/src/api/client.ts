@@ -494,6 +494,8 @@ export interface PrinterStatus {
     bed_target?: number;
     bed_heating?: boolean;  // Actual heater state from MQTT
     nozzle?: number;
+    nozzle_0?: number;
+    nozzle_1?: number;
     nozzle_target?: number;
     nozzle_heating?: boolean;  // Actual heater state from MQTT
     nozzle_2?: number;  // Second nozzle for H2 series (dual nozzle)
@@ -502,6 +504,7 @@ export interface PrinterStatus {
     chamber?: number;
     chamber_target?: number;
     chamber_heating?: boolean;  // Actual heater state from MQTT
+
   } | null;
   cover_url: string | null;
   hms_errors: HMSError[];
