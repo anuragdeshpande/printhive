@@ -1,0 +1,81 @@
+name: PrintHive Release & Docker Publish
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          echo "Commit message: $COMMIT_MSG"
+          if [[ "$COMMIT_MSG" =~ chore\(release\):\ v([0-9]+\.[0-9]+\.[0-9]+) ]] || [[ "$COMMIT_MSG" =~ release:\ v([0-9]+\.[0-9]+\.[0-9]+) ]] || [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            if [[ "$COMMIT_MSG" =~ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+              echo "version=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+            else
+              TAG_NAME="${GITHUB_REF#refs/tags/v}"
+              echo "version=${TAG_NAME}" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          fi
+
+  publish:
+    needs: check-release
+    if: needs.check-release.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/anuragdeshpande/printhive
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ needs.check-release.outputs.version }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.check-release.outputs.version }}
+          name: PrintHive Release v${{ needs.check-release.outputs.version }}
+          generate_release_notes: true

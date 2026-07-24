@@ -8,8 +8,9 @@ from pydantic_settings import BaseSettings
 
 # Application version - single source of truth
 APP_VERSION = "1.2.5"
-GITHUB_REPO = "maziggy/bambuddy"
-BUG_REPORT_RELAY_URL = os.environ.get("BUG_REPORT_RELAY_URL", "https://bambuddy.cool/api/bug-report")
+GITHUB_REPO = "anuragdeshpande/printhive"
+BUG_REPORT_RELAY_URL = os.environ.get("BUG_REPORT_RELAY_URL", "https://api.github.com/repos/anuragdeshpande/printhive/issues")
+
 
 # App directory - where the application is installed (for static files)
 _app_dir = Path(__file__).resolve().parent.parent.parent.parent

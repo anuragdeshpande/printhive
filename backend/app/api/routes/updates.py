@@ -929,3 +929,19 @@ async def get_update_status(
 ):
     """Get current update status."""
     return _update_status
+
+
+@router.post("/restart")
+async def restart_application(
+    background_tasks: BackgroundTasks,
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_UPDATE),
+):
+    """Trigger application self-exit so systemd or Docker container supervisor restarts it."""
+    def _deferred_exit():
+        time.sleep(1.0)
+        logger.info("PrintHive restarting via in-app request...")
+        sys.exit(0)
+
+    background_tasks.add_task(_deferred_exit)
+    return {"success": True, "message": "PrintHive is restarting..."}
+

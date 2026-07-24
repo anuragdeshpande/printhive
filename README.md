@@ -6,45 +6,29 @@
 
 <p align="center">
   <strong>Your printers. No cloud. Your rules.</strong><br>
-  Self-hosted command center and companion for Bambu Lab, Elegoo, and multi-vendor printer farms.
+  Self-hosted command center and companion for Bambu Lab, Elegoo, Flashforge, and multi-vendor printer farms.
 </p>
 
 <p align="center">
-  PrintHive is an open-source fork of the excellent <a href="https://github.com/maziggy/bambuddy">Bambuddy</a> project. We have extended it into a universal, multi-vendor printer companion. Our first integration adds native support for <strong>Elegoo printers</strong> (including the Centauri Carbon series) by integrating the <a href="https://github.com/bjan/pycentauri">pycentauri</a> SDK to manage WebSocket telemetry, direct HTTP file transfers, and webcam streams. Future plans include native support for <strong>Klipper-based machines</strong> and the <strong>Prusa Connect API</strong>.
+  PrintHive is an open-source multi-vendor printer companion forked from <a href="https://github.com/maziggy/bambuddy">Bambuddy</a>. We have extended the core platform into a universal printer command center. Current integrations include native support for <strong>Bambu Lab printers</strong>, <strong>Elegoo printers</strong> (Centauri Carbon series via <a href="https://github.com/bjan/pycentauri">pycentauri</a>), and <strong>Flashforge Creator 5</strong> multi-toolhead machines.
 </p>
 
 <p align="center">
   <a href="#-features">Features</a> •
-  <a href="#-screenshots">Screenshots</a> •
   <a href="#-quick-start">Quick Start</a> •
   <a href="#-contributing">Contributing</a>
 </p>
 
 ---
 
-## 📰 As Featured In
+## ⚡ Multi-Brand Multi-Toolhead Support
 
-> **"Bambuddy is the companion app that Bambu Lab should have built from day one."**
-> — Adam Conway, [XDA-Developers](https://www.xda-developers.com/finally-have-full-control-bambu-lab-printer-ditched-bambu-cloud/)
+PrintHive extends beyond single-vendor setups with native multi-brand printer control:
+- 🚀 **Bambu Lab Fleet**: Full MQTT, AMS/AMS-HT multi-slot management, FTPS, and live chamber camera streaming.
+- 🐊 **Elegoo Centauri Carbon Series**: Native SDCP WebSocket status telemetry, 2MB optimized HTTP chunk file transfers, and web camera integration.
+- ⚡ **Flashforge Creator 5**: Multi-toolhead dual-nozzle (T0/T1) telemetry, REST API dispatch (Port 8898), and direct MJPEG camera streaming.
+- 🏷️ **Phomemo 30mm Bluetooth Thermal QR Printing**: Print 203 DPI 30mm spool labels directly from BuddyDash over Bluetooth with zero vendor app dependency!
 
-<p align="center">
-  <a href="https://hackaday.com/2026/06/13/bambuddy-says-bye-to-bambu-lab-cloud-services/"><img src="https://img.shields.io/badge/Hackaday-Read-F2A724?style=flat-square&labelColor=000000" alt="Hackaday"></a>
-  <a href="https://www.xda-developers.com/finally-have-full-control-bambu-lab-printer-ditched-bambu-cloud/"><img src="https://img.shields.io/badge/XDA--Developers-Read-C8102E?style=flat-square" alt="XDA-Developers"></a>
-  <a href="https://www.howtogeek.com/free-your-bambu-lab-3d-printer-from-the-cloud/"><img src="https://img.shields.io/badge/How--To%20Geek-Read-33A6CA?style=flat-square" alt="How-To Geek"></a>
-  <a href="https://www.fabbaloo.com/news/bambuddy-launches-as-open-source-alternative-to-bambu-labs-cloud"><img src="https://img.shields.io/badge/Fabbaloo-Read-F77B0F?style=flat-square" alt="Fabbaloo"></a>
-  <a href="https://itsfoss.com/news/bambuddy-self-hosted-bambu-lab-alternative/"><img src="https://img.shields.io/badge/It's%20FOSS-Read-00B5AD?style=flat-square" alt="It's FOSS"></a>
-  <a href="https://www.igorslab.de/en/bambuddy-the-silent-alternative-to-the-bamboo-cloud/"><img src="https://img.shields.io/badge/Igor's%20Lab-Read-E10000?style=flat-square" alt="Igor's Lab"></a>
-  <a href="https://3druck.com/en/programs/bambuddy-open-source-tool-replaces-bambu-cloud-for-management-and-automation-of-3d-print-jobs-38153226/"><img src="https://img.shields.io/badge/3Druck-Read-0080C0?style=flat-square" alt="3Druck"></a>
-  <a href="https://www.fastblinker.com/bambuddy-the-open-source-solution-thats-revolutionizing-bambu-lab-3d-printer-management/"><img src="https://img.shields.io/badge/FastBlinker-Read-00B0FF?style=flat-square" alt="FastBlinker"></a>
-</p>
-
-Two leading 3D-printing publications independently concluded that Bambuddy's feature set **already exceeds Bambu's own cloud**:
-
-> *"The features seem to exceed those provided by Bambu Lab's own cloud."* — [Fabbaloo](https://www.fabbaloo.com/news/bambuddy-launches-as-open-source-alternative-to-bambu-labs-cloud)
->
-> *"The list of functions seems so extensive that it even goes beyond what Bambu Lab offers in its own cloud."* — [3Druck.com](https://3druck.com/en/programs/bambuddy-open-source-tool-replaces-bambu-cloud-for-management-and-automation-of-3d-print-jobs-38153226/)
-
-📄 **[See all press coverage →](https://bambuddy.cool/press.html)**
 
 ---
 
