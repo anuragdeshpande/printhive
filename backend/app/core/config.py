@@ -7,8 +7,9 @@ from pydantic import Field
 from pydantic_settings import BaseSettings
 
 # Application version - single source of truth
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.3.1"
 GITHUB_REPO = "anuragdeshpande/printhive"
+
 BUG_REPORT_RELAY_URL = os.environ.get("BUG_REPORT_RELAY_URL", "https://api.github.com/repos/anuragdeshpande/printhive/issues")
 
 
