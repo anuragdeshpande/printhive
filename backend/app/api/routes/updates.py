@@ -883,7 +883,29 @@ async def apply_update(
             ),
         }
 
+    if _is_docker_environment():
+        # Inside Docker, trigger a container exit (sys.exit) or notify Watchtower
+        logger.info("Docker update requested in-app. Triggering process restart for Watchtower/Docker runner...")
+        _update_status = {
+            "status": "installing",
+            "progress": 50,
+            "message": "Docker update requested. Restarting container for Watchtower update...",
+            "error": None,
+        }
+
+        def _perform_docker_update():
+            time.sleep(2.0)
+            sys.exit(0)
+
+        background_tasks.add_task(_perform_docker_update)
+        return {
+            "success": True,
+            "message": "Docker update initiated. Container is restarting...",
+            "status": _update_status,
+        }
+
     # Discover which release tag to install. Resolved here (where we have
+
     # a DB session) and passed into the background task; the BG task can't
     # reuse this request's session since FastAPI closes it on response.
     target_ref = await _discover_target_release(db)
