@@ -65,6 +65,7 @@ jobs:
             type=raw,value=latest
             type=raw,value=${{ needs.check-release.outputs.version }}
 
+
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v5
         with:
