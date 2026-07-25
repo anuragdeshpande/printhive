@@ -850,8 +850,15 @@ class SimpleMQTTServer:
                 # Send CONNACK with auth failure
                 writer.write(bytes([0x20, 0x02, 0x00, 0x05]))  # Not authorized
                 await writer.drain()
-                logger.warning("%sMQTT auth failed for user '%s' (access code mismatch)", self._log_prefix, username)
+                logger.warning(
+                    "%sMQTT auth failed for user '%s' (got password %r, expected %r)",
+                    self._log_prefix,
+                    username,
+                    password,
+                    self.access_code,
+                )
                 return False, 0
+
 
         except (IndexError, ValueError) as e:
             logger.debug("MQTT CONNECT parse error: %s", e)
