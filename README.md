@@ -83,8 +83,11 @@ Printers are no longer hardcoded into disparate services. Instead, each manufact
 ### 2. Multi-IP Virtual Printer Network
 To eliminate port collisions on standard ports (Port 990 for FTPS, Port 8883 for MQTT, Port 3030 for SDCP, Port 1900/2021 for SSDP), each virtual printer binds to its own dedicated static IP interface on the local subnet (`vmbr0`). Your local router/gateway (e.g., Google Fiber `192.168.1.1`) sees them as separate physical devices.
 
-### 3. Containerized OrcaSlicer (KasmVNC)
-OrcaSlicer runs natively inside the stack (`lscr.io/linuxserver/orcaslicer`) with 2GB shared memory (`/dev/shm`), mounted directly to PrintHive's data archive. Slicing presets, custom filament settings, and printer profiles from your desktop are synchronized automatically.
+### 3. Containerized OrcaSlicer (KasmVNC & Drag-and-Drop Auto-Load)
+OrcaSlicer runs natively inside the stack (`lscr.io/linuxserver/orcaslicer`) with 2GB shared memory (`/dev/shm`), dark mode enabled by default, and a built-in drag-and-drop watcher:
+* **Drag-and-Drop File Loading**: Drag any `.3mf`, `.stl`, `.step`, or `.obj` file directly from your desktop into the browser window — the integrated `orca_drop_watcher` daemon detects the upload and opens it on the build plate automatically.
+* **Direct Print Archive Access**: Mounts PrintHive's data archive directly into `/prints/archive` so you can open historical prints with `Ctrl+O` without re-uploading.
+* **Synced Slicing Presets**: Custom filament profiles, printer settings, and process parameters from your desktop are synchronized automatically.
 
 ### 4. Nginx Reverse Proxy & SSL Termination
 * **Automatic Redirect**: Port 80 redirects to HTTPS on Port 443.
