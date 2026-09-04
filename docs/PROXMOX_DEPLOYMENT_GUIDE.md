@@ -307,6 +307,18 @@ http {
             add_header Content-Disposition 'attachment; filename="printhive.crt"';
         }
 
+        location = /cert/printhive.mobileconfig {
+            alias /etc/nginx/certs/printhive.mobileconfig;
+            default_type application/x-apple-aspen-config;
+            add_header Content-Disposition 'attachment; filename="printhive.mobileconfig"';
+        }
+
+        location = /printhive.mobileconfig {
+            alias /etc/nginx/certs/printhive.mobileconfig;
+            default_type application/x-apple-aspen-config;
+            add_header Content-Disposition 'attachment; filename="printhive.mobileconfig"';
+        }
+
         location / {
             return 301 https://$host$request_uri;
         }
@@ -334,6 +346,18 @@ http {
             alias /etc/nginx/certs/printhive.crt;
             default_type application/x-x509-ca-cert;
             add_header Content-Disposition 'attachment; filename="printhive.crt"';
+        }
+
+        location = /cert/printhive.mobileconfig {
+            alias /etc/nginx/certs/printhive.mobileconfig;
+            default_type application/x-apple-aspen-config;
+            add_header Content-Disposition 'attachment; filename="printhive.mobileconfig"';
+        }
+
+        location = /printhive.mobileconfig {
+            alias /etc/nginx/certs/printhive.mobileconfig;
+            default_type application/x-apple-aspen-config;
+            add_header Content-Disposition 'attachment; filename="printhive.mobileconfig"';
         }
 
         location / {
@@ -487,16 +511,16 @@ Because this setup uses a custom self-signed 10-year root certificate, client de
 
 ---
 
-### B. iPhone / iPad (iOS) Setup
+### B. iPhone / iPad (iOS) Setup (1-Tap Profile)
 
 1. Open **Safari** on your iOS device and navigate to:
    ```
-   http://192.168.1.250/cert
+   http://192.168.1.250/cert/printhive.mobileconfig
    ```
 2. Tap **Allow** when prompted to download the configuration profile.
 3. Open **Settings** $\rightarrow$ tap **Profile Downloaded** (near the top) $\rightarrow$ tap **Install** (enter your passcode).
 4. Navigate to **Settings** $\rightarrow$ **General** $\rightarrow$ **About** $\rightarrow$ **Certificate Trust Settings** (at the bottom).
-5. Under *"Enable full trust for root certificates"*, toggle **ON** the switch for `PrintHive HomeLab`.
+5. Under *"Enable full trust for root certificates"*, toggle **ON** the switch for `PrintHive CA`.
 
 ---
 
@@ -523,6 +547,28 @@ sudo sh -c 'echo "192.168.1.250 printhive.local.home orcaslicer.local.home" >> /
 curl -sk http://192.168.1.250/cert | sudo tee /usr/local/share/ca-certificates/printhive.crt >/dev/null
 sudo update-ca-certificates
 ```
+
+---
+
+### E. Installing PrintHive as a Standalone App (PWA)
+
+PrintHive is a fully compatible Progressive Web App (PWA) running in borderless standalone mode without browser chrome or URL address bars:
+
+* **iPhone & iPad (iOS Safari)**:
+  1. Open `https://printhive.local.home/` in Safari.
+  2. Tap the **Share** button (`⎋`) in the bottom navigation bar.
+  3. Scroll down and tap **"Add to Home Screen"** (`⊞`).
+  4. Tap **Add**. PrintHive will now open in a full-screen, native standalone app window.
+* **macOS (Safari Sonoma 14+)**:
+  1. Open `https://printhive.local.home/` in Safari.
+  2. In the menu bar, click **File** $\rightarrow$ **Add to Dock...**.
+  3. PrintHive runs in its own native macOS app window with Dock icon and notification badge support.
+* **Android (Chrome / Edge)**:
+  1. Open `https://printhive.local.home/`.
+  2. Tap the browser menu (`⋮`) $\rightarrow$ **Install app** (or tap the in-app **Install App** button).
+* **Desktop Chrome & Edge (Mac / PC / Linux)**:
+  1. Open `https://printhive.local.home/`.
+  2. Click the **Install** button (`⊕`) on the right side of the address bar, or click the **Install App** button in the PrintHive sidebar.
 
 ---
 

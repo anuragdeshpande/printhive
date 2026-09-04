@@ -1,14 +1,16 @@
 {
-  "id": "/",
+  "id": "/?source=pwa",
   "name": "PrintHive",
   "short_name": "PrintHive",
-  "description": "Monitor and manage your 3D printers with PrintHive",
-  "start_url": "/",
+  "description": "Real-time 3D printer fleet management and monitoring",
+  "start_url": "/?source=pwa",
   "display": "standalone",
-  "background_color": "#1a1a1a",
-  "theme_color": "#f97316",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "background_color": "#18181b",
+  "theme_color": "#18181b",
   "orientation": "any",
   "scope": "/",
+  "prefer_related_applications": false,
   "icons": [
     {
       "src": "/img/favicon-16x16.png",
@@ -19,6 +21,12 @@
       "src": "/img/favicon-32x32.png",
       "sizes": "32x32",
       "type": "image/png"
+    },
+    {
+      "src": "/img/printhive_logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
     },
     {
       "src": "/img/android-chrome-192x192.png",

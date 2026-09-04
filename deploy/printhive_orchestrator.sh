@@ -423,6 +423,65 @@ EOF
         -out /opt/printhive/nginx/certs/printhive.crt"
     log_ok "10-Year SSL SAN Certificate created."
 
+    log_info "Generating Apple .mobileconfig profile for 1-tap iOS certificate trust..."
+    pct_exec "python3 -c '
+with open(\"/opt/printhive/nginx/certs/printhive.crt\", \"r\") as f:
+    cert_pem = f.read()
+
+lines = [line.strip() for line in cert_pem.splitlines() if not line.startswith(\"-----\")]
+cert_base64 = \"\".join(lines)
+
+mobileconfig = f\"\"\"<?xml version=\\\"1.0\\\" encoding=\\\"UTF-8\\\"?>
+<!DOCTYPE plist PUBLIC \\\"-//Apple//DTD PLIST 1.0//EN\\\" \\\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\\\">
+<plist version=\\\"1.0\\\">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadCertificateFileName</key>
+            <string>printhive.crt</string>
+            <key>PayloadContent</key>
+            <data>
+{cert_base64}
+            </data>
+            <key>PayloadDescription</key>
+            <string>PrintHive Root SSL Certificate for trusted local access and PWA support</string>
+            <key>PayloadDisplayName</key>
+            <string>PrintHive CA</string>
+            <key>PayloadIdentifier</key>
+            <string>com.printhive.ssl.rootca</string>
+            <key>PayloadType</key>
+            <string>com.apple.security.root</string>
+            <key>PayloadUUID</key>
+            <string>9E5A8E1D-3C84-4A37-975E-36BD42D3D8FE</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+        </dict>
+    </array>
+    <key>PayloadDescription</key>
+    <string>Configures trust for PrintHive SSL Certificate</string>
+    <key>PayloadDisplayName</key>
+    <string>PrintHive SSL Certificate</string>
+    <key>PayloadIdentifier</key>
+    <string>com.printhive.ssl</string>
+    <key>PayloadOrganization</key>
+    <string>PrintHive HomeLab</string>
+    <key>PayloadRemovalDisallowed</key>
+    <false/>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>5F8C1D6E-7B93-4B82-9538-41C07C75A77B</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>\"\"\"
+
+with open(\"/opt/printhive/nginx/certs/printhive.mobileconfig\", \"w\") as f:
+    f.write(mobileconfig)
+'"
+    log_ok "Apple .mobileconfig profile generated at /opt/printhive/nginx/certs/printhive.mobileconfig"
+
     log_info "Writing Nginx configuration with HTTP->HTTPS redirect and WebSocket support..."
     pve_exec "pct exec ${VMID} -- bash -c 'cat > /opt/printhive/nginx/nginx.conf'" << 'EOF'
 user  nginx;
@@ -462,6 +521,18 @@ http {
             add_header Content-Disposition 'attachment; filename="printhive.crt"';
         }
 
+        location = /cert/printhive.mobileconfig {
+            alias /etc/nginx/certs/printhive.mobileconfig;
+            default_type application/x-apple-aspen-config;
+            add_header Content-Disposition 'attachment; filename="printhive.mobileconfig"';
+        }
+
+        location = /printhive.mobileconfig {
+            alias /etc/nginx/certs/printhive.mobileconfig;
+            default_type application/x-apple-aspen-config;
+            add_header Content-Disposition 'attachment; filename="printhive.mobileconfig"';
+        }
+
         location / {
             return 301 https://$host$request_uri;
         }
@@ -488,6 +559,18 @@ http {
             alias /etc/nginx/certs/printhive.crt;
             default_type application/x-x509-ca-cert;
             add_header Content-Disposition 'attachment; filename="printhive.crt"';
+        }
+
+        location = /cert/printhive.mobileconfig {
+            alias /etc/nginx/certs/printhive.mobileconfig;
+            default_type application/x-apple-aspen-config;
+            add_header Content-Disposition 'attachment; filename="printhive.mobileconfig"';
+        }
+
+        location = /printhive.mobileconfig {
+            alias /etc/nginx/certs/printhive.mobileconfig;
+            default_type application/x-apple-aspen-config;
+            add_header Content-Disposition 'attachment; filename="printhive.mobileconfig"';
         }
 
         location / {

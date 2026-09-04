@@ -1,6 +1,6 @@
-// Bambuddy Service Worker
-const CACHE_NAME = 'bambuddy-v30';
-const STATIC_CACHE = 'bambuddy-static-v29';
+// PrintHive Service Worker
+const CACHE_NAME = 'printhive-v32';
+const STATIC_CACHE = 'printhive-static-v31';
 
 // Static assets to cache on install
 const STATIC_ASSETS = [
@@ -12,8 +12,8 @@ const STATIC_ASSETS = [
   '/img/android-chrome-192x192.png',
   '/img/android-chrome-512x512.png',
   '/img/apple-touch-icon.png',
-  '/img/bambuddy_logo_dark.png',
-  // Self-hosted Inter font (#1460) - cached so the UI renders offline.
+  '/img/printhive_logo.png',
+  '/img/printhive_logo.svg',
   '/fonts/inter-latin.woff2',
   '/fonts/inter-latin-ext.woff2',
 ];

@@ -116,6 +116,12 @@ OrcaSlicer runs natively inside the stack (`lscr.io/linuxserver/orcaslicer`) wit
 * **Automated Spool Tare Subtraction**: Integrates a pre-loaded catalog of 90+ empty spool weights for precision filament estimation.
 * **Backend QR-to-NFC Translation**: Bridges thermal labels directly to digital filament inventories.
 
+### 📱 Progressive Web App (PWA) & Standalone Window Mode
+* **Fully Compliant PWA**: Launch PrintHive on iOS, Android, macOS, and Windows without browser navigation bars or traditional browser windows.
+* **Seamless Dark UI Chrome**: Theme colors (`#18181b`) blend directly into native window titlebars and mobile status bars.
+* **Offline App Shell & Service Worker**: Pre-caches assets, icons, and self-hosted fonts for instant load and offline resilience.
+* **Built-In Install & Trust Assistant**: In-app modal and one-tap Apple configuration profile (`printhive.mobileconfig`) for effortless setup.
+
 ---
 
 ## 🛠️ Deployment Orchestrator (`deploy/printhive_orchestrator.sh`)
@@ -191,33 +197,40 @@ docker run -d \
 
 ---
 
-## 🛡️ Client Setup & Trusted HTTPS
+## 🛡️ Client Setup, Trusted HTTPS & PWA Installation
 
-Because PrintHive creates a private, self-hosted root certificate covering your LAN and Tailscale domain, client devices must install root trust once to eliminate browser "Not Secure" warnings:
+Modern browsers require a **trusted HTTPS connection** before enabling Progressive Web App (PWA) installation and Service Workers. PrintHive provides a 1-step client installer and native mobile configuration profiles:
 
-### 1. Add Domain to `/etc/hosts` (Mac / Linux)
+### 1. Fast Automated Client Setup (Mac & Linux)
+Run the automated helper script on your client laptop/desktop:
 ```bash
-sudo sh -c 'echo "192.168.1.250 printhive.local.home orcaslicer.local.home" >> /etc/hosts'
+chmod +x deploy/install_cert.sh
+./deploy/install_cert.sh
+```
+*Or single-line direct trust on macOS:*
+```bash
+curl -k -sSL https://printhive.local.home/cert | sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain -
 ```
 
-### 2. Install Root Certificate
+### 2. Apple iOS / iPadOS (1-Tap Profile Installation)
+1. Open **Safari** on your iPhone/iPad and navigate to:
+   ```
+   http://192.168.1.250/cert/printhive.mobileconfig
+   ```
+2. Tap **Allow** when prompted to download the configuration profile.
+3. Open iOS **Settings** $\rightarrow$ Tap **Profile Downloaded** at the top $\rightarrow$ Tap **Install**.
+4. Go to **Settings** $\rightarrow$ **General** $\rightarrow$ **About** $\rightarrow$ **Certificate Trust Settings** and toggle **PrintHive Root CA** to **ON**.
+5. Open `https://printhive.local.home/` in Safari, tap the **Share** button (`⎋`), and select **"Add to Home Screen"** (`⊞`). PrintHive will launch full-screen as a standalone native app!
 
-* **macOS (Automated)**:
-  ```bash
-  ./deploy/printhive_orchestrator.sh --install-cert
-  ```
-* **iPhone / iPad (iOS)**:
-  1. Open Safari and navigate to `http://192.168.1.250/cert`.
-  2. Tap **Allow** to download profile $\rightarrow$ **Settings** $\rightarrow$ **Profile Downloaded** $\rightarrow$ **Install**.
-  3. Go to **Settings** $\rightarrow$ **General** $\rightarrow$ **About** $\rightarrow$ **Certificate Trust Settings** and toggle full trust **ON**.
-* **Android / Pixel**:
-  1. Download certificate from `http://192.168.1.250/cert`.
-  2. Go to **Settings** $\rightarrow$ **Security & Privacy** $\rightarrow$ **Encryption & Credentials** $\rightarrow$ **Install a Certificate** $\rightarrow$ **CA Certificate**.
-* **Linux Client**:
-  ```bash
-  curl -sk http://192.168.1.250/cert | sudo tee /usr/local/share/ca-certificates/printhive.crt >/dev/null
-  sudo update-ca-certificates
-  ```
+### 3. macOS Safari (Sonoma 14+)
+1. Open `https://printhive.local.home/` in Safari.
+2. In the top menu bar, click **File** $\rightarrow$ **Add to Dock...**.
+3. PrintHive will run as a standalone Mac application directly from your Dock and Launchpad.
+
+### 4. Chrome / Edge (Desktop & Android)
+1. Navigate to `https://printhive.local.home/`.
+2. Click the **Install PrintHive** icon in the address bar (`⊕`) or tap the in-app **Install App** button in the sidebar.
+3. On Android: tap Chrome menu (`⋮`) $\rightarrow$ **Install app**.
 
 ---
 

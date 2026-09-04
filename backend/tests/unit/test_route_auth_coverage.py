@@ -114,8 +114,21 @@ _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/manifest.json"),
         ("GET", "/sw-register.js"),
         ("GET", "/sw.js"),
+        ("GET", "/cert"),
+        ("GET", "/printhive.crt"),
+        ("GET", "/cert/printhive.mobileconfig"),
+        ("GET", "/printhive.mobileconfig"),
         ("GET", "/gcode-viewer/"),
         ("GET", "/gcode-viewer/{file_path:path}"),
+        # ---- Virtual Printer & Slicer compatibility routes ----
+        ("POST", "/api/v1/virtual-printers/api/upload"),
+        ("POST", "/api/v1/virtual-printers/upload"),
+        ("GET", "/system/info"),
+        ("GET", "/upload"),
+        ("GET", "/uploadFile/upload"),
+        ("POST", "/api/upload"),
+        ("POST", "/upload"),
+        ("POST", "/uploadFile/upload"),
         # SPA catch-all — serves index.html for client-side routing. No backend data path.
         ("GET", "/{full_path:path}"),
         # ---- WebSocket routes ----

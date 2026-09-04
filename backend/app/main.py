@@ -7502,6 +7502,47 @@ async def serve_sw_register():
     return {"error": "sw-register.js not found"}
 
 
+@app.api_route("/cert", methods=["GET", "HEAD"])
+@app.api_route("/printhive.crt", methods=["GET", "HEAD"])
+async def serve_printhive_cert():
+    """Serve PrintHive SSL root certificate for client trust."""
+    from pathlib import Path
+    cert_paths = [
+        Path("/etc/nginx/certs/printhive.crt"),
+        Path("/etc/ssl/printhive/printhive.crt"),
+        Path("/opt/printhive/nginx/certs/printhive.crt"),
+        app_settings.static_dir / "printhive.crt",
+    ]
+    for p in cert_paths:
+        if p.exists():
+            return FileResponse(
+                p,
+                media_type="application/x-x509-ca-cert",
+                headers={"Content-Disposition": 'attachment; filename="printhive.crt"'},
+            )
+    return {"error": "Certificate not found"}
+
+
+@app.api_route("/cert/printhive.mobileconfig", methods=["GET", "HEAD"])
+@app.api_route("/printhive.mobileconfig", methods=["GET", "HEAD"])
+async def serve_printhive_mobileconfig():
+    """Serve PrintHive Apple mobileconfig profile for 1-tap iOS trust."""
+    from pathlib import Path
+    config_paths = [
+        Path("/etc/nginx/certs/printhive.mobileconfig"),
+        Path("/opt/printhive/nginx/certs/printhive.mobileconfig"),
+        app_settings.static_dir / "printhive.mobileconfig",
+    ]
+    for p in config_paths:
+        if p.exists():
+            return FileResponse(
+                p,
+                media_type="application/x-apple-aspen-config",
+                headers={"Content-Disposition": 'attachment; filename="printhive.mobileconfig"'},
+            )
+    return {"error": "Mobileconfig profile not found"}
+
+
 # ── GCode viewer static files ────────────────────────────────────────────────
 # Served via explicit routes so ordering is guaranteed (app.mount() loses
 # to the /{full_path:path} catch-all in some Starlette versions).

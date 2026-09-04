@@ -1,10 +1,11 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, Bell, type LucideIcon } from 'lucide-react';
+import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, Bell, Download, Smartphone, type LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../contexts/ThemeContext';
 import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
 import { InstallAppButton } from './InstallAppButton';
+import { InstallAppModal } from './InstallAppModal';
 import { SwitchbarPopover } from './SwitchbarPopover';
 import { useQuery, useQueries } from '@tanstack/react-query';
 import { api, supportApi, pendingUploadsApi, type Permission } from '../api/client';
@@ -95,6 +96,9 @@ export function Layout() {
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showSwitchbar, setShowSwitchbar] = useState(false);
+  const [showInstallModal, setShowInstallModal] = useState(false);
+  const isStandalone = typeof window !== 'undefined' && 
+    (window.matchMedia('(display-mode: standalone)').matches || (window.navigator as any).standalone);
   const defaultSidebarOrder = useMemo(() => defaultNavItems.map(i => i.id), []);
   const [sidebarOrder, setSidebarOrder] = useState<string[]>(() => getSidebarOrder(defaultNavItems.map(i => i.id)));
   const [hiddenSystemItemIds, setHiddenSystemItemIds] = useState<string[]>(getHiddenSidebarSystemItemIds);
@@ -482,15 +486,27 @@ export function Layout() {
     <div className="flex min-h-screen">
       {/* Compact Header */}
       {isSidebarCompact && (
-        <header className="fixed top-0 left-0 right-0 z-40 h-14 bg-bambu-dark-secondary border-b border-bambu-dark-tertiary flex items-center px-4">
-          <button
-            onClick={() => setMobileDrawerOpen(true)}
-            className="p-2 -ml-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors"
-            aria-label="Open menu"
-          >
-            <Menu className="w-6 h-6 text-white" />
-          </button>
-          <PrintHiveLogo className="h-8 ml-3" showText={true} />
+        <header className="fixed top-0 left-0 right-0 z-40 h-14 bg-bambu-dark-secondary border-b border-bambu-dark-tertiary flex items-center justify-between px-4">
+          <div className="flex items-center">
+            <button
+              onClick={() => setMobileDrawerOpen(true)}
+              className="p-2 -ml-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors"
+              aria-label="Open menu"
+            >
+              <Menu className="w-6 h-6 text-white" />
+            </button>
+            <PrintHiveLogo className="h-8 ml-3" showText={true} />
+          </div>
+          {!isStandalone && (
+            <button
+              onClick={() => setShowInstallModal(true)}
+              className="px-2.5 py-1.5 bg-orange-500/10 hover:bg-orange-500/20 border border-orange-500/30 text-orange-400 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors"
+              title={t('pwa.installApp', { defaultValue: 'Install App' })}
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>{t('pwa.install', { defaultValue: 'Install' })}</span>
+            </button>
+          )}
         </header>
       )}
 
@@ -682,6 +698,16 @@ export function Layout() {
                   </span>
                 )}
                 <InstallAppButton />
+                {!isStandalone && (
+                  <button
+                    onClick={() => setShowInstallModal(true)}
+                    className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                    title={t('pwa.installAppGuide', { defaultValue: 'Install App & SSL Guide' })}
+                    aria-label="Install App Guide"
+                  >
+                    <Smartphone className="w-5 h-5" />
+                  </button>
+                )}
                 <a
                   href="https://github.com/anuragdeshpande/printBuddy"
                   target="_blank"
@@ -787,6 +813,16 @@ export function Layout() {
                 </span>
               )}
               <InstallAppButton />
+              {!isStandalone && (
+                <button
+                  onClick={() => setShowInstallModal(true)}
+                  className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                  title={t('pwa.installAppGuide', { defaultValue: 'Install App & SSL Guide' })}
+                  aria-label="Install App Guide"
+                >
+                  <Smartphone className="w-5 h-5" />
+                </button>
+              )}
               <a
                 href="https://github.com/anuragdeshpande/printBuddy"
                 target="_blank"
@@ -912,6 +948,11 @@ export function Layout() {
         isPending={unknownSpool.isPending}
         onConfirm={unknownSpool.confirm}
         onCancel={unknownSpool.cancel}
+      />
+
+      <InstallAppModal
+        isOpen={showInstallModal}
+        onClose={() => setShowInstallModal(false)}
       />
 
       {/* Keyboard Shortcuts Modal */}
