@@ -393,6 +393,7 @@ default_bits = 2048
 prompt = no
 default_md = sha256
 req_extensions = req_ext
+x509_extensions = req_ext
 distinguished_name = dn
 
 [dn]
@@ -403,6 +404,9 @@ O = PrintHive HomeLab
 CN = ${FQDN}
 
 [req_ext]
+basicConstraints = critical, CA:TRUE
+keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+extendedKeyUsage = serverAuth, clientAuth
 subjectAltName = @alt_names
 
 [alt_names]
