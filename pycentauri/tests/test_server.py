@@ -16,7 +16,7 @@ import pytest
 pytest.importorskip("fastapi")
 
 from pycentauri import server as server_module
-from pycentauri.client import Printer
+from pycentauri.client import Printer, RequestTimeoutError
 from tests.test_client import MAINBOARD, _FakePrinter
 
 
@@ -79,6 +79,56 @@ async def test_openapi_schema_generates(monkeypatch: pytest.MonkeyPatch) -> None
         r = await client.get("/openapi.json")
         assert r.status_code == 200
         assert r.json()["info"]["title"]
+
+
+async def test_upload_endpoint_spools_and_forwards(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _FakePrinter()
+    await server.start()
+    monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+
+    captured: dict[str, Any] = {}
+
+    async def fake_upload(
+        self: Any,
+        local_path: Any,
+        *,
+        remote_name: Any = None,
+        timeout: float = 180.0,
+        progress: Any = None,
+    ) -> Any:
+        captured["content"] = Path(local_path).read_bytes()
+        captured["remote_name"] = remote_name
+        return remote_name
+
+    monkeypatch.setattr("pycentauri.client.Printer.upload_file", fake_upload)
+
+    app = server_module.create_app("127.0.0.1", enable_control=True, mainboard_id=MAINBOARD)
+    async with app.router.lifespan_context(app), await _asgi_client(app) as client:
+        # A malicious filename must be reduced to its basename (no traversal).
+        r = await client.post(
+            "/files/upload",
+            files={"file": ("../../etc/model.gcode", b"G28\nG1 X0 Y0\n", "text/plain")},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        assert body["filename"] == "model.gcode"
+        assert "start_response" not in body
+
+    assert captured["content"] == b"G28\nG1 X0 Y0\n"
+    assert captured["remote_name"] == "model.gcode"
+    await server.stop()
+
+
+async def test_upload_endpoint_404_without_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _FakePrinter()
+    await server.start()
+    monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+    app = server_module.create_app("127.0.0.1", mainboard_id=MAINBOARD)
+    async with app.router.lifespan_context(app), await _asgi_client(app) as client:
+        r = await client.post("/files/upload", files={"file": ("x.gcode", b"G28\n", "text/plain")})
+        assert r.status_code == 404
+    await server.stop()
 
 
 async def test_control_endpoints_404_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -273,6 +323,77 @@ async def test_rtsp_unavailable_when_binaries_missing(
     await fake_ws.stop()
 
 
+async def test_move_endpoint_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _FakePrinter()
+    await server.start()
+    monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+
+    app = server_module.create_app("127.0.0.1", enable_control=True, mainboard_id=MAINBOARD)
+    async with app.router.lifespan_context(app), await _asgi_client(app) as client:
+        r = await client.post("/move", json={"axis": "Z", "distance": 10.0})
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+        r = await client.post("/move", json={"axis": "ALL", "home": True})
+        assert r.status_code == 200
+
+    sent = [m["Data"] for m in server.received if m["Data"]["Cmd"] in (401, 402)]
+    assert len(sent) == 2
+    assert sent[0]["Data"] == {"Axis": "Z", "Step": 10.0}
+    assert sent[1]["Data"] == {"Axis": "XYZ"}
+    await server.stop()
+
+
+async def test_move_endpoint_404_without_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    server = _FakePrinter()
+    await server.start()
+    monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+
+    app = server_module.create_app("127.0.0.1", mainboard_id=MAINBOARD)
+    async with app.router.lifespan_context(app), await _asgi_client(app) as client:
+        r = await client.post("/move", json={"axis": "Z", "distance": 10.0})
+        assert r.status_code == 404
+    await server.stop()
+
+
+async def test_thumbnail_local_gcode_extraction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    server = _FakePrinter()
+    await server.start()
+    monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+
+    png = b"\x89PNG\r\n\x1a\nfake"
+    gcode = tmp_path / "cube.gcode"
+    b64 = __import__("base64").b64encode(png).decode()
+    gcode.write_text(
+        f"; HEADER_BLOCK_START\n; thumbnail begin 220x124 1\n; {b64}\n; thumbnail end\nG28\n"
+    )
+
+    app = server_module.create_app("127.0.0.1", mainboard_id=MAINBOARD)
+    async with app.router.lifespan_context(app), await _asgi_client(app) as client:
+        r = await client.get(f"/print/thumbnail?local_path={gcode}")
+        assert r.status_code == 200
+        assert r.content == png
+        assert r.headers["content-type"] == "image/png"
+
+    await server.stop()
+
+
+async def test_thumbnail_printer_not_implemented_for_cc1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _FakePrinter()
+    await server.start()
+    monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+
+    app = server_module.create_app("127.0.0.1", mainboard_id=MAINBOARD)
+    async with app.router.lifespan_context(app), await _asgi_client(app) as client:
+        r = await client.get("/print/thumbnail?filename=cube.gcode")
+        assert r.status_code == 501
+    await server.stop()
+
+
 async def test_canvas_unsupported_maps_to_501(monkeypatch: pytest.MonkeyPatch) -> None:
     """CC1 has no Canvas: GET /canvas must be 501 (so the UI stops asking),
     reserving 504 for transient timeouts on a real CC2."""
@@ -285,6 +406,75 @@ async def test_canvas_unsupported_maps_to_501(monkeypatch: pytest.MonkeyPatch) -
         r = await client.get("/canvas")
         assert r.status_code == 501
         assert "CC1" in r.json()["detail"]
+    await server.stop()
+
+
+async def test_history_timeout_maps_to_504(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transient RequestTimeoutError on /history must surface as 504, not 501.
+
+    RequestTimeoutError subclasses PrinterError, so a bare `except PrinterError`
+    would mislabel a timeout as 501 — which the web UI reads as "unsupported"
+    and hides the history panel until reload. 504 is retryable; the panel stays.
+    """
+    server = _FakePrinter()
+    await server.start()
+    monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+
+    async def _boom(self: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RequestTimeoutError("no response within 10.0s")
+
+    monkeypatch.setattr("pycentauri.client.Printer.print_history", _boom)
+
+    app = server_module.create_app("127.0.0.1", mainboard_id=MAINBOARD)
+    async with app.router.lifespan_context(app), await _asgi_client(app) as client:
+        r = await client.get("/history")
+        assert r.status_code == 504
+    await server.stop()
+
+
+async def test_delete_rejects_non_list_filenames(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST /files/delete with a bare string must 400, not iterate per-character
+    into a batch of malformed delete Cmds on the crash-prone SDCP channel."""
+    server = _FakePrinter()
+    await server.start()
+    monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+
+    app = server_module.create_app("127.0.0.1", enable_control=True, mainboard_id=MAINBOARD)
+    async with app.router.lifespan_context(app), await _asgi_client(app) as client:
+        r = await client.post("/files/delete", json={"filenames": "cube.gcode"})
+        assert r.status_code == 400
+    await server.stop()
+
+
+def test_update_available_logic() -> None:
+    """PEP 440 comparison; a local dev build ahead of PyPI never nags."""
+    from pycentauri.server import _update_available
+
+    assert _update_available("0.8.0", "0.9.0") is True
+    assert _update_available("0.8.0", "0.8.0") is False
+    assert _update_available("0.9.0", "0.8.0") is False  # dev ahead of PyPI
+    assert _update_available("0.8.0", None) is False
+    assert _update_available("0.8.0", "not-a-version") is False
+
+
+async def test_api_info_reports_update_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    """/api/info always carries latest_version + update_available. With the
+    check off (default) latest is None; once a newer version is known it flips."""
+    server = _FakePrinter()
+    await server.start()
+    monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+
+    app = server_module.create_app("127.0.0.1", mainboard_id=MAINBOARD)
+    async with app.router.lifespan_context(app), await _asgi_client(app) as client:
+        info = (await client.get("/api/info")).json()
+        assert info["latest_version"] is None
+        assert info["update_available"] is False
+
+        # Simulate a completed PyPI check reporting a newer version.
+        app.state.update.latest = "999.0.0"
+        info2 = (await client.get("/api/info")).json()
+        assert info2["latest_version"] == "999.0.0"
+        assert info2["update_available"] is True
     await server.stop()
 
 

@@ -74,13 +74,14 @@ async def upload_elegoo_file_async(
         num_chunks = max(1, (file_size + MAX_CHUNK - 1) // MAX_CHUNK)
         # Use HTTP/1.1 connection pool with keep-alive limits for fast chunk pipelining
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        request_timeout = max(1.0, float(timeout))
+        # Allow at least 180s per chunk for slow Wi-Fi links (~6.9 KB/s for 1 MB is ~150s)
+        request_timeout = max(180.0, float(timeout))
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(
-                connect=min(5.0, request_timeout),
+                connect=15.0,
                 read=request_timeout,
                 write=request_timeout,
-                pool=min(5.0, request_timeout),
+                pool=15.0,
             ),
             limits=limits,
         ) as client:
@@ -3438,28 +3439,35 @@ class PrintScheduler:
 
         try:
             if is_elegoo_model(printer.model):
-                upload_args = (
-                    printer.ip_address,
-                    printer.access_code,
-                    file_path,
-                    remote_filename,
-                )
-                if ftp_retry_enabled:
-                    uploaded = await with_ftp_retry(
-                        upload_elegoo_file_async,
-                        *upload_args,
-                        timeout=ftp_timeout,
-                        progress_callback=progress_bridge,
-                        max_retries=ftp_retry_count,
-                        retry_delay=ftp_retry_delay,
-                        operation_name=f"Elegoo upload to {printer.name}",
+                client = printer_manager.get_client(printer.id)
+                if client and hasattr(client, "pause_telemetry"):
+                    client.pause_telemetry()
+                try:
+                    upload_args = (
+                        printer.ip_address,
+                        printer.access_code,
+                        file_path,
+                        remote_filename,
                     )
-                else:
-                    uploaded = await upload_elegoo_file_async(
-                        *upload_args,
-                        timeout=ftp_timeout,
-                        progress_callback=progress_bridge,
-                    )
+                    if ftp_retry_enabled:
+                        uploaded = await with_ftp_retry(
+                            upload_elegoo_file_async,
+                            *upload_args,
+                            timeout=ftp_timeout,
+                            progress_callback=progress_bridge,
+                            max_retries=ftp_retry_count,
+                            retry_delay=ftp_retry_delay,
+                            operation_name=f"Elegoo upload to {printer.name}",
+                        )
+                    else:
+                        uploaded = await upload_elegoo_file_async(
+                            *upload_args,
+                            timeout=ftp_timeout,
+                            progress_callback=progress_bridge,
+                        )
+                finally:
+                    if client and hasattr(client, "resume_telemetry"):
+                        client.resume_telemetry()
             elif ftp_retry_enabled:
                 uploaded = await with_ftp_retry(
                     upload_file_async,

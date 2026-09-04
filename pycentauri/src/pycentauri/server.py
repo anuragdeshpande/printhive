@@ -15,31 +15,38 @@ Routes (start with ``centauri server``):
 * ``GET /events/status`` — Server-Sent Events stream of status pushes
 * ``GET /discover`` — UDP LAN scan (finds CC1s)
 * ``GET /canvas`` — Canvas multi-filament state (CC2)
+* ``GET /files`` / ``GET /disk`` / ``GET /history`` — file list, disk usage
+  (CC2), and print history (both models)
 * ``GET|POST /api/rtsp*`` — RTSP bridge state/control (with ``--rtsp``)
-* ``POST /print/{start,pause,resume,stop,speed,fan,temperature}`` and
-  ``POST /canvas/refill`` — registered only with ``--enable-control``.
+* ``POST /print/{start,pause,resume,stop,speed,fan,temperature}``,
+  ``POST /canvas/refill``, ``POST /light``, ``POST /files/upload``, and
+  ``POST /files/delete`` — registered only with ``--enable-control``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
+import os
 import subprocess
+import tempfile
+import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib.resources import files as resource_files
+from pathlib import Path
 from typing import Any
 
-import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from pycentauri import __version__
+from pycentauri import __version__, mjpeg_broadcast
 from pycentauri import rtsp as rtsp_module
 from pycentauri.camera import CAMERA_PATH
 from pycentauri.client import (
@@ -86,6 +93,11 @@ class PrinterManager:
         self._supervisor: asyncio.Task[None] | None = None
         self._ready = asyncio.Event()
         self._closing = False
+        # One shared upstream camera connection for all browsers — the
+        # printer's MJPEG server starves under connection churn.
+        self.camera = mjpeg_broadcast.CameraBroadcaster(
+            lambda: f"http://{self.host}:{self.printer.camera_port}{CAMERA_PATH}"
+        )
 
     @property
     def printer(self) -> Printer:
@@ -104,6 +116,8 @@ class PrinterManager:
 
     async def stop(self) -> None:
         self._closing = True
+        with contextlib.suppress(Exception):
+            await self.camera.close()
         if self._supervisor is not None and not self._supervisor.done():
             self._supervisor.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -273,6 +287,24 @@ class RefillBody(BaseModel):
     enabled: bool = Field(..., description="true to enable auto-refill, false to disable.")
 
 
+class LightBody(BaseModel):
+    on: bool = Field(..., description="true to turn the chamber light on, false for off.")
+
+
+class MoveBody(BaseModel):
+    axis: str = Field(..., description="Axis to move: 'X', 'Y', 'Z', or 'ALL' for homing.")
+    distance: float | None = Field(
+        None, description="Distance in mm (required for jog; ignored when homing)."
+    )
+    home: bool = Field(False, description="True to home the axis/axes instead of jogging.")
+    feedrate: int | None = Field(
+        None,
+        ge=60,
+        le=9000,
+        description="Optional feedrate in mm/min (forward compatibility; may be ignored by firmware).",
+    )
+
+
 # --- Dependency helpers -----------------------------------------------------
 
 
@@ -298,6 +330,60 @@ def require_control(manager: PrinterManager = Depends(get_manager)) -> PrinterMa
 # --- App factory ------------------------------------------------------------
 
 
+# --- optional PyPI update check (opt-in via --check-updates) ----------------
+
+PYPI_JSON_URL = "https://pypi.org/pypi/pycentauri/json"
+UPDATE_CHECK_INTERVAL_S = 12 * 3600
+
+
+class _UpdateState:
+    """The latest version seen on PyPI, or ``None`` until a successful check."""
+
+    def __init__(self) -> None:
+        self.latest: str | None = None
+
+
+def _update_available(current: str, latest: str | None) -> bool:
+    """True when ``latest`` (from PyPI) is a newer release than ``current``.
+
+    Uses PEP 440 parsing so a locally-run dev build that's *ahead* of PyPI
+    (e.g. between commit and publish) never shows a spurious "update".
+    """
+    if not latest:
+        return False
+    try:
+        from packaging.version import InvalidVersion, parse
+
+        try:
+            return parse(latest) > parse(current)
+        except InvalidVersion:
+            return False
+    except Exception:
+        return False
+
+
+async def _update_check_loop(state: _UpdateState) -> None:
+    """Poll PyPI for the latest version on an interval. Fail-silent.
+
+    This is the single outbound (non-printer) call in the whole server, and
+    it runs only when ``--check-updates`` is set. It reads a version string
+    and sends nothing about the user or the printer.
+    """
+    import httpx
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(PYPI_JSON_URL, headers={"Accept": "application/json"})
+            if resp.status_code == 200:
+                latest = (resp.json().get("info") or {}).get("version")
+                if isinstance(latest, str):
+                    state.latest = latest
+        except Exception:
+            pass  # network down / PyPI hiccup — try again next interval
+        await asyncio.sleep(UPDATE_CHECK_INTERVAL_S)
+
+
 def create_app(
     host: str,
     *,
@@ -305,6 +391,7 @@ def create_app(
     mainboard_id: str | None = None,
     access_code: str | None = None,
     rtsp_config: rtsp_module.RtspConfig | None = None,
+    check_updates: bool = False,
 ) -> FastAPI:
     """Build the FastAPI app. ``host`` is the printer's IP/hostname.
 
@@ -326,10 +413,20 @@ def create_app(
         )
         app.state.manager = manager
         app.state.rtsp = RtspController(rtsp_config) if rtsp_config is not None else None
+        app.state.update = _UpdateState()
+        update_task: asyncio.Task[None] | None = None
+        if check_updates:
+            update_task = asyncio.create_task(
+                _update_check_loop(app.state.update), name="pycentauri-update-check"
+            )
         await manager.start()
         try:
             yield
         finally:
+            if update_task is not None:
+                update_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await update_task
             if app.state.rtsp is not None:
                 with contextlib.suppress(Exception):
                     await app.state.rtsp.stop()
@@ -415,51 +512,18 @@ def create_app(
     ) -> StreamingResponse:
         """Proxy the printer's MJPEG stream.
 
-        The printer serves ``multipart/x-mixed-replace`` on port 3031.
-        Browsers can render this directly in an ``<img src=...>`` tag. We
-        proxy it through the API server so the UI never needs to know the
-        printer's IP and so cross-origin isn't an issue.
+        The printer serves ``multipart/x-mixed-replace`` (CC1 :3031,
+        CC2 :8080). Browsers render it directly in an ``<img src=…>``.
+        Every browser here attaches to a *single* shared upstream
+        connection (see :class:`CameraBroadcaster`): the printer's camera
+        server starves under connection churn, so no matter how many tabs
+        or reloads hit ``/stream``, the printer only ever sees one.
         """
-        cam_port = manager.printer.camera_port
-        url = f"http://{manager.host}:{cam_port}{CAMERA_PATH}"
-        # read=None is deliberate (MJPEG never ends); connect must be
-        # bounded or a wedged printer hangs every /stream request forever.
-        client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0)
-        )
-
-        # Open the upstream connection *before* building the response so we
-        # can forward its Content-Type verbatim — the multipart boundary
-        # string differs between CC1 and CC2 firmware.
         try:
-            upstream_cm = client.stream("GET", url)
-            upstream = await upstream_cm.__aenter__()
-        except Exception as err:
-            await client.aclose()
-            raise HTTPException(status_code=502, detail=f"webcam unreachable: {err}") from err
-        if upstream.status_code != 200:
-            await upstream_cm.__aexit__(None, None, None)
-            await client.aclose()
-            raise HTTPException(
-                status_code=502, detail=f"webcam returned HTTP {upstream.status_code}"
-            )
-        media_type = upstream.headers.get(
-            "content-type", "multipart/x-mixed-replace; boundary=frame"
-        )
-
-        async def body() -> AsyncIterator[bytes]:
-            try:
-                async for chunk in upstream.aiter_raw():
-                    yield chunk
-            except Exception as err:
-                log.warning("MJPEG proxy error: %r", err)
-            finally:
-                with contextlib.suppress(Exception):
-                    await upstream_cm.__aexit__(None, None, None)
-                with contextlib.suppress(Exception):
-                    await client.aclose()
-
-        return StreamingResponse(body(), media_type=media_type)
+            media_type, chunks = await manager.camera.subscribe()
+        except mjpeg_broadcast.CameraUnavailable as err:
+            raise HTTPException(status_code=502, detail=f"webcam unavailable: {err}") from err
+        return StreamingResponse(chunks, media_type=media_type)
 
     @app.get("/discover", tags=["read"])
     async def discover_endpoint() -> list[dict[str, Any]]:
@@ -512,6 +576,67 @@ def create_app(
         except PrinterError as err:
             raise HTTPException(status_code=501, detail=str(err)) from err
         return cs.raw
+
+    @app.get("/files", tags=["read"])
+    async def list_files(
+        manager: PrinterManager = Depends(get_manager),
+        storage: str = "local",
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """List files on the printer. Query: ?storage=local|u-disk&offset=0&limit=100."""
+        try:
+            return await manager.printer.list_files(storage, offset=offset, limit=limit)
+        except RequestTimeoutError as err:
+            raise HTTPException(status_code=504, detail=str(err)) from err
+        except PrinterError as err:
+            raise HTTPException(status_code=501, detail=str(err)) from err
+
+    @app.post("/files/delete", tags=["control"])
+    async def delete_files(
+        body: dict[str, Any],
+        manager: PrinterManager = Depends(require_control),
+    ) -> dict[str, Any]:
+        """Delete file(s) from the printer. Body: {"filenames": [...], "storage": "local"}."""
+        filenames = body.get("filenames", [])
+        storage = body.get("storage", "local")
+        if not filenames:
+            raise HTTPException(status_code=400, detail="filenames list is required")
+        if not isinstance(filenames, list) or not all(isinstance(f, str) for f in filenames):
+            # Guard the SDCP channel: a bare string would iterate per-character
+            # into a batch of malformed delete Cmds.
+            raise HTTPException(status_code=400, detail="filenames must be a list of strings")
+        try:
+            result = await manager.printer.delete_files(filenames, storage=storage)
+        except RequestTimeoutError as err:
+            raise HTTPException(status_code=504, detail=str(err)) from err
+        except PrinterError as err:
+            raise HTTPException(status_code=502, detail=str(err)) from err
+        return {"ok": True, "deleted": filenames, "response": result}
+
+    @app.get("/disk", tags=["read"])
+    async def disk_info(
+        manager: PrinterManager = Depends(get_manager),
+    ) -> dict[str, Any]:
+        """Disk usage (CC2 only): total_bytes, used_bytes."""
+        try:
+            return await manager.printer.disk_info()
+        except RequestTimeoutError as err:
+            raise HTTPException(status_code=504, detail=str(err)) from err
+        except PrinterError as err:
+            raise HTTPException(status_code=501, detail=str(err)) from err
+
+    @app.get("/history", tags=["read"])
+    async def print_history(
+        manager: PrinterManager = Depends(get_manager),
+    ) -> dict[str, Any]:
+        """Print history."""
+        try:
+            return await manager.printer.print_history()
+        except RequestTimeoutError as err:
+            raise HTTPException(status_code=504, detail=str(err)) from err
+        except PrinterError as err:
+            raise HTTPException(status_code=501, detail=str(err)) from err
 
     # --- RTSP bridge --------------------------------------------------------
 
@@ -575,20 +700,88 @@ def create_app(
     async def api_info(
         manager: PrinterManager = Depends(get_manager),
     ) -> dict[str, Any]:
+        update: _UpdateState | None = getattr(app.state, "update", None)
+        latest = update.latest if update is not None else None
         return {
             "service": "pycentauri",
             "version": __version__,
+            "latest_version": latest,
+            "update_available": _update_available(__version__, latest),
             "printer_host": manager.host,
             "mainboard_id": manager._mainboard_id,
             "connected": manager._printer is not None and not manager._printer._closed,
             "enable_control": manager.enable_control,
         }
 
+    @app.get("/print/thumbnail", tags=["read"])
+    async def print_thumbnail(
+        filename: str | None = None,
+        storage: str = "local",
+        local_path: str | None = None,
+        manager: PrinterManager = Depends(get_manager),
+    ) -> Response:
+        """Return a PNG thumbnail for a print file.
+
+        Priority:
+        1. ``local_path`` query param — extract PNG from a local .gcode or .3mf.
+        2. ``filename`` query param — fetch from the printer (CC2 method 1045).
+
+        Query: ``?filename=benchy.gcode`` or ``?local_path=/path/to/file.gcode``
+        """
+        png: bytes | None = None
+        source = "unknown"
+        if local_path:
+            path = Path(local_path)
+            try:
+                if path.suffix.lower() == ".3mf":
+                    png = _extract_3mf_thumbnail(path)
+                else:
+                    png = _extract_gcode_thumbnail(path)
+            except Exception as err:
+                raise HTTPException(
+                    status_code=400, detail=f"could not extract local thumbnail: {err}"
+                ) from err
+            if png is None:
+                raise HTTPException(status_code=404, detail="no thumbnail found in local file")
+            source = str(path)
+        elif filename:
+            try:
+                png = await manager.printer.get_file_thumbnail(filename, storage=storage)
+            except NotImplementedError as err:
+                raise HTTPException(
+                    status_code=501,
+                    detail="printer thumbnail API is not available for this model",
+                ) from err
+            except RequestTimeoutError as err:
+                raise HTTPException(status_code=504, detail=str(err)) from err
+            except PrinterError as err:
+                raise HTTPException(status_code=502, detail=str(err)) from err
+            source = filename
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="provide either 'filename' (printer file) or 'local_path' (local file)",
+            )
+        return Response(
+            content=png,
+            media_type="image/png",
+            headers={"X-Thumbnail-Source": source},
+        )
+
     # --- Static web UI ------------------------------------------------------
+
+    class _NoCacheStatic(StaticFiles):
+        # The dashboard updates with pycentauri; force browsers to revalidate
+        # (cheap via ETag) so a redeploy is picked up on a normal reload
+        # instead of serving a stale cached app.js.
+        async def get_response(self, path: str, scope: Any) -> Response:
+            resp = await super().get_response(path, scope)
+            resp.headers["Cache-Control"] = "no-cache"
+            return resp
 
     _web_root = resource_files("pycentauri").joinpath("web")
     if _web_root.is_dir():
-        app.mount("/ui", StaticFiles(directory=str(_web_root), html=True), name="ui")
+        app.mount("/ui", _NoCacheStatic(directory=str(_web_root), html=True), name="ui")
 
         @app.get("/", include_in_schema=False)
         async def root_redirect() -> RedirectResponse:
@@ -726,7 +919,120 @@ def create_app(
             raise HTTPException(status_code=502, detail=str(err)) from err
         return {"ok": True, "response": result.inner}
 
+    @app.post("/light", tags=["control"])
+    async def set_light(
+        body: LightBody, manager: PrinterManager = Depends(require_control)
+    ) -> dict[str, Any]:
+        """Turn the chamber light on/off."""
+        try:
+            result = await manager.printer.set_light(body.on)
+        except PrinterError as err:
+            raise HTTPException(status_code=502, detail=str(err)) from err
+        return {"ok": True, "response": result.inner}
+
+    @app.post("/move", tags=["control"])
+    async def move(
+        body: MoveBody, manager: PrinterManager = Depends(require_control)
+    ) -> dict[str, Any]:
+        """Jog an axis or home axes.
+
+        Body examples:
+            {"axis": "Z", "distance": 10.0}
+            {"axis": "ALL", "home": true}
+            {"axis": "Z", "distance": -1.0, "feedrate": 1200}
+        """
+        try:
+            if body.home or body.axis.strip().upper() == "ALL":
+                result = await manager.printer.home(body.axis)
+            else:
+                if body.distance is None:
+                    raise HTTPException(status_code=400, detail="distance is required when jogging")
+                result = await manager.printer.jog_axis(
+                    body.axis, body.distance, feedrate=body.feedrate
+                )
+        except ValueError as err:
+            raise HTTPException(status_code=400, detail=str(err)) from err
+        except RequestTimeoutError as err:
+            raise HTTPException(status_code=504, detail=_sent_unconfirmed("move", err)) from err
+        except PrinterError as err:
+            raise HTTPException(status_code=502, detail=str(err)) from err
+        return {"ok": True, "response": result.inner}
+
+    @app.post("/files/upload", tags=["control"])
+    async def upload_file_route(
+        file: UploadFile = File(..., description="The file to upload (e.g. a .gcode)."),
+        start: bool = Form(False),
+        manager: PrinterManager = Depends(require_control),
+    ) -> dict[str, Any]:
+        # Spool the browser upload to a temp file, then chunk it to the
+        # printer over HTTP. Path(...).name strips any directory components
+        # from the client-supplied filename (no traversal).
+        remote_name = Path(file.filename or "upload.gcode").name
+        fd, tmp_path = tempfile.mkstemp(suffix=f"_{remote_name}")
+        try:
+            with os.fdopen(fd, "wb") as tmp:
+                while chunk := await file.read(1024 * 1024):
+                    tmp.write(chunk)
+            remote = await manager.printer.upload_file(tmp_path, remote_name=remote_name)
+            resp: dict[str, Any] = {"ok": True, "filename": remote}
+            if start:
+                started = await manager.printer.start_print(remote)
+                resp["start_response"] = started.inner
+            return resp
+        except PrinterError as err:
+            raise HTTPException(status_code=502, detail=str(err)) from err
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_path)
+
     return app
+
+
+def _extract_gcode_thumbnail(path: Path) -> bytes | None:
+    """Extract the first embedded base64 PNG thumbnail from a G-code file.
+
+    Slicer thumbnail blocks look like::
+
+        ; thumbnail begin 220x124 1234
+        ; <base64 lines>
+        ; thumbnail end
+    """
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    in_block = False
+    b64_lines: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line.startswith(";"):
+            continue
+        comment = line.lstrip(";").strip()
+        if comment.startswith("thumbnail begin"):
+            in_block = True
+            b64_lines = []
+            continue
+        if comment.startswith("thumbnail end"):
+            break
+        if in_block:
+            b64_lines.append(comment)
+    if not b64_lines:
+        return None
+    try:
+        return base64.b64decode("".join(b64_lines))
+    except Exception as err:
+        raise ValueError("malformed base64 thumbnail in G-code") from err
+
+
+def _extract_3mf_thumbnail(path: Path) -> bytes | None:
+    """Extract ``/3D/Thumbnail/thumbnail.png`` from a 3MF (zip) package."""
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if not zipfile.is_zipfile(path):
+        raise ValueError(f"not a valid 3MF/zip file: {path}")
+    with zipfile.ZipFile(path, "r") as zf:
+        for name in ("3D/Thumbnail/thumbnail.png", "3D/Thumbnail/thumbnail.bmp"):
+            if name in zf.namelist():
+                return zf.read(name)
+    return None
 
 
 def run(
@@ -739,6 +1045,7 @@ def run(
     access_code: str | None = None,
     log_level: str = "info",
     rtsp_config: rtsp_module.RtspConfig | None = None,
+    check_updates: bool = False,
 ) -> None:
     """Launch the server with uvicorn (blocks).
 
@@ -759,6 +1066,7 @@ def run(
         mainboard_id=mainboard_id,
         access_code=access_code,
         rtsp_config=rtsp_config,
+        check_updates=check_updates,
     )
     # Bound graceful shutdown: open SSE/MJPEG streams never close on
     # their own, and without a timeout uvicorn waits for them forever —

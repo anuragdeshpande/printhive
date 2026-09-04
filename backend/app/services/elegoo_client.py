@@ -152,6 +152,16 @@ class ElegooCentauriClient:
         if self.on_state_change:
             self.on_state_change(self.state)
 
+    def pause_telemetry(self):
+        """Pause active telemetry polling (e.g. during file uploads)."""
+        if self._printer:
+            self._printer.pause_watch()
+
+    def resume_telemetry(self):
+        """Resume active telemetry polling after upload finishes."""
+        if self._printer:
+            self._printer.resume_watch()
+
     async def _async_connect(self):
         # Discover the mainboard_id so we can pass it to connect_auto.
         # The CC1 printer only pushes its mainboard ID when idle/active — when
@@ -518,29 +528,124 @@ class ElegooCentauriClient:
             return self._run_async(self._printer.set_fan_speed(chamber=speed_pct))
         return False
 
+    def home_axes(self, axes: str = "XYZ") -> bool:
+        if not self._printer:
+            return False
+        if hasattr(self._printer, "home"):
+            return self._run_async(self._printer.home(axes), action_name="home")
+        if hasattr(self._printer, "_cc2_request"):
+            return self._run_async(self._printer._cc2_request(1026, {}), action_name="home_cc2")
+        return False
+
+    def move_axis(self, axis: str, distance: float, speed: int = 3000) -> bool:
+        if not self._printer:
+            return False
+        axis_clean = axis.strip().upper()
+        if hasattr(self._printer, "jog_axis"):
+            return self._run_async(
+                self._printer.jog_axis(axis_clean, distance),
+                action_name=f"jog_axis({axis_clean}, {distance})",
+            )
+        if hasattr(self._printer, "_cc2_request"):
+            return self._run_async(
+                self._printer._cc2_request(1027, {"axis": axis_clean, "step": float(distance)}),
+                action_name=f"move_axis_cc2({axis_clean})",
+            )
+        return False
+
     def set_chamber_light(self, on: bool) -> bool:
         if not self._printer:
             return False
+        if hasattr(self._printer, "set_light"):
+            return self._run_async(self._printer.set_light(on), action_name="set_light")
         if hasattr(self._printer, "_cc2_request"):
             status = 1 if on else 0
-            return self._run_async(self._printer._cc2_request(1029, {"status": status}))
+            return self._run_async(self._printer._cc2_request(1029, {"status": status}), action_name="set_light_cc2")
         return False
 
     def send_gcode(self, gcode_string: str) -> bool:
+        """Translate common G-code commands to native SDCP commands for Elegoo printers."""
         if not self._printer:
             return False
-        
-        # CC2 supports HOME_AXES (1026) and MOVE_AXES (1027)
-        if hasattr(self._printer, "_cc2_request"):
-            if "G28" in gcode_string:
-                return self._run_async(self._printer._cc2_request(1026, {}))
-            elif "G1" in gcode_string and "Z" in gcode_string:
-                import re
-                match = re.search(r"Z\s*(-?\d+(\.\d+)?)", gcode_string)
+
+        import re
+
+        success = True
+        for line in gcode_string.strip().splitlines():
+            line = line.split(";")[0].strip()  # Strip comments
+            if not line:
+                continue
+
+            line_upper = line.upper()
+
+            # Homing
+            if "G28" in line_upper:
+                axes = "XYZ"
+                if "X" in line_upper and "Y" not in line_upper and "Z" not in line_upper:
+                    axes = "X"
+                elif "Y" in line_upper and "X" not in line_upper and "Z" not in line_upper:
+                    axes = "Y"
+                elif "Z" in line_upper and "X" not in line_upper and "Y" not in line_upper:
+                    axes = "Z"
+                success = self.home_axes(axes) and success
+
+            # Jog / Movement
+            elif line_upper.startswith("G0 ") or line_upper.startswith("G1 "):
+                for axis in ("X", "Y", "Z"):
+                    match = re.search(rf"{axis}\s*(-?\d+(\.\d+)?)", line_upper)
+                    if match:
+                        dist = float(match.group(1))
+                        success = self.move_axis(axis, dist) and success
+
+            # Nozzle Temperature: M104 / M109 S<temp>
+            elif line_upper.startswith("M104") or line_upper.startswith("M109"):
+                match = re.search(r"S\s*(\d+(\.\d+)?)", line_upper)
                 if match:
-                    distance = float(match.group(1))
-                    return self._run_async(self._printer._cc2_request(1027, {"axis": "Z", "step": distance}))
-        return False
+                    temp = float(match.group(1))
+                    success = self.set_nozzle_temperature(temp) and success
+
+            # Bed Temperature: M140 / M190 S<temp>
+            elif line_upper.startswith("M140") or line_upper.startswith("M190"):
+                match = re.search(r"S\s*(\d+(\.\d+)?)", line_upper)
+                if match:
+                    temp = float(match.group(1))
+                    success = self.set_bed_temperature(temp) and success
+
+            # Fan Speed: M106 P<fan> S<speed>
+            elif line_upper.startswith("M106"):
+                p_match = re.search(r"P\s*(\d+)", line_upper)
+                s_match = re.search(r"S\s*(\d+)", line_upper)
+                fan_id = int(p_match.group(1)) if p_match else 1
+                pwm = int(s_match.group(1)) if s_match else 255
+                success = self.set_fan_speed(fan_id, pwm) and success
+
+            # Fan Off: M107
+            elif line_upper.startswith("M107"):
+                p_match = re.search(r"P\s*(\d+)", line_upper)
+                fan_id = int(p_match.group(1)) if p_match else 1
+                success = self.set_fan_speed(fan_id, 0) and success
+
+        return success
+
+    def list_files_sync(self, storage: str = "local", path: str = "/") -> list[dict]:
+        if not self._printer or not hasattr(self._printer, "list_files"):
+            return []
+        res = self._run_async(self._printer.list_files(storage=storage, path=path), action_name="list_files")
+        if isinstance(res, dict):
+            file_list = res.get("file_list") or res.get("FileList") or []
+            return file_list if isinstance(file_list, list) else []
+        return []
+
+    def delete_files_sync(self, file_paths: list[str], storage: str = "local") -> bool:
+        if not self._printer or not hasattr(self._printer, "delete_files"):
+            return False
+        return bool(self._run_async(self._printer.delete_files(file_paths, storage=storage), action_name="delete_files"))
+
+    def get_disk_info_sync(self) -> dict:
+        if not self._printer or not hasattr(self._printer, "disk_info"):
+            return {}
+        res = self._run_async(self._printer.disk_info(), action_name="disk_info")
+        return res if isinstance(res, dict) else {}
 
     def request_status_update(self) -> bool:
         if not self._printer:

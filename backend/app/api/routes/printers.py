@@ -1547,76 +1547,27 @@ async def list_printer_files(
     """List files on the printer at the specified path."""
     printer = await _load_printer_or_404(printer_id)
 
-    from backend.app.services.elegoo_client import is_elegoo_model
-    if is_elegoo_model(printer.model):
-        from backend.app.services.printer_manager import printer_manager
-        client = printer_manager.get_client(printer_id)
-        if not client or not client.connected:
+    from backend.app.services.printer_pipeline.capabilities import PrinterCapability
+    adapter = printer_manager.get_adapter(printer_id)
+    if adapter and adapter.capabilities.has(PrinterCapability.FILE_LIST):
+        if not adapter.is_connected():
             raise HTTPException(503, "Printer is offline or client not connected")
-
-        p = path.lower()
-        files = []
-        
-        if "timelapse" in p or "ips" in p:
-            try:
-                mid = await client._printer.wait_for_mainboard()
-                res_history = await client._printer._request(320, {}, mid)
-                history_ids = res_history.raw.get("Data", {}).get("Data", {}).get("HistoryData", [])
-                if history_ids:
-                    chunk_size = 20
-                    for i in range(0, len(history_ids), chunk_size):
-                        chunk = history_ids[i:i+chunk_size]
-                        res_details = await client._printer._request(321, {"Id": chunk}, mid)
-                        details = res_details.raw.get("Data", {}).get("Data", {}).get("HistoryDetailList", [])
-                        for d in details:
-                            if d.get("TimeLapseVideoStatus") == 1:
-                                video_url = d.get("TimeLapseVideoUrl") or ""
-                                video_name = video_url.split("/")[-1] if "/" in video_url else video_url
-                                if not video_name:
-                                    continue
-                                from datetime import datetime, timezone
-                                end_time = d.get("EndTime", 0)
-                                mtime = datetime.fromtimestamp(end_time, timezone.utc) if end_time else None
-                                
-                                files.append({
-                                    "name": video_name,
-                                    "is_directory": False,
-                                    "size": 0,
-                                    "path": f"/timelapse/{video_name}",
-                                    "mtime": mtime
-                                })
-            except Exception as e:
-                logger.error("Failed to query Elegoo timelapses: %s", e)
-        else:
-            try:
-                mid = await client._printer.wait_for_mainboard()
-                target_url = "/usb" if "usb" in p or "udisk" in p else "/local"
-                res = await client._printer._request(258, {"Url": target_url}, mid)
-                file_list = res.raw.get("Data", {}).get("Data", {}).get("FileList", [])
-                for f in file_list:
-                    name = f.get("name") or ""
-                    if "/" in name:
-                        name = name.split("/")[-1]
-                    
-                    from datetime import datetime, timezone
-                    ctime = f.get("CreateTime", 0)
-                    mtime = datetime.fromtimestamp(ctime, timezone.utc) if ctime else None
-                    
-                    files.append({
-                        "name": name,
-                        "is_directory": False,
-                        "size": f.get("FileSize", 0),
-                        "path": f"{target_url}/{name}",
-                        "mtime": mtime
-                    })
-            except Exception as e:
-                logger.error("Failed to query Elegoo file list: %s", e)
-
+        file_infos = adapter.list_files(path=path)
+        from datetime import datetime, timezone
+        files = [
+            {
+                "name": f.name,
+                "is_directory": False,
+                "size": f.size_bytes,
+                "path": f.path,
+                "mtime": datetime.fromtimestamp(f.modified_timestamp, timezone.utc) if f.modified_timestamp else None,
+            }
+            for f in file_infos
+        ]
         return {
             "path": path,
             "files": files,
         }
-
     files = await list_files_async(printer.ip_address, printer.access_code, path, printer_model=printer.model)
 
     # Add full path to each file
@@ -1638,34 +1589,10 @@ async def download_printer_file(
     """Download a file from the printer."""
     printer = await _load_printer_or_404(printer_id)
 
-    from backend.app.services.elegoo_client import is_elegoo_model
-    if is_elegoo_model(printer.model):
-        p = path.lower()
-        if "timelapse" in p or "ips" in p:
-            filename = path.split("/")[-1]
-            url = f"http://{printer.ip_address}/local/aic_tlp/{filename}"
-        else:
-            clean_path = path.lstrip("/")
-            url = f"http://{printer.ip_address}/{clean_path}"
-
-        import httpx
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as http_client:
-                logger.info("Downloading Elegoo file via HTTP from %s", url)
-                res = await http_client.get(url)
-                if res.status_code == 200:
-                    data = res.content
-                elif res.status_code == 500 and "busy" in res.text.lower():
-                    raise HTTPException(
-                        status_code=503,
-                        detail="The printer storage is currently locked/busy (likely due to an active print). Please stop printing or wait until the print finishes to download files."
-                    )
-                else:
-                    logger.error("Failed to download Elegoo file %s: HTTP %s", url, res.status_code)
-                    data = None
-        except httpx.HTTPError as e:
-            logger.error("HTTP error downloading Elegoo file: %s", e)
-            data = None
+    from backend.app.services.printer_pipeline.capabilities import PrinterCapability
+    adapter = printer_manager.get_adapter(printer_id)
+    if adapter and adapter.capabilities.has(PrinterCapability.FILE_DOWNLOAD):
+        data = adapter.download_file(path)
     else:
         data = await download_file_bytes_async(printer.ip_address, printer.access_code, path, printer_model=printer.model)
         
@@ -2049,6 +1976,13 @@ async def delete_printer_file(
     """Delete a file from the printer."""
     printer = await _load_printer_or_404(printer_id)
 
+    from backend.app.services.printer_pipeline.capabilities import PrinterCapability
+    adapter = printer_manager.get_adapter(printer_id)
+    if adapter and adapter.capabilities.has(PrinterCapability.FILE_DELETE):
+        if not adapter.delete_file(path):
+            raise HTTPException(500, f"Failed to delete file: {path}")
+        return {"status": "deleted", "path": path}
+
     from backend.app.services.bambu_ftp import DeleteResult
 
     result = await delete_file_async(printer.ip_address, printer.access_code, path, printer_model=printer.model)
@@ -2067,6 +2001,17 @@ async def get_printer_storage(
 ):
     """Get storage information from the printer."""
     printer = await _load_printer_or_404(printer_id)
+
+    from backend.app.services.printer_pipeline.capabilities import PrinterCapability
+    adapter = printer_manager.get_adapter(printer_id)
+    if adapter and adapter.capabilities.has(PrinterCapability.STORAGE_LOCAL):
+        info = adapter.get_storage_info()
+        if info:
+            return {
+                "total_bytes": info.total_bytes,
+                "used_bytes": info.used_bytes,
+                "free_bytes": info.free_bytes,
+            }
 
     storage_info = await get_storage_info_async(printer.ip_address, printer.access_code, printer_model=printer.model)
 

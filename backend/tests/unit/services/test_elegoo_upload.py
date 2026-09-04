@@ -63,7 +63,7 @@ async def test_elegoo_upload_returns_false_on_http_error(
 
 
 @pytest.mark.asyncio
-async def test_elegoo_upload_uses_short_connect_timeout(
+async def test_elegoo_upload_timeout_configuration(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     client = _AsyncClient([_Response(200)])
@@ -78,8 +78,8 @@ async def test_elegoo_upload_uses_short_connect_timeout(
     assert await upload_elegoo_file_async("192.0.2.1", "", local_path, "job.gcode") is True
 
     timeout = client.kwargs["timeout"]
-    assert timeout.connect == 5.0
-    assert timeout.read == 30.0
+    assert timeout.connect == 15.0
+    assert timeout.read == 180.0
 
 
 @pytest.mark.asyncio

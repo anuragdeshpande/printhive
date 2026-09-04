@@ -14,7 +14,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator
 from types import TracebackType
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import websockets
 from typing_extensions import Self
@@ -23,6 +23,11 @@ from websockets.asyncio.client import ClientConnection, connect
 from pycentauri import camera as camera_module
 from pycentauri import sdcp
 from pycentauri.models import Attributes, CanvasStatus, Status
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from pycentauri import upload as upload_module
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +95,15 @@ class Printer:
         self._pending: dict[str, asyncio.Future[sdcp.ParsedMessage]] = {}
         self._status_queues: set[asyncio.Queue[Status]] = set()
         self._closed = False
+        self._watch_paused = False
+
+    def pause_watch(self) -> None:
+        """Temporarily suspend active Cmd 0 status polling (e.g. during file upload)."""
+        self._watch_paused = True
+
+    def resume_watch(self) -> None:
+        """Resume active Cmd 0 status polling after suspension."""
+        self._watch_paused = False
 
     @classmethod
     async def connect(
@@ -122,6 +136,11 @@ class Printer:
             timeout=connect_timeout,
         )
         self._reader = asyncio.create_task(self._read_loop(), name=f"pycentauri-reader-{host}")
+        if not self._mainboard_id:
+            try:
+                await self._request(sdcp.Cmd.GET_PRINTER_STATUS, None, None, timeout=min(connect_timeout, 3.0))
+            except Exception as err:
+                log.debug("initial unaddressed Cmd 0 probe failed on %s: %s", host, err)
         return self
 
     # --- context-manager sugar -------------------------------------------------
@@ -153,19 +172,23 @@ class Printer:
         """Block until the printer has reported its mainboard ID.
 
         Returns immediately if ``mainboard_id=`` was passed to
-        :meth:`connect`. Otherwise waits for the first ``Attributes`` push
-        from the printer. The printer only pushes Attributes spontaneously
-        in idle/active states — when paused or errored it stays silent until
-        asked, so callers that run in those states should pass ``mainboard_id``
-        explicitly (e.g. from a prior :func:`pycentauri.discover`).
+        :meth:`connect`. Otherwise queries the printer or waits for an
+        Attributes push.
         """
+        if self._mainboard_id:
+            return self._mainboard_id
+        if self._ws is not None and not self._closed:
+            try:
+                await self._request(sdcp.Cmd.GET_PRINTER_STATUS, None, None, timeout=min(timeout, 3.0))
+            except Exception as err:
+                log.debug("unaddressed Cmd 0 probe for mainboard ID timed out or failed on %s: %s", self.host, err)
         if self._mainboard_id:
             return self._mainboard_id
         try:
             await asyncio.wait_for(self._mainboard_event.wait(), timeout=timeout)
         except asyncio.TimeoutError as err:
             raise PrinterError(
-                "printer did not push Attributes within "
+                "printer did not respond to Cmd 0 probe or push Attributes within "
                 f"{timeout}s. Pass mainboard_id=... to Printer.connect() "
                 "(discover() provides one) — the firmware does not push "
                 "Attributes while paused or errored."
@@ -222,21 +245,64 @@ class Printer:
         interval = self.push_period_ms / 1000.0
         queue: asyncio.Queue[Status] = asyncio.Queue(maxsize=64)
         self._status_queues.add(queue)
+        missed_polls = 0
         try:
             if self._latest_status is not None:
                 queue.put_nowait(self._latest_status)
             while not self._closed:
+                if self._watch_paused:
+                    try:
+                        # While paused, still yield any status pushed spontaneously, but do not poll
+                        status = await asyncio.wait_for(queue.get(), timeout=1.0)
+                        missed_polls = 0
+                        yield status
+                    except asyncio.TimeoutError:
+                        continue
                 try:
-                    yield await asyncio.wait_for(queue.get(), timeout=interval + 2)
+                    status = await asyncio.wait_for(queue.get(), timeout=interval + 2)
+                    missed_polls = 0
+                    yield status
                 except asyncio.TimeoutError:
+                    if self._watch_paused:
+                        continue
                     mid = await self.wait_for_mainboard()
-                    await self._request(sdcp.Cmd.GET_PRINTER_STATUS, None, mid, timeout=8.0)
+                    try:
+                        await self._request(sdcp.Cmd.GET_PRINTER_STATUS, None, mid, timeout=8.0)
+                        missed_polls = 0
+                    except (RequestTimeoutError, asyncio.TimeoutError):
+                        missed_polls += 1
+                        log.debug("Cmd 0 status poll timed out on %s (%d/3)", self.host, missed_polls)
+                        if missed_polls >= 3:
+                            raise PrinterError(f"3 consecutive status polls timed out on {self.host}")
+                    except PrinterError:
+                        raise
         finally:
             self._status_queues.discard(queue)
 
     async def snapshot(self, *, timeout: float = camera_module.DEFAULT_TIMEOUT) -> bytes:
         """Return a single JPEG frame from the built-in webcam."""
         return await camera_module.snapshot(self.host, timeout=timeout)
+
+    async def upload_file(
+        self,
+        local_path: str | Path,
+        *,
+        remote_name: str | None = None,
+        timeout: float = 180.0,
+        progress: upload_module.ProgressCallback | None = None,
+    ) -> str:
+        """Upload a file to the printer's internal storage (chunked HTTP).
+
+        Returns the name the file has on the printer, which is what
+        :meth:`start_print` expects. Transfers over HTTP, independent of
+        the SDCP control channel. Requires ``enable_control=True``.
+        """
+        from pycentauri import upload as upload_module
+
+        self._require_control("upload_file")
+        return await upload_module.upload_cc1(
+            self.host, local_path, remote_name=remote_name, timeout=timeout, progress=progress
+        )
 
     async def canvas_status(self) -> CanvasStatus:
         """Return the Canvas multi-filament system state.
@@ -260,6 +326,118 @@ class Printer:
             "requires a Centauri Carbon 2 (MQTT method 2004)."
         )
 
+    async def list_files(
+        self,
+        storage: str = "local",
+        *,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """List files on the printer (SDCP Cmd 258 GET_FILE_LIST).
+
+        Verified live on V0.3.0-o 2026-07-15 with ``{"Url": "/local"}`` —
+        the same request the printer's own web UI sends. (The SDK has this
+        Cmd commented out, but the firmware handles it; earlier "258
+        crashes the daemon" observations were from sending it with an
+        empty payload.) Returns the same shape as the CC2 so every surface
+        works unchanged: ``{"file_list": [{filename, size, layer,
+        create_time}], "total"}``. ``offset``/``limit`` are applied
+        client-side (the firmware returns the whole list).
+        """
+        url = "/udisk" if storage in ("u-disk", "udisk", "usb") else "/local"
+        mid = await self.wait_for_mainboard()
+        resp = await self._request(sdcp.Cmd.GET_FILE_LIST, {"Url": url}, mid)
+        inner = resp.inner or {}
+        raw = (inner.get("Data") or {}).get("FileList", [])
+        files = [
+            {
+                # The firmware returns full paths ("/local/x.gcode"); strip
+                # to the bare name that start_print expects.
+                "filename": f.get("name", "").rsplit("/", 1)[-1],
+                "size": f.get("FileSize"),
+                "layer": f.get("TotalLayers"),
+                "create_time": f.get("CreateTime"),
+            }
+            for f in raw
+        ]
+        window = files[offset : offset + limit] if limit else files[offset:]
+        return {"file_list": window, "total": len(files), "offset": offset}
+
+    async def delete_files(
+        self,
+        filenames: list[str],
+        storage: str = "local",
+    ) -> dict[str, Any]:
+        """Delete files from the printer (SDCP Cmd 259 DELETE_FILE_LIST).
+
+        Verified live on V0.3.0-o 2026-07-15: the firmware wants a
+        ``{"FileList": ["/local/<name>", ...]}`` payload of *full* paths
+        (``{"Url": path}`` is silently ignored). ``filenames`` may be bare
+        names (as returned by :meth:`list_files`) or already-rooted paths;
+        both are normalised to ``/local`` / ``/udisk``.
+
+        Refuses to delete the file that's currently printing — the motion
+        stack streams gcode from disk, so pulling the active file mid-print
+        can abort or corrupt the running job.
+        """
+        self._require_control("delete_files")
+        active = (await self.status()).active_filename
+        if active:
+            active_base = active.rsplit("/", 1)[-1]
+            for n in filenames:
+                if n.rsplit("/", 1)[-1] == active_base:
+                    raise PrinterError(
+                        f"refusing to delete {active_base!r}: it is currently printing"
+                    )
+        prefix = "/udisk" if storage in ("u-disk", "udisk", "usb") else "/local"
+        paths = [n if n.startswith("/") else f"{prefix}/{n}" for n in filenames]
+        mid = await self.wait_for_mainboard()
+        resp = await self._request(sdcp.Cmd.DELETE_FILE_LIST, {"FileList": paths}, mid)
+        ack = ((resp.inner or {}).get("Data") or {}).get("Ack")
+        return {"deleted": paths, "ack": ack}
+
+    async def disk_info(self) -> dict[str, Any]:
+        """Return disk usage. CC2 only (MQTT method 1048)."""
+        raise PrinterError(
+            "Disk info is not available on the CC1 over SDCP. It currently "
+            "requires a Centauri Carbon 2 (MQTT method 1048)."
+        )
+
+    async def print_history(self) -> dict[str, Any]:
+        """Return print history (SDCP Cmd 320 + 321).
+
+        Two-step on the CC1: Cmd 320 returns the task-id list (newest-first),
+        Cmd 321 ``{"Id": [...]}`` returns per-task detail. Normalised to the
+        CC2's ``{"history_task_list": [...]}`` shape (oldest-first, like
+        method 1036) so the CLI and web history panel work unchanged.
+        Returns the whole list — newest-first display is the CLI/UI's job.
+        Verified live on V0.3.0-o 2026-07-15.
+        """
+        mid = await self.wait_for_mainboard()
+        id_resp = await self._request(sdcp.Cmd.GET_PRINT_HISTORY, {}, mid)
+        ids = ((id_resp.inner or {}).get("Data") or {}).get("HistoryData", [])
+        if not ids:
+            return {"history_task_list": []}
+        det = await self._request(sdcp.Cmd.GET_PRINT_HISTORY_DETAIL, {"Id": ids}, mid)
+        details = ((det.inner or {}).get("Data") or {}).get("HistoryDetailList", [])
+        # CC1 TaskStatus: 1 = completed, 3 = stopped (done < total layers).
+        # Map 3 → the CC2's 2 ("cancelled") so the shared {1: completed,
+        # 2: cancelled} status map covers both printers. (Confirmed
+        # 2026-07-15 by correlating status against AlreadyPrintLayer.)
+        tasks = [
+            {
+                "task_name": d.get("TaskName", "").rsplit("/", 1)[-1],
+                "task_status": 2 if d.get("TaskStatus") == 3 else d.get("TaskStatus"),
+                "begin_time": d.get("BeginTime"),
+                "end_time": d.get("EndTime"),
+            }
+            for d in details
+        ]
+        # Cmd 320 lists newest-first; return oldest-first to match the CC2 so
+        # the CLI/web (which reverse for display) show newest-first.
+        tasks.reverse()
+        return {"history_task_list": tasks}
+
     # --- control actions (gated) ----------------------------------------------
 
     async def start_print(
@@ -275,12 +453,16 @@ class Printer:
 
         ``storage`` is either ``"local"`` (internal storage) or ``"udisk"``
         (USB). The filename is the name used by the printer, not a local path.
-        ``platform_type`` sets ``PrintPlatformType`` (0=Textured PEI/Default,
-        1=Smooth PEI/High Temp, 2=Engineering, 3=Cool Plate, 4=SuperTack).
         """
         self._require_control("start_print")
+        target_filename = filename
+        if storage == "local" and not target_filename.startswith("/local/"):
+            target_filename = f"/local/{target_filename}"
+        elif storage == "udisk" and not target_filename.startswith("/usb/"):
+            target_filename = f"/usb/{target_filename}"
+
         data: dict[str, Any] = {
-            "Filename": filename,
+            "Filename": target_filename,
             "StartLayer": 0,
             "Calibration_switch": 1 if auto_leveling else 0,
             "PrintPlatformType": platform_type,
@@ -424,6 +606,85 @@ class Printer:
         mid = await self.wait_for_mainboard()
         return await self._request(sdcp.Cmd.CHANGE_PRINT_PARAMS, targets, mid)
 
+    async def jog_axis(
+        self,
+        axis: str,
+        distance: float,
+        *,
+        feedrate: int | None = None,
+    ) -> sdcp.ParsedMessage:
+        """Jog a single axis by a relative distance (mm).
+
+        ``axis`` is one of ``X``, ``Y``, ``Z`` (case-insensitive).
+        ``distance`` may be positive or negative. The printer must already
+        be homed on the requested axis; otherwise the firmware typically
+        responds with ``Ack=1``.
+
+        CC1 sends SDCP Cmd 401 with ``{"Axis": "X", "Step": 10.0}``.
+        An optional ``feedrate`` (mm/min) is accepted for forward
+        compatibility but is not part of the confirmed CC1 payload.
+        """
+        self._require_control("jog_axis")
+        axis_clean = axis.strip().upper()
+        if axis_clean not in ("X", "Y", "Z"):
+            raise ValueError(f"axis must be X, Y, or Z; got {axis!r}")
+        data: dict[str, Any] = {"Axis": axis_clean, "Step": float(distance)}
+        if feedrate is not None:
+            data["Feedrate"] = int(feedrate)
+        mid = await self.wait_for_mainboard()
+        return await self._request(sdcp.Cmd.MOVE_AXES, data, mid)
+
+    async def home(self, axes: str = "ALL") -> sdcp.ParsedMessage:
+        """Home one or more axes.
+
+        ``axes`` may be ``"X"``, ``"Y"``, ``"Z"``, ``"XY"``, ``"XYZ"``,
+        or ``"ALL"`` (default). CC1 sends SDCP Cmd 402 with
+        ``{"Axis": "XYZ"}``.
+        """
+        self._require_control("home")
+        axes_clean = axes.strip().upper()
+        if axes_clean == "ALL":
+            axes_clean = "XYZ"
+        if axes_clean not in ("X", "Y", "Z", "XY", "XZ", "YZ", "XYZ"):
+            raise ValueError(f"axes must be one of X, Y, Z, XY, XZ, YZ, XYZ, or ALL; got {axes!r}")
+        mid = await self.wait_for_mainboard()
+        return await self._request(sdcp.Cmd.HOME_AXES, {"Axis": axes_clean}, mid)
+
+    async def get_file_thumbnail(
+        self,
+        filename: str,
+        storage: str = "local",
+    ) -> bytes:
+        """Return the embedded PNG thumbnail for a file on the printer.
+
+        CC1 does not expose a printer-side thumbnail API, so this base
+        implementation always raises :class:`NotImplementedError`. Use a
+        locally cached copy of the G-code/3MF file and extract the
+        thumbnail offline, or connect to a CC2 printer which overrides
+        this method with method 1045.
+        """
+        raise NotImplementedError(
+            "CC1 printers do not expose a file thumbnail API; "
+            "extract thumbnails from a local G-code/3MF copy instead."
+        )
+
+    async def set_light(self, on: bool) -> sdcp.ParsedMessage:
+        """Turn the chamber light on or off.
+
+        Sent as ``Cmd 403`` (CHANGE_PRINT_PARAMS) with
+        ``{"LightStatus": {"SecondLight": 0|1}}`` — verified live on
+        V0.3.0-o 2026-07-14. Cmd 403 is a confirmed-working command, so
+        this is safe mid-print. Current state reads back as
+        ``LightStatus.SecondLight``.
+        """
+        self._require_control("set_light")
+        mid = await self.wait_for_mainboard()
+        return await self._request(
+            sdcp.Cmd.CHANGE_PRINT_PARAMS,
+            {"LightStatus": {"SecondLight": 1 if on else 0}},
+            mid,
+        )
+
     # --- lifecycle -------------------------------------------------------------
 
     async def close(self) -> None:
@@ -465,7 +726,7 @@ class Printer:
         self,
         cmd: int,
         data: dict[str, Any] | None,
-        mainboard_id: str,
+        mainboard_id: str | None = None,
         *,
         timeout: float = DEFAULT_REQUEST_TIMEOUT,
     ) -> sdcp.ParsedMessage:

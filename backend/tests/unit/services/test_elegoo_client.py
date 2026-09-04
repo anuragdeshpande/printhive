@@ -235,3 +235,13 @@ class TestElegooCentauriClient:
             timelapse=False,
             platform_type=1,
         )
+
+    def test_pause_and_resume_telemetry(self, client):
+        mock_printer = MagicMock()
+        client._printer = mock_printer
+
+        client.pause_telemetry()
+        mock_printer.pause_watch.assert_called_once()
+
+        client.resume_telemetry()
+        mock_printer.resume_watch.assert_called_once()

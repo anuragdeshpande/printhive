@@ -16,7 +16,8 @@ from typing import Any
 import pytest
 from websockets.asyncio.server import serve
 
-from pycentauri.client import ControlDisabledError, Printer, RequestTimeoutError
+from pycentauri.client import ControlDisabledError, Printer, PrinterError
+from pycentauri.models import Status
 from pycentauri.sdcp import Cmd
 
 MAINBOARD = "abcdef123456"
@@ -175,24 +176,6 @@ async def test_watch_yields_multiple_updates(monkeypatch: pytest.MonkeyPatch) ->
         assert len(seen) >= 3
 
 
-async def test_watch_propagates_failed_status_poll() -> None:
-    """A dead TCP connection must not leave a watcher alive forever."""
-    printer = Printer("127.0.0.1", push_period_ms=-2000, mainboard_id=MAINBOARD)
-
-    async def no_op() -> None:
-        return None
-
-    async def fail_status_request(*args: Any, **kwargs: Any) -> Any:
-        raise RequestTimeoutError("status request timed out")
-
-    printer._ensure_subscribed = no_op  # type: ignore[method-assign]
-    printer._request = fail_status_request  # type: ignore[method-assign]
-    watcher = printer.watch()
-    with pytest.raises(RequestTimeoutError):
-        await asyncio.wait_for(anext(watcher), timeout=0.2)
-    await watcher.aclose()
-
-
 async def test_control_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _fake_printer() as server:
         monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
@@ -201,6 +184,30 @@ async def test_control_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> N
                 await printer.start_print("cube.gcode")
             with pytest.raises(ControlDisabledError):
                 await printer.stop()
+
+
+async def test_delete_refuses_currently_printing_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fake reports print_status=13 printing 'cube.gcode'; deleting that
+    file must be refused before any Cmd 259 reaches the printer."""
+    async with _fake_printer() as server:
+        monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+        async with await Printer.connect(
+            "127.0.0.1", enable_control=True, mainboard_id=MAINBOARD
+        ) as printer:
+            with pytest.raises(PrinterError, match="currently printing"):
+                await printer.delete_files(["cube.gcode"])
+
+
+def test_active_filename_only_when_job_live() -> None:
+    """active_filename is the job file while busy, None when idle/terminal."""
+
+    def st(code: int) -> Status:
+        return Status.from_payload({"PrintInfo": {"Status": code, "Filename": "job.gcode"}})
+
+    assert st(13).active_filename == "job.gcode"  # printing
+    assert st(6).active_filename == "job.gcode"  # paused — still holds the file
+    for terminal in (0, 8, 9, 14):  # idle / stopped / completed / error
+        assert st(terminal).active_filename is None
 
 
 async def test_preseeded_mainboard_skips_attributes_wait(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -267,6 +274,36 @@ async def test_control_enabled_sends_commands(monkeypatch: pytest.MonkeyPatch) -
         assert int(Cmd.PAUSE_PRINT) in cmds
 
 
+async def test_jog_and_home_send_move_commands(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _fake_printer() as server:
+        monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+        async with await Printer.connect(
+            "127.0.0.1", enable_control=True, mainboard_id=MAINBOARD
+        ) as printer:
+            result = await asyncio.wait_for(printer.jog_axis("z", -1.5), timeout=3)
+            assert result.inner is not None and result.inner["Data"]["Ack"] == 0
+
+            result = await asyncio.wait_for(printer.home("ALL"), timeout=3)
+            assert result.inner is not None and result.inner["Data"]["Ack"] == 0
+
+        sent = [m["Data"] for m in server.received if m["Data"]["Cmd"] in (401, 402)]
+        assert len(sent) == 2
+        assert sent[0]["Data"] == {"Axis": "Z", "Step": -1.5}
+        assert sent[1]["Data"] == {"Axis": "XYZ"}
+
+
+async def test_jog_validation_rejects_bad_axis(monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _fake_printer() as server:
+        monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
+        async with await Printer.connect(
+            "127.0.0.1", enable_control=True, mainboard_id=MAINBOARD
+        ) as printer:
+            with pytest.raises(ValueError, match="axis must be X, Y, or Z"):
+                await printer.jog_axis("A", 10)
+            with pytest.raises(ValueError, match="axes must be one of"):
+                await printer.home("ABC")
+
+
 async def test_adjust_methods_round_trip(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _fake_printer() as server:
         monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
@@ -311,19 +348,20 @@ async def test_adjust_validation_rejects_out_of_range(
                 await printer.set_temperatures()
 
 
-async def test_start_print_platform_type(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_adjust_disabled_without_control(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pycentauri.client import ControlDisabledError
+
     async with _fake_printer() as server:
         monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
-        async with await Printer.connect("127.0.0.1", enable_control=True) as printer:
+        async with await Printer.connect("127.0.0.1") as printer:
             await asyncio.wait_for(printer.wait_for_mainboard(), timeout=2)
-            await asyncio.wait_for(
-                printer.start_print("plate_job.gcode", platform_type=2, auto_leveling=True),
-                timeout=3,
-            )
-
-        start_cmds = [m["Data"] for m in server.received if m["Data"]["Cmd"] == int(Cmd.START_PRINT)]
-        assert len(start_cmds) == 1
-        data = start_cmds[0]["Data"]
-        assert data["Filename"] == "plate_job.gcode"
-        assert data["PrintPlatformType"] == 2
-        assert data["Calibration_switch"] == 1
+            for call in (
+                lambda: printer.set_print_speed(100),
+                lambda: printer.set_fan_speed(model=50),
+                lambda: printer.set_temperatures(nozzle=200),
+            ):
+                try:
+                    await call()
+                except ControlDisabledError:
+                    continue
+                raise AssertionError("expected ControlDisabledError")

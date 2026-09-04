@@ -394,6 +394,7 @@ class TestPrinterManager:
             use_ams=True,
             nozzle_offset_cali="auto",
             nozzle_mapping=None,
+            bed_type=None,
         )
         assert result is True
 

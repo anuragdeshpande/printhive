@@ -36,8 +36,15 @@ class Cmd(IntEnum):
     STOP_PRINT = 130
     RESUME_PRINT = 131
     GET_FILE_LIST = 258
+    DELETE_FILE_LIST = 259
     GET_PRINT_HISTORY = 320
+    GET_PRINT_HISTORY_DETAIL = 321
     GET_CANVAS_STATUS = 324
+    # Axis control (Cmd 401 / 402) are documented in the Elegoo SDK's
+    # COMMAND_MAPPING_TABLE but commented out and not yet confirmed on CC1
+    # firmware. Use with caution and only when the printer is idle.
+    MOVE_AXES = 401
+    HOME_AXES = 402
     # Cmd 403 is overloaded — the payload shape dispatches:
     # {"PrintSpeedPct": N}                            → set print speed
     # {"TargetFanSpeed": {"ModelFan":...,"BoxFan":...,"AuxiliaryFan":...}}
@@ -77,7 +84,7 @@ def _new_envelope_id() -> str:
 def build_request(
     cmd: int,
     data: dict[str, Any] | None,
-    mainboard_id: str,
+    mainboard_id: str | None = None,
     *,
     request_id: str | None = None,
     envelope_id: str | None = None,
@@ -101,24 +108,24 @@ def build_request(
           "Topic": "sdcp/request/<mainboard id>"
         }
 
-    ``MainboardID`` is mandatory for every outbound command; obtain it from a
-    discovery response or from the first ``Attributes`` push the printer sends
-    after the WebSocket connects.
+    If ``mainboard_id`` is omitted or empty, an unaddressed packet (matching
+    OrcaSlicer's initial probe format) is created without a topic.
     """
-    if not mainboard_id:
-        raise ValueError("mainboard_id is required for SDCP commands")
-    return {
-        "Id": envelope_id or mainboard_id,
-        "Data": {
-            "Cmd": int(cmd),
-            "Data": data or {},
-            "RequestID": request_id or _new_request_id(),
-            "MainboardID": mainboard_id,
-            "TimeStamp": _now_ms(),
-            "From": 1,
-        },
-        "Topic": f"sdcp/request/{mainboard_id}",
+    req_data: dict[str, Any] = {
+        "Cmd": int(cmd),
+        "Data": data or {},
+        "RequestID": request_id or _new_request_id(),
+        "MainboardID": mainboard_id or "",
+        "TimeStamp": _now_ms(),
+        "From": 1,
     }
+    packet: dict[str, Any] = {
+        "Id": envelope_id or (mainboard_id or ""),
+        "Data": req_data,
+    }
+    if mainboard_id:
+        packet["Topic"] = f"sdcp/request/{mainboard_id}"
+    return packet
 
 
 def build_subscribe(mainboard_id: str, period_ms: int = DEFAULT_PUSH_PERIOD_MS) -> dict[str, Any]:

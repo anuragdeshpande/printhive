@@ -15,6 +15,7 @@
       <span class="logo">pycentauri</span>
       <span class="rail-sep">/</span>
       <span class="rail-ver">v<span id="version">-</span></span>
+      <a id="update-badge" class="rail-update" hidden target="_blank" rel="noopener"></a>
     </div>
     <div class="rail-group">
       <span class="rail-dim" id="printer-name">-</span>
@@ -59,6 +60,11 @@
           <button id="btn-resume" class="btn ok" type="button">Resume</button>
           <button id="btn-stop" class="btn danger" type="button">Stop</button>
         </div>
+        <div class="upload-row">
+          <input type="file" id="upload-file" class="upload-input">
+          <label class="upload-chk"><input type="checkbox" id="upload-start"> start</label>
+          <button id="btn-upload" class="btn" type="button">Upload</button>
+        </div>
         <div class="ctrl-msg" id="ctrl-msg" aria-live="polite"></div>
       </div>
 
@@ -79,6 +85,12 @@
           <button class="btn adj-mode" data-mode="ludicrous" type="button">
             <small>160%</small> Ludicrous
           </button>
+        </div>
+
+        <div class="adj-sub">Light</div>
+        <div class="adj-modes light-row" id="adj-light">
+          <button class="btn adj-light" data-light="on" type="button">On</button>
+          <button class="btn adj-light" data-light="off" type="button">Off</button>
         </div>
 
         <div class="adj-sub">Fans</div>
@@ -212,6 +224,30 @@
           <button class="btn canvas-refresh" id="canvas-refresh" type="button" title="Refresh Canvas status">Refresh</button>
         </div>
         <div class="ctrl-msg" id="canvas-msg" aria-live="polite"></div>
+      </div>
+
+      <div class="panel files-panel" id="files-panel" hidden>
+        <header class="panel-header">
+          <span class="panel-tag">Files</span>
+          <span class="files-disk" id="files-disk"></span>
+        </header>
+        <div class="files-list" id="files-list"></div>
+        <div class="files-meta">
+          <select class="files-storage" id="files-storage" title="Storage">
+            <option value="local">Local</option>
+            <option value="u-disk">USB</option>
+          </select>
+          <button class="btn files-refresh" id="files-refresh" type="button">Refresh</button>
+        </div>
+        <div class="ctrl-msg" id="files-msg" aria-live="polite"></div>
+      </div>
+
+      <div class="panel history-panel" id="history-panel" hidden>
+        <header class="panel-header"><span class="panel-tag">Print history</span></header>
+        <div class="files-list" id="history-list"></div>
+        <div class="files-meta">
+          <button class="btn files-refresh" id="history-refresh" type="button">Refresh</button>
+        </div>
       </div>
     </aside>
   </main>

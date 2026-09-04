@@ -320,6 +320,7 @@ class PrinterManager:
 
     def __init__(self):
         self._clients: dict[int, BambuMQTTClient] = {}
+        self._adapters: dict[int, Any] = {}
         self._models: dict[int, str | None] = {}  # Cache printer models for feature detection
         self._printer_info: dict[int, PrinterInfo] = {}  # Cache printer name/serial for callbacks
         self._on_print_start: Callable[[int, dict], None] | None = None
@@ -659,6 +660,7 @@ class PrinterManager:
         if printer_id in self._clients:
             self._clients[printer_id].disconnect(timeout=timeout)
             del self._clients[printer_id]
+        self._adapters.pop(printer_id, None)
         self._models.pop(printer_id, None)  # Clean up model cache
         self._printer_info.pop(printer_id, None)  # Clean up printer info cache
 
@@ -807,6 +809,152 @@ class PrinterManager:
         """Stop the current print on a connected printer."""
         if printer_id in self._clients:
             return self._clients[printer_id].stop_print()
+        return False
+
+    def get_adapter(self, printer_id: int):
+        """Get or lazily create the unified feature adapter for a printer."""
+        if printer_id in self._adapters:
+            return self._adapters[printer_id]
+        if printer_id in self._clients:
+            client = self._clients[printer_id]
+            model = self._models.get(printer_id)
+            pinfo = self._printer_info.get(printer_id)
+            serial = pinfo.serial_number if pinfo else getattr(client, "serial_number", "")
+            ip = getattr(client, "ip_address", "")
+            access_code = getattr(client, "access_code", "")
+
+            from backend.app.services.elegoo_client import is_elegoo_model
+            from backend.app.services.printer_pipeline.adapters.bambu_adapter import BambuAdapter
+            from backend.app.services.printer_pipeline.adapters.elegoo_adapter import ElegooAdapter
+
+            if is_elegoo_model(model):
+                adapter = ElegooAdapter(
+                    printer_id=printer_id,
+                    ip_address=ip,
+                    serial_number=serial,
+                    access_code=access_code,
+                    model=model,
+                    client=client,
+                )
+            else:
+                adapter = BambuAdapter(
+                    printer_id=printer_id,
+                    ip_address=ip,
+                    serial_number=serial,
+                    access_code=access_code,
+                    model=model,
+                    mqtt_client=client,
+                )
+            self._adapters[printer_id] = adapter
+            return adapter
+        return None
+
+    def pause_print(self, printer_id: int) -> bool:
+        """Pause the current print job on a printer."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.pause_print()
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "pause_print"):
+            return self._clients[printer_id].pause_print()
+        return False
+
+    def resume_print(self, printer_id: int) -> bool:
+        """Resume a paused print job on a printer."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.resume_print()
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "resume_print"):
+            return self._clients[printer_id].resume_print()
+        return False
+
+    def home_axes(self, printer_id: int, axes: str = "XYZ") -> bool:
+        """Home toolhead/bed axes on a printer."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.home(axes)
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "home_axes"):
+            return self._clients[printer_id].home_axes(axes)
+        return False
+
+    def move_axis(self, printer_id: int, axis: str, distance: float, speed: int = 3000) -> bool:
+        """Jog toolhead/bed axis by a relative distance."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            from backend.app.services.printer_pipeline.models import JogRequest
+            return adapter.jog(JogRequest(axis=axis, distance_mm=distance, speed_mm_min=speed))
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "move_axis"):
+            return self._clients[printer_id].move_axis(axis, distance, speed)
+        return False
+
+    def set_bed_temp(self, printer_id: int, temp: int) -> bool:
+        """Set the bed temperature."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.set_bed_temperature(temp)
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "set_bed_temperature"):
+            return self._clients[printer_id].set_bed_temperature(temp)
+        return False
+
+    def set_nozzle_temp(self, printer_id: int, temp: int, nozzle: int = 0) -> bool:
+        """Set the nozzle temperature."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.set_nozzle_temperature(temp, nozzle=nozzle)
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "set_nozzle_temperature"):
+            return self._clients[printer_id].set_nozzle_temperature(temp, nozzle=nozzle)
+        return False
+
+    def set_chamber_temp(self, printer_id: int, temp: int) -> bool:
+        """Set the chamber temperature."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.set_chamber_temperature(temp)
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "set_chamber_temperature"):
+            return self._clients[printer_id].set_chamber_temperature(temp)
+        return False
+
+    def set_fan_speed(self, printer_id: int, fan_id: int, speed: int) -> bool:
+        """Set fan speed (1=part, 2=aux, 3=chamber)."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.set_fan_speed(fan_id, speed)
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "set_fan_speed"):
+            return self._clients[printer_id].set_fan_speed(fan_id, speed)
+        return False
+
+    def set_chamber_light(self, printer_id: int, on: bool) -> bool:
+        """Set chamber illumination state."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.set_chamber_light(on)
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "set_chamber_light"):
+            return self._clients[printer_id].set_chamber_light(on)
+        return False
+
+    def set_speed_level(self, printer_id: int, mode: int) -> bool:
+        """Set speed level (1=silent, 2=standard, 3=sport, 4=ludicrous)."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.set_print_speed(mode)
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "set_print_speed"):
+            return self._clients[printer_id].set_print_speed(mode)
+        return False
+
+    def send_gcode(self, printer_id: int, gcode: str) -> bool:
+        """Send G-code or translated commands to printer."""
+        adapter = self.get_adapter(printer_id)
+        if adapter:
+            return adapter.send_gcode(gcode)
+        if printer_id in self._clients and hasattr(self._clients[printer_id], "send_gcode"):
+            return self._clients[printer_id].send_gcode(gcode)
+        return False
+
+    def clear_hms_errors(self, printer_id: int) -> bool:
+        """Clear active errors / HMS codes."""
+        if printer_id in self._clients:
+            client = self._clients[printer_id]
+            if hasattr(client, "clear_hms_errors"):
+                return client.clear_hms_errors()
         return False
 
     async def wait_for_cooldown(
@@ -1496,6 +1644,18 @@ def printer_state_to_dict(
         _printer_info = printer_manager.get_printer(printer_id)
         if _printer_info is not None:
             result["name"] = _printer_info.name
+        _adapter = printer_manager.get_adapter(printer_id)
+        if _adapter is not None:
+            from backend.app.services.printer_pipeline.capabilities import PrinterCapability
+            result["capabilities"] = [
+                c.name.lower()
+                for c in PrinterCapability
+                if c != PrinterCapability.NONE and _adapter.capabilities.has(c)
+            ]
+        else:
+            result["capabilities"] = []
+    else:
+        result["capabilities"] = []
     if model:
         result["model"] = model
     return result

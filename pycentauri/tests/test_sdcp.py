@@ -42,12 +42,11 @@ def test_build_request_uses_passed_ids():
     assert pkt["Data"]["Data"] == {"Filename": "cube.gcode"}
 
 
-def test_build_request_rejects_empty_mainboard():
-    try:
-        build_request(Cmd.GET_PRINTER_STATUS, None, "")
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError")
+def test_build_request_accepts_empty_mainboard():
+    pkt = build_request(Cmd.GET_PRINTER_STATUS, None, "")
+    assert pkt["Id"] == ""
+    assert pkt["Data"]["MainboardID"] == ""
+    assert "Topic" not in pkt
 
 
 def test_build_subscribe():
