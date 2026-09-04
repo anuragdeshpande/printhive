@@ -343,8 +343,39 @@ PYEOF
     log_info "Staging OrcaSlicer configurations and presets..."
     pct_exec "mkdir -p /opt/orcaslicer/config/.config/OrcaSlicer"
     COPYFILE_DISABLE=1 tar --format ustar --no-mac-metadata --no-xattrs -C "$ORCA_BACKUP_DIR" -cf - . | pve_exec "pct exec ${VMID} -- tar --warning=no-unknown-keyword -C /opt/orcaslicer/config/.config/OrcaSlicer -xf -"
-    pct_exec "mkdir -p /opt/orcaslicer/config/.config/labwc /opt/orcaslicer/config/.config/gtk-3.0 && printf '#!/usr/bin/env bash\nexport GTK_THEME=Adwaita:dark\nexport GTK_APPLICATION_PREFER_DARK_THEME=1\n/opt/orcaslicer/AppRun &\n' > /opt/orcaslicer/config/.config/labwc/autostart && chmod +x /opt/orcaslicer/config/.config/labwc/autostart && printf '[Settings]\ngtk-theme-name = Adwaita-dark\ngtk-application-prefer-dark-theme = 1\n' > /opt/orcaslicer/config/.config/gtk-3.0/settings.ini && sed -i 's/\"dark_color_mode\": \"0\"/\"dark_color_mode\": \"1\"/g' /opt/orcaslicer/config/.config/OrcaSlicer/OrcaSlicer.conf 2>/dev/null || true && find /opt/orcaslicer/config -name '._*' -delete 2>/dev/null || true && chown -R 1000:1000 /opt/orcaslicer"
-    log_ok "OrcaSlicer profiles imported and Dark Mode autostart configured."
+    pve_exec "pct exec ${VMID} -- bash -c 'cat > /opt/orcaslicer/config/.config/orca_drop_watcher.py'" << 'PYEOF'
+#!/usr/bin/env python3
+import os, subprocess, time, sys
+DESKTOP_DIR = "/config/Desktop"
+SUPPORTED_EXTS = (".3mf", ".stl", ".step", ".stp", ".obj")
+def main():
+    os.makedirs(DESKTOP_DIR, exist_ok=True)
+    seen_files = set(os.listdir(DESKTOP_DIR))
+    while True:
+        try:
+            for fname in os.listdir(DESKTOP_DIR):
+                if fname.startswith(".") or fname in seen_files: continue
+                if not any(fname.lower().endswith(ext) for ext in SUPPORTED_EXTS):
+                    seen_files.add(fname); continue
+                fpath = os.path.join(DESKTOP_DIR, fname)
+                last_size, stable = -1, 0
+                while stable < 3:
+                    try: size = os.path.getsize(fpath)
+                    except OSError: size = -1
+                    if size > 0 and size == last_size: stable += 1
+                    else: stable = 0; last_size = size
+                    time.sleep(0.3)
+                seen_files.add(fname)
+                env = os.environ.copy()
+                env.update({"DISPLAY": ":0", "WAYLAND_DISPLAY": "wayland-0", "GTK_THEME": "Adwaita:dark", "DARK_MODE": "true"})
+                subprocess.Popen(["/opt/orcaslicer/bin/orca-slicer", fpath], env=env)
+                print(f"[DropWatcher] Auto-opened: {fname}", flush=True)
+        except Exception as e: print(f"[DropWatcher] Error: {e}", file=sys.stderr, flush=True)
+        time.sleep(1)
+if __name__ == "__main__": main()
+PYEOF
+    pct_exec "mkdir -p /opt/orcaslicer/config/.config/labwc /opt/orcaslicer/config/.config/gtk-3.0 && printf '#!/usr/bin/env bash\nexport GTK_THEME=Adwaita:dark\nexport GTK_APPLICATION_PREFER_DARK_THEME=1\n/lsiopy/bin/python3 /config/.config/orca_drop_watcher.py &\n/opt/orcaslicer/AppRun &\n' > /opt/orcaslicer/config/.config/labwc/autostart && chmod +x /opt/orcaslicer/config/.config/labwc/autostart /opt/orcaslicer/config/.config/orca_drop_watcher.py && printf '[Settings]\ngtk-theme-name = Adwaita-dark\ngtk-application-prefer-dark-theme = 1\n' > /opt/orcaslicer/config/.config/gtk-3.0/settings.ini && sed -i 's/\"dark_color_mode\": \"0\"/\"dark_color_mode\": \"1\"/g' /opt/orcaslicer/config/.config/OrcaSlicer/OrcaSlicer.conf 2>/dev/null || true && find /opt/orcaslicer/config -name '._*' -delete 2>/dev/null || true && chown -R 1000:1000 /opt/orcaslicer"
+    log_ok "OrcaSlicer profiles, Dark Mode, and Drag-and-Drop file watcher configured."
 }
 
 # ------------------------------------------------------------------------------
