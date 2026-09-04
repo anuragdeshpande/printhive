@@ -6,14 +6,14 @@ import { describe, it, expect } from 'vitest';
 import { buildApiKeyQrPayload, API_KEY_QR_VERSION } from '../../utils/apiKeyQr';
 
 describe('buildApiKeyQrPayload', () => {
-  it('uses the bambuddy://config scheme with v first', () => {
+  it('uses the printhive://pair scheme with v first', () => {
     const payload = buildApiKeyQrPayload('https://printer.local', 'bb_abc123');
-    expect(payload.startsWith(`bambuddy://config?v=${API_KEY_QR_VERSION}`)).toBe(true);
+    expect(payload.startsWith(`printhive://pair?v=${API_KEY_QR_VERSION}`)).toBe(true);
   });
 
   it('encodes the url and key parameters', () => {
     const payload = buildApiKeyQrPayload('https://printer.local', 'bb_abc123');
-    expect(payload).toBe('bambuddy://config?v=1&url=https%3A%2F%2Fprinter.local&key=bb_abc123');
+    expect(payload).toBe('printhive://pair?v=1&url=https%3A%2F%2Fprinter.local&key=bb_abc123&name=PrintHive');
   });
 
   it('URL-encodes special characters in both values', () => {

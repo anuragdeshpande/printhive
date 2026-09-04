@@ -4195,6 +4195,7 @@ class BambuMQTTClient:
         use_ams: bool = True,
         nozzle_offset_cali: str = "auto",
         nozzle_mapping: str | None = None,
+        bed_type: str = "auto",
     ):
         """Start a print job on the printer.
 
@@ -4406,7 +4407,7 @@ class BambuMQTTClient:
                     "url": f"ftp://{filename}",
                     "file": filename,
                     "md5": "",
-                    "bed_type": "auto",
+                    "bed_type": bed_type or "auto",
                     "timelapse": timelapse,
                     # bed_leveling stays a JSON bool (true only for "on") and
                     # auto_bed_leveling carries the tri-state int — the exact

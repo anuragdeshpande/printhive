@@ -273,6 +273,7 @@ class VirtualPrinterInstance:
         self._bind: BindServer | None = None
         self._ssdp: VirtualPrinterSSDPServer | None = None
         self._ssdp_proxy: SSDPProxy | None = None
+        self._sdcp = None
         self._tasks: list[asyncio.Task] = []
 
         # Pending timer that re-fires gcode_state=FINISH after a project_file
@@ -873,16 +874,19 @@ class VirtualPrinterInstance:
                         if raw_ams is not None:
                             ams_mapping_json = json.dumps(raw_ams)
 
+                print_data_payload = {
+                    "status": "archived",
+                    "source": "virtual_printer",
+                    "source_ip": source_ip,
+                }
+                if slicer_opts and slicer_opts.get("bed_type"):
+                    print_data_payload["bed_type"] = slicer_opts["bed_type"]
 
                 service = ArchiveService(db)
                 archive = await service.archive_print(
                     printer_id=None,
                     source_file=file_path,
-                    print_data={
-                        "status": "archived",
-                        "source": "virtual_printer",
-                        "source_ip": source_ip,
-                    },
+                    print_data=print_data_payload,
                     prefer_filename_for_name=prefer_filename,
                 )
                 if archive:
@@ -1124,7 +1128,7 @@ class VirtualPrinterInstance:
         return cert_path, key_path, advertise
 
     async def start_server(self) -> None:
-        """Start server-mode services (FTP, MQTT, SSDP, Bind) on this VP's bind_ip."""
+        """Start server-mode services (FTP, MQTT, SSDP, Bind / Elegoo SDCP) on this VP's bind_ip."""
         logger.info("[VP %s] Starting server-mode services on %s", self.name, self.bind_ip)
 
         cert_path, key_path, advertise_addr = self._resolve_cert_and_advertise()
@@ -1138,147 +1142,142 @@ class VirtualPrinterInstance:
 
         self._tasks = []
 
-        # FTP server. Each VP gets a non-overlapping passive-mode port slice
-        # derived from its DB id so bridge-mode Docker users only have to
-        # expose a narrow range (#1646). Default slice is 10 ports per VP;
-        # see ftp_server.compute_passive_port_slice for the wrap-around
-        # behaviour on installs with very high VP ids.
-        passive_port_min, passive_port_max = compute_passive_port_slice(self.id)
-        self._ftp = VirtualPrinterFTPServer(
-            upload_dir=self.upload_dir,
-            access_code=self.access_code,
-            cert_path=cert_path,
-            key_path=key_path,
-            on_file_received=self.on_file_received,
-            bind_address=bind_addr,
-            vp_name=self.name,
-            passive_port_min=passive_port_min,
-            passive_port_max=passive_port_max,
-        )
-        self._tasks.append(
-            asyncio.create_task(
-                run_with_logging(self._ftp.start(), "FTP"),
-                name=f"vp_{self.id}_ftp",
-            )
-        )
+        from backend.app.services.elegoo_client import is_elegoo_model
 
-        # MQTT server
-        self._mqtt = SimpleMQTTServer(
-            serial=self.serial,
-            access_code=self.access_code,
-            cert_path=cert_path,
-            key_path=key_path,
-            on_print_command=self.on_print_command,
-            model=self.model or DEFAULT_VIRTUAL_PRINTER_MODEL,
-            bind_address=bind_addr,
-            vp_name=self.name,
-        )
-        self._tasks.append(
-            asyncio.create_task(
-                run_with_logging(self._mqtt.start(), "MQTT"),
-                name=f"vp_{self.id}_mqtt",
+        if is_elegoo_model(self.model):
+            # Elegoo Virtual Printer services (SSDP discovery; SDCP server is managed globally on port 3030)
+            self._ssdp = VirtualPrinterSSDPServer(
+                name=self.name,
+                serial=self.serial,
+                model=self.model or "EG-CC1",
+                advertise_ip=advertise_addr,
+                bind_ip=bind_addr,
             )
-        )
+            self._tasks.append(
+                asyncio.create_task(
+                    run_with_logging(self._ssdp.start(), "SSDP"),
+                    name=f"vp_{self.id}_ssdp",
+                )
+            )
 
-        # MQTT bridge — fans out the target printer's pushes to slicers connected
-        # to this VP and forwards their commands back to the printer. Only meaningful
-        # when a target printer is configured AND printer_manager was injected (it
-        # always is at runtime; tests may omit it).
-        if self.target_printer_id is not None and self._printer_manager is not None:
-            self._mqtt_bridge = MQTTBridge(
-                vp_id=self.id,
+            ready_targets = [
+                ("SSDP", self._ssdp.ready),
+            ]
+        else:
+            # Bambu Virtual Printer services (FTP on 990, MQTT on 8883, Bind on 3000, SSDP)
+            passive_port_min, passive_port_max = compute_passive_port_slice(self.id)
+            self._ftp = VirtualPrinterFTPServer(
+                upload_dir=self.upload_dir,
+                access_code=self.access_code,
+                cert_path=cert_path,
+                key_path=key_path,
+                on_file_received=self.on_file_received,
+                bind_address=bind_addr,
                 vp_name=self.name,
-                vp_serial=self.serial,
-                target_printer_id=self.target_printer_id,
-                mqtt_server=self._mqtt,
-                printer_manager=self._printer_manager,
+                passive_port_min=passive_port_min,
+                passive_port_max=passive_port_max,
             )
-            self._mqtt.set_bridge(self._mqtt_bridge)
-            await self._mqtt_bridge.start()
-
-            # Camera passthrough. BambuStudio / OrcaSlicer connect the "camera"
-            # button to the device IP they bound on (the VP), not the IP in the
-            # printer's `ipcam.rtsp_url`. Without a listener the slicer gets
-            # connection refused → "LAN connection failed" (RTSP models) or
-            # OrcaSlicer error `[2:-10061]` (chamber-image models, #1868).
-            #
-            # The port depends on the TARGET printer's model:
-            #   RTSPS (X1/X2/H2/P2S)        → 322
-            #   chamber-image (A1/P1P/P1S)  → 6000
-            #
-            # `get_camera_port()` is the same source of truth used by
-            # `routes/camera.py`, so slicer and Bambuddy UI agree.
-            target_client = self._printer_manager.get_client(self.target_printer_id)
-            target_ip = getattr(target_client, "ip_address", None) if target_client else None
-            target_model = getattr(target_client, "model", None) if target_client else None
-            if target_ip:
-                from backend.app.services.camera import get_camera_port
-                from backend.app.services.elegoo_client import is_elegoo_model
-
-                camera_port = get_camera_port(target_model)
-                target_camera_port = 3031 if is_elegoo_model(target_model) else camera_port
-                self._rtsp_proxy = TCPProxy(
-                    name=f"Camera-{camera_port}",
-                    listen_port=camera_port,
-                    target_host=target_ip,
-                    target_port=target_camera_port,
-                    bind_address=bind_addr,
+            self._tasks.append(
+                asyncio.create_task(
+                    run_with_logging(self._ftp.start(), "FTP"),
+                    name=f"vp_{self.id}_ftp",
                 )
-                self._tasks.append(
-                    asyncio.create_task(
-                        run_with_logging(self._rtsp_proxy.start(), f"Camera-{camera_port}"),
-                        name=f"vp_{self.id}_camera",
+            )
+
+            # MQTT server
+            self._mqtt = SimpleMQTTServer(
+                serial=self.serial,
+                access_code=self.access_code,
+                cert_path=cert_path,
+                key_path=key_path,
+                on_print_command=self.on_print_command,
+                model=self.model or DEFAULT_VIRTUAL_PRINTER_MODEL,
+                bind_address=bind_addr,
+                vp_name=self.name,
+            )
+            self._tasks.append(
+                asyncio.create_task(
+                    run_with_logging(self._mqtt.start(), "MQTT"),
+                    name=f"vp_{self.id}_mqtt",
+                )
+            )
+
+            # MQTT bridge — fans out the target printer's pushes to slicers connected
+            # to this VP and forwards their commands back to the printer.
+            if self.target_printer_id is not None and self._printer_manager is not None:
+                self._mqtt_bridge = MQTTBridge(
+                    vp_id=self.id,
+                    vp_name=self.name,
+                    vp_serial=self.serial,
+                    target_printer_id=self.target_printer_id,
+                    mqtt_server=self._mqtt,
+                    printer_manager=self._printer_manager,
+                )
+                self._mqtt.set_bridge(self._mqtt_bridge)
+                await self._mqtt_bridge.start()
+
+                target_client = self._printer_manager.get_client(self.target_printer_id)
+                target_ip = getattr(target_client, "ip_address", None) if target_client else None
+                target_model = getattr(target_client, "model", None) if target_client else None
+                if target_ip:
+                    from backend.app.services.camera import get_camera_port
+
+                    camera_port = get_camera_port(target_model)
+                    target_camera_port = 3031 if is_elegoo_model(target_model) else camera_port
+                    self._rtsp_proxy = TCPProxy(
+                        name=f"Camera-{camera_port}",
+                        listen_port=camera_port,
+                        target_host=target_ip,
+                        target_port=target_camera_port,
+                        bind_address=bind_addr,
                     )
+                    self._tasks.append(
+                        asyncio.create_task(
+                            run_with_logging(self._rtsp_proxy.start(), f"Camera-{camera_port}"),
+                            name=f"vp_{self.id}_camera",
+                        )
+                    )
+
+            # Bind server
+            self._bind = BindServer(
+                serial=self.serial,
+                model=self.model or DEFAULT_VIRTUAL_PRINTER_MODEL,
+                name=self.name,
+                bind_address=bind_addr,
+                cert_path=cert_path,
+                key_path=key_path,
+            )
+            self._tasks.append(
+                asyncio.create_task(
+                    run_with_logging(self._bind.start(), "Bind"),
+                    name=f"vp_{self.id}_bind",
                 )
-
-        # Bind server
-        self._bind = BindServer(
-            serial=self.serial,
-            model=self.model or DEFAULT_VIRTUAL_PRINTER_MODEL,
-            name=self.name,
-            bind_address=bind_addr,
-            cert_path=cert_path,
-            key_path=key_path,
-        )
-        self._tasks.append(
-            asyncio.create_task(
-                run_with_logging(self._bind.start(), "Bind"),
-                name=f"vp_{self.id}_bind",
             )
-        )
 
-        # SSDP server — advertise_addr is the remote_interface_ip (Tailscale
-        # IP, when chosen from the bind_ip dropdown) or the bind_ip. SSDP
-        # Location accepts IPs only; FQDNs go in through bind_ip selection
-        # at the printer-IP level and resolve before reaching the SSDP
-        # advertisement.
-        self._ssdp = VirtualPrinterSSDPServer(
-            name=self.name,
-            serial=self.serial,
-            model=self.model or DEFAULT_VIRTUAL_PRINTER_MODEL,
-            advertise_ip=advertise_addr,
-            bind_ip=bind_addr,
-        )
-        self._tasks.append(
-            asyncio.create_task(
-                run_with_logging(self._ssdp.start(), "SSDP"),
-                name=f"vp_{self.id}_ssdp",
+            # SSDP server
+            self._ssdp = VirtualPrinterSSDPServer(
+                name=self.name,
+                serial=self.serial,
+                model=self.model or DEFAULT_VIRTUAL_PRINTER_MODEL,
+                advertise_ip=advertise_addr,
+                bind_ip=bind_addr,
             )
-        )
+            self._tasks.append(
+                asyncio.create_task(
+                    run_with_logging(self._ssdp.start(), "SSDP"),
+                    name=f"vp_{self.id}_ssdp",
+                )
+            )
+
+            ready_targets = [
+                ("FTP", self._ftp.ready),
+                ("MQTT", self._mqtt.ready),
+                ("Bind", self._bind.ready),
+                ("SSDP", self._ssdp.ready),
+            ]
 
         # Wait briefly for every child service to actually finish binding its
-        # socket so ``is_running`` doesn't lie. Without this barrier a caller
-        # racing the start (e.g. the diagnostic route) would see is_running=True
-        # while ports were still in the gap between task creation and the
-        # ``asyncio.start_server`` returning. Bounded timeout — if a child
-        # hangs we log it and move on; the existing task tracking still
-        # catches the failure on the next iteration.
-        ready_targets = [
-            ("FTP", self._ftp.ready),
-            ("MQTT", self._mqtt.ready),
-            ("Bind", self._bind.ready),
-            ("SSDP", self._ssdp.ready),
-        ]
+        # socket so ``is_running`` doesn't lie.
         try:
             await asyncio.wait_for(
                 asyncio.gather(*(e.wait() for _, e in ready_targets)),
@@ -1325,6 +1324,9 @@ class VirtualPrinterInstance:
         if self._ssdp:
             await self._ssdp.stop()
             self._ssdp = None
+        if self._sdcp:
+            await self._sdcp.stop()
+            self._sdcp = None
         await self._cancel_tasks()
 
     async def start_proxy(self) -> None:

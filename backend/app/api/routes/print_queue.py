@@ -43,6 +43,7 @@ from backend.app.utils.printer_models import (
     normalize_printer_model_id,
 )
 from backend.app.utils.threemf_tools import (
+    extract_gcode_metadata,
     extract_plate_metadata_from_3mf,
     extract_print_time_from_3mf,
 )
@@ -250,17 +251,38 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
             response.nozzle_diameter = item.archive.nozzle_diameter
             response.sliced_for_model = item.archive.sliced_for_model
             response.bed_type = item.archive.bed_type
-            if item.plate_id:
+            if item.archive.file_path:
                 archive_path = settings.base_dir / item.archive.file_path
                 if archive_path.exists():
-                    # One cached parse for all three per-plate overrides (#2573).
-                    plate_meta = extract_plate_metadata_from_3mf(archive_path, item.plate_id)
-                    if plate_meta.print_time_seconds is not None:
-                        response.print_time_seconds = plate_meta.print_time_seconds
-                    if plate_meta.filament_used_grams > 0:
-                        response.filament_used_grams = plate_meta.filament_used_grams
-                    if plate_meta.bed_type:
-                        response.bed_type = plate_meta.bed_type
+                    if archive_path.suffix.lower() in (".3mf", ".gcode.3mf") and item.plate_id:
+                        # One cached parse for all three per-plate overrides (#2573).
+                        plate_meta = extract_plate_metadata_from_3mf(archive_path, item.plate_id)
+                        if plate_meta.print_time_seconds is not None:
+                            response.print_time_seconds = plate_meta.print_time_seconds
+                        if plate_meta.filament_used_grams > 0:
+                            response.filament_used_grams = plate_meta.filament_used_grams
+                        if plate_meta.bed_type:
+                            response.bed_type = plate_meta.bed_type
+                    elif archive_path.suffix.lower() == ".gcode":
+                        # If archive lacks metadata, extract from G-code comments
+                        if (
+                            response.print_time_seconds is None
+                            or response.filament_used_grams is None
+                            or response.bed_type is None
+                        ):
+                            gcode_meta = extract_gcode_metadata(archive_path)
+                            if response.print_time_seconds is None and "print_time_seconds" in gcode_meta:
+                                response.print_time_seconds = gcode_meta["print_time_seconds"]
+                            if response.filament_used_grams is None and "filament_used_grams" in gcode_meta:
+                                response.filament_used_grams = gcode_meta["filament_used_grams"]
+                            if response.bed_type is None and "bed_type" in gcode_meta:
+                                response.bed_type = gcode_meta["bed_type"]
+                            if response.filament_type is None and "filament_type" in gcode_meta:
+                                response.filament_type = gcode_meta["filament_type"]
+                            if response.layer_height is None and "layer_height" in gcode_meta:
+                                response.layer_height = gcode_meta["layer_height"]
+                            if response.nozzle_diameter is None and "nozzle_diameter" in gcode_meta:
+                                response.nozzle_diameter = gcode_meta["nozzle_diameter"]
     if item.library_file:
         response.library_file_name = (
             item.library_file.file_metadata.get("print_name") if item.library_file.file_metadata else None
@@ -278,10 +300,10 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
             response.nozzle_diameter = item.library_file.file_metadata.get("nozzle_diameter")
             response.sliced_for_model = item.library_file.file_metadata.get("sliced_for_model")
             response.bed_type = item.library_file.file_metadata.get("bed_type")
-        if item.plate_id:
-            lib_path = Path(item.library_file.file_path)
-            library_file_path = lib_path if lib_path.is_absolute() else settings.base_dir / item.library_file.file_path
-            if library_file_path.exists():
+        lib_path = Path(item.library_file.file_path)
+        library_file_path = lib_path if lib_path.is_absolute() else settings.base_dir / item.library_file.file_path
+        if library_file_path.exists():
+            if library_file_path.suffix.lower() in (".3mf", ".gcode.3mf") and item.plate_id:
                 # One cached parse for all three per-plate overrides (#2573).
                 plate_meta = extract_plate_metadata_from_3mf(library_file_path, item.plate_id)
                 if plate_meta.print_time_seconds is not None:
@@ -290,6 +312,25 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
                     response.filament_used_grams = plate_meta.filament_used_grams
                 if plate_meta.bed_type:
                     response.bed_type = plate_meta.bed_type
+            elif library_file_path.suffix.lower() == ".gcode":
+                if (
+                    response.print_time_seconds is None
+                    or response.filament_used_grams is None
+                    or response.bed_type is None
+                ):
+                    gcode_meta = extract_gcode_metadata(library_file_path)
+                    if response.print_time_seconds is None and "print_time_seconds" in gcode_meta:
+                        response.print_time_seconds = gcode_meta["print_time_seconds"]
+                    if response.filament_used_grams is None and "filament_used_grams" in gcode_meta:
+                        response.filament_used_grams = gcode_meta["filament_used_grams"]
+                    if response.bed_type is None and "bed_type" in gcode_meta:
+                        response.bed_type = gcode_meta["bed_type"]
+                    if response.filament_type is None and "filament_type" in gcode_meta:
+                        response.filament_type = gcode_meta["filament_type"]
+                    if response.layer_height is None and "layer_height" in gcode_meta:
+                        response.layer_height = gcode_meta["layer_height"]
+                    if response.nozzle_diameter is None and "nozzle_diameter" in gcode_meta:
+                        response.nozzle_diameter = gcode_meta["nozzle_diameter"]
     if item.printer:
         response.printer_name = item.printer.name
     return response

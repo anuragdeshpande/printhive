@@ -718,15 +718,41 @@ async def get_printer_status(
     # is only meaningful then.
     current_archive_id: int | None = None
     current_plate_id: int | None = None
-    if state.state in ("RUNNING", "PAUSE"):
+    if state.state in ("RUNNING", "PAUSE", "PREPARE"):
         current_plate_id = resolve_plate_id(state)
+        from backend.app.models.archive import PrintArchive
         if state.subtask_id:
-            from backend.app.models.archive import PrintArchive
-
             archive_row = await db.execute(
                 select(PrintArchive.id)
                 .where(PrintArchive.subtask_id == state.subtask_id)
                 .where(PrintArchive.printer_id == printer_id)
+                .order_by(PrintArchive.created_at.desc())
+                .limit(1)
+            )
+            current_archive_id = archive_row.scalar_one_or_none()
+
+        if not current_archive_id and (state.current_print or state.gcode_file or state.subtask_name):
+            candidates = [n for n in (state.current_print, state.gcode_file, state.subtask_name) if n]
+            clean_names = set(candidates)
+            for n in candidates:
+                clean_names.add(Path(n).name)
+                clean_n = n.lstrip("/")
+                if clean_n.startswith("local/"):
+                    clean_names.add(clean_n[len("local/"):])
+                if clean_n.startswith("usb/"):
+                    clean_names.add(clean_n[len("usb/"):])
+                if clean_n.startswith("user/"):
+                    clean_names.add(clean_n[len("user/"):])
+
+            archive_row = await db.execute(
+                select(PrintArchive.id)
+                .where(
+                    or_(
+                        PrintArchive.filename.in_(clean_names),
+                        PrintArchive.subtask_name.in_(clean_names),
+                        PrintArchive.print_name.in_(clean_names),
+                    )
+                )
                 .order_by(PrintArchive.created_at.desc())
                 .limit(1)
             )

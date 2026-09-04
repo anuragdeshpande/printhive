@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, or_, select, text
+from sqlalchemy import delete, func, or_, select, text
 
 from backend.app.api.routes import (
     ams_history,
@@ -7266,13 +7266,22 @@ elegoo_logger = logging.getLogger("backend.app.main.elegoo_link")
 
 @app.api_route("/system/info", methods=["GET", "HEAD"])
 async def elegoo_link_system_info():
-    """Elegoo Link device info endpoint expected by OrcaSlicer."""
+    """Elegoo Link device info endpoint expected by OrcaSlicer (CC1 & CC2)."""
     return JSONResponse(
         {
             "code": 0,
+            "error_code": 0,
             "msg": "ok",
+            "message": "ok",
             "vendor": "ELEGOO",
             "data": {
+                "sn": "20P90A391800002",
+                "name": "Virtual Centauri Carbon",
+                "vendor": "ELEGOO",
+                "firmware_version": "V1.0.0",
+                "model": "Centauri Carbon",
+            },
+            "system_info": {
                 "sn": "20P90A391800002",
                 "name": "Virtual Centauri Carbon",
                 "vendor": "ELEGOO",
@@ -7376,13 +7385,17 @@ async def elegoo_link_upload_handler(request: Request):
             from backend.app.models.printer import Printer
             from backend.app.services.archive import ArchiveService
             from backend.app.services.elegoo_client import is_elegoo_model
+            from backend.app.services.virtual_printer.elegoo_sdcp_server import elegoo_sdcp_server
+
+            sdcp_opts = elegoo_sdcp_server.get_print_options(safe_name) or {}
+            print_data = {"source": "elegoo_link", "filename": safe_name, **sdcp_opts}
 
             service = ArchiveService(db)
             archive = await service.archive_print(
                 printer_id=None,
                 source_file=temp_path,
                 created_by_id=None,
-                print_data={"source": "elegoo_link", "filename": safe_name},
+                print_data=print_data,
             )
 
             printers_stmt = select(Printer)
@@ -7390,19 +7403,45 @@ async def elegoo_link_upload_handler(request: Request):
             all_printers = result.scalars().all()
             target_printer = next((p for p in all_printers if is_elegoo_model(p.model)), all_printers[0] if all_printers else None)
 
-            if archive and target_printer:
-                queue_item = PrintQueueItem(
-                    printer_id=target_printer.id,
-                    archive_id=archive.id,
-                    position=1,
-                    status="pending",
-                    manual_start=False,
-                )
-                db.add(queue_item)
-                await db.commit()
-                elegoo_logger.info("Elegoo Link upload %s queued for printer %s", archive.print_name, target_printer.name)
+            if not archive:
+                raise RuntimeError("failed to archive uploaded file")
+            if not target_printer:
+                raise RuntimeError("no printer is configured to receive Elegoo Link uploads")
+
+            cali_switch = sdcp_opts.get("calibration_switch")
+            bed_levelling = "off" if cali_switch == 0 else ("on" if cali_switch == 1 else "auto")
+            timelapse = bool(sdcp_opts.get("tlp_switch", 0))
+
+            pos_stmt = select(func.coalesce(func.max(PrintQueueItem.position), 0)).where(
+                PrintQueueItem.status == "pending"
+            )
+            pos_result = await db.execute(pos_stmt)
+            next_position = (pos_result.scalar() or 0) + 1
+
+            queue_item = PrintQueueItem(
+                printer_id=target_printer.id,
+                archive_id=archive.id,
+                position=next_position,
+                status="pending",
+                manual_start=False,
+                bed_levelling=bed_levelling,
+                timelapse=timelapse,
+            )
+            db.add(queue_item)
+            await db.commit()
+            elegoo_logger.info("Elegoo Link upload %s queued for printer %s at position %d", archive.print_name, target_printer.name, next_position)
     except Exception as e:
         elegoo_logger.error("Failed to enqueue Elegoo Link upload %s: %s", safe_name, e)
+        return JSONResponse(
+            {
+                "code": 500,
+                "code_num": 500,
+                "msg": "failed",
+                "message": "Upload received but could not be queued for printing",
+                "data": {"filename": safe_name},
+            },
+            status_code=500,
+        )
     finally:
         temp_path.unlink(missing_ok=True)
 

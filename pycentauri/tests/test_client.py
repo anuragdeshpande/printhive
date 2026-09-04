@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 from websockets.asyncio.server import serve
 
-from pycentauri.client import ControlDisabledError, Printer
+from pycentauri.client import ControlDisabledError, Printer, RequestTimeoutError
 from pycentauri.sdcp import Cmd
 
 MAINBOARD = "abcdef123456"
@@ -175,6 +175,24 @@ async def test_watch_yields_multiple_updates(monkeypatch: pytest.MonkeyPatch) ->
         assert len(seen) >= 3
 
 
+async def test_watch_propagates_failed_status_poll() -> None:
+    """A dead TCP connection must not leave a watcher alive forever."""
+    printer = Printer("127.0.0.1", push_period_ms=-2000, mainboard_id=MAINBOARD)
+
+    async def no_op() -> None:
+        return None
+
+    async def fail_status_request(*args: Any, **kwargs: Any) -> Any:
+        raise RequestTimeoutError("status request timed out")
+
+    printer._ensure_subscribed = no_op  # type: ignore[method-assign]
+    printer._request = fail_status_request  # type: ignore[method-assign]
+    watcher = printer.watch()
+    with pytest.raises(RequestTimeoutError):
+        await asyncio.wait_for(anext(watcher), timeout=0.2)
+    await watcher.aclose()
+
+
 async def test_control_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _fake_printer() as server:
         monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
@@ -293,20 +311,19 @@ async def test_adjust_validation_rejects_out_of_range(
                 await printer.set_temperatures()
 
 
-async def test_adjust_disabled_without_control(monkeypatch: pytest.MonkeyPatch) -> None:
-    from pycentauri.client import ControlDisabledError
-
+async def test_start_print_platform_type(monkeypatch: pytest.MonkeyPatch) -> None:
     async with _fake_printer() as server:
         monkeypatch.setattr("pycentauri.client.WS_PORT", server.port)
-        async with await Printer.connect("127.0.0.1") as printer:
+        async with await Printer.connect("127.0.0.1", enable_control=True) as printer:
             await asyncio.wait_for(printer.wait_for_mainboard(), timeout=2)
-            for call in (
-                lambda: printer.set_print_speed(100),
-                lambda: printer.set_fan_speed(model=50),
-                lambda: printer.set_temperatures(nozzle=200),
-            ):
-                try:
-                    await call()
-                except ControlDisabledError:
-                    continue
-                raise AssertionError("expected ControlDisabledError")
+            await asyncio.wait_for(
+                printer.start_print("plate_job.gcode", platform_type=2, auto_leveling=True),
+                timeout=3,
+            )
+
+        start_cmds = [m["Data"] for m in server.received if m["Data"]["Cmd"] == int(Cmd.START_PRINT)]
+        assert len(start_cmds) == 1
+        data = start_cmds[0]["Data"]
+        assert data["Filename"] == "plate_job.gcode"
+        assert data["PrintPlatformType"] == 2
+        assert data["Calibration_switch"] == 1

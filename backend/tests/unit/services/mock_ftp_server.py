@@ -10,7 +10,10 @@ import threading
 import time
 
 from pyftpdlib.authorizers import DummyAuthorizer
-from pyftpdlib.handlers import TLS_FTPHandler
+try:
+    from pyftpdlib.handlers import TLS_FTPHandler
+except ImportError:
+    from pyftpdlib.handlers import FTPHandler as TLS_FTPHandler
 from pyftpdlib.servers import FTPServer
 
 

@@ -8,7 +8,7 @@ import { buildApiKeyQrPayload } from '../utils/apiKeyQr';
 interface ApiKeyQRCodeModalProps {
   /** Raw API key string (only available in-memory right after creation). */
   apiKey: string;
-  /** Base URL a client uses to reach Bambuddy. Defaults to the current origin. */
+  /** Base URL a client uses to reach PrintHive. Defaults to current origin. */
   baseUrl?: string;
   onClose: () => void;
 }
@@ -53,13 +53,23 @@ export function ApiKeyQRCodeModal({ apiKey, baseUrl, onClose }: ApiKeyQRCodeModa
           <p className="text-sm text-bambu-gray mb-4 text-center">
             {t('settings.apiKeyQrCaption')}
           </p>
-          <div className="bg-white p-4 rounded-lg mb-4">
-            <QRCodeSVG value={payload} size={256} />
+
+          <div className="bg-white p-4 rounded-xl mb-4 shadow-lg border border-amber-500/20 flex justify-center items-center">
+            <QRCodeSVG
+              value={payload}
+              size={240}
+              level="H"
+              marginSize={2}
+              fgColor="#000000"
+              bgColor="#FFFFFF"
+            />
           </div>
-          <div className="flex items-start gap-2 text-xs text-amber-700 dark:text-amber-400 mb-4">
-            <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+
+          <div className="flex items-start gap-2.5 text-xs bg-amber-500/10 border border-amber-500/30 p-3 rounded-lg text-amber-600 dark:text-amber-300 mb-4">
+            <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5 text-amber-500" />
             <span>{t('settings.apiKeyQrWarning')}</span>
           </div>
+
           <Button onClick={onClose} className="w-full">
             {t('common.close')}
           </Button>

@@ -658,6 +658,222 @@ def extract_bed_type_from_3mf(file_path: Path, plate_id: int | None = None) -> s
     return extract_plate_metadata_from_3mf(file_path, plate_id).bed_type
 
 
+def parse_gcode_duration(val: str) -> int | None:
+    """Parse duration string into integer seconds.
+
+    Supports:
+    - Raw seconds: "5050" -> 5050
+    - Component strings: "1h 24m 10s", "1d 2h 3m", "45m 12s", "30s"
+    - Colons: "01:24:10", "45:12"
+    """
+    if not val:
+        return None
+    val = val.strip()
+    if val.isdigit():
+        return int(val)
+
+    if ":" in val:
+        parts = val.split(":")
+        try:
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+            elif len(parts) == 2:
+                return int(parts[0]) * 60 + int(float(parts[1]))
+            elif len(parts) == 4:
+                return int(parts[0]) * 86400 + int(parts[1]) * 3600 + int(parts[2]) * 60 + int(float(parts[3]))
+        except (ValueError, TypeError):
+            pass
+
+    total_seconds = 0
+    matched = False
+    for unit, mult in [("d", 86400), ("h", 3600), ("m", 60), ("s", 1)]:
+        m = re.search(rf"(\d+)\s*{unit}", val, re.IGNORECASE)
+        if m:
+            total_seconds += int(m.group(1)) * mult
+            matched = True
+    if matched:
+        return total_seconds
+    return None
+
+
+def extract_bed_type_from_gcode(file_path_or_content: Path | str | bytes) -> str | None:
+    """Extract bed/plate type from G-code comments or headers.
+
+    Supports OrcaSlicer, BambuStudio, PrusaSlicer and Elegoo format:
+    ;curr_bed_type:Cool Plate
+    ; curr_bed_type = Cool Plate
+    ;curr_bed_type:Textured PEI Plate
+    ;bed_type = Textured PEI Plate
+    """
+    meta = extract_gcode_metadata(file_path_or_content)
+    return meta.get("bed_type")
+
+
+def extract_gcode_metadata(file_path_or_content: Path | str | bytes) -> dict:
+    """Extract metadata from G-code headers and config comments.
+
+    Extracts bed type, print time, filament weight, layer height, nozzle diameter,
+    temperatures, and layer counts.
+    """
+    meta: dict = {}
+    try:
+        sample = ""
+        footer = ""
+        read_size_head = 262144
+        read_size_tail = 131072
+        if isinstance(file_path_or_content, bytes):
+            sample = file_path_or_content[:read_size_head].decode("utf-8", errors="ignore")
+            if len(file_path_or_content) > read_size_head:
+                footer = file_path_or_content[-read_size_tail:].decode("utf-8", errors="ignore")
+        elif isinstance(file_path_or_content, str):
+            sample = file_path_or_content[:read_size_head]
+            if len(file_path_or_content) > read_size_head:
+                footer = file_path_or_content[-read_size_tail:]
+        else:
+            path = Path(file_path_or_content)
+            if not path.exists():
+                return meta
+            file_size = path.stat().st_size
+            with open(path, "rb") as f:
+                sample = f.read(read_size_head).decode("utf-8", errors="ignore")
+                if file_size > read_size_head:
+                    f.seek(max(0, file_size - read_size_tail))
+                    footer = f.read().decode("utf-8", errors="ignore")
+
+        combined = f"{sample}\n{footer}" if footer else sample
+
+        # Bed type
+        m = re.search(r";\s*curr_bed_type\s*[:=]\s*([^\r\n;]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*bed_type\s*[:=]\s*([^\r\n;]+)", combined, re.IGNORECASE)
+        if m:
+            val = m.group(1).strip().strip('"').strip("'")
+            bed_aliases = {
+                "btpc": "Cool Plate",
+                "btpei": "Textured PEI Plate",
+                "btsmooth": "Smooth PEI Plate",
+                "bthightemp": "High Temp Plate",
+                "bteng": "Engineering Plate",
+            }
+            norm_val = bed_aliases.get(val.lower(), val)
+            if norm_val and norm_val != "0" and norm_val.lower() != "null":
+                meta["bed_type"] = norm_val
+
+        # Estimated print time in seconds
+        m = re.search(r";\s*estimated\s+printing\s+time\s*(?:\([^)]*\))?\s*[:=]\s*([^\r\n;]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*total\s+estimated\s+time\s*[:=]\s*([^\r\n;]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*model\s+printing\s+time\s*[:=]\s*([^\r\n;]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*TIME\s*[:=]\s*([0-9]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*print_time\s*[:=]\s*([0-9]+)", combined, re.IGNORECASE)
+        if m:
+            parsed_sec = parse_gcode_duration(m.group(1))
+            if parsed_sec:
+                meta["print_time_seconds"] = parsed_sec
+
+        # Filament used in grams
+        m = re.search(r";\s*total\s+filament\s+used\s*\[g\]\s*[:=]\s*([0-9.,\s]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*filament\s+used\s*\[g\]\s*[:=]\s*([0-9.,\s]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*filament_used_g\s*[:=]\s*([0-9.,\s]+)", combined, re.IGNORECASE)
+        if m:
+            val_str = m.group(1).strip()
+            try:
+                parts = [float(p.strip()) for p in val_str.split(",") if p.strip()]
+                if parts:
+                    meta["filament_used_grams"] = round(sum(parts), 2)
+            except ValueError:
+                pass
+        else:
+            # Try cubic cm (volume * ~1.24 g/cm3 for PLA default density)
+            m_cm3 = re.search(r";\s*(?:total\s+)?filament\s+used\s*\[cm3\]\s*[:=]\s*([0-9.,\s]+)", combined, re.IGNORECASE)
+            if m_cm3:
+                val_str = m_cm3.group(1).strip()
+                try:
+                    parts = [float(p.strip()) for p in val_str.split(",") if p.strip()]
+                    if parts:
+                        meta["filament_used_grams"] = round(sum(parts) * DEFAULT_FILAMENT_DENSITY, 2)
+                except ValueError:
+                    pass
+
+        # Total layers
+        m = re.search(r";\s*total(?:_|\s+)layers?(?:_|\s+)?(?:number|count)?\s*[:=]\s*([0-9]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*LAYER_COUNT\s*[:=]\s*([0-9]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*total_layer_number\s*[:=]\s*([0-9]+)", combined, re.IGNORECASE)
+        if m:
+            try:
+                meta["total_layers"] = int(m.group(1))
+            except ValueError:
+                pass
+
+        # Layer height
+        m = re.search(r";\s*layer_height\s*[:=]\s*([0-9.]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*first_layer_height\s*[:=]\s*([0-9.]+)", combined, re.IGNORECASE)
+        if m:
+            try:
+                meta["layer_height"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # Nozzle diameter
+        m = re.search(r";\s*nozzle_diameter\s*[:=]\s*([0-9.]+)", combined, re.IGNORECASE)
+        if m:
+            try:
+                meta["nozzle_diameter"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # Filament type
+        m = re.search(r";\s*filament_type\s*[:=]\s*([^\r\n;]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*initial_filament\s*[:=]\s*([^\r\n;]+)", sample, re.IGNORECASE)
+        if m:
+            meta["filament_type"] = m.group(1).strip().strip('"').strip("'")
+
+        # Filament color
+        m = re.search(r";\s*filament_colou?r\s*[:=]\s*([^\r\n;]+)", combined, re.IGNORECASE)
+        if m:
+            meta["filament_color"] = m.group(1).strip().strip('"').strip("'")
+
+        # Bed temperature
+        m = re.search(r";\s*first_layer_bed_temperature\s*[:=]\s*([0-9.]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*bed_temperature(?:_initial_layer)?\s*[:=]\s*([0-9.]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r"M140\s+S([0-9.]+)", sample)
+        if m:
+            try:
+                meta["bed_temperature"] = float(m.group(1))
+            except ValueError:
+                pass
+
+        # Nozzle temperature
+        m = re.search(r";\s*nozzle_temperature(?:_initial_layer)?\s*[:=]\s*([0-9.]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*first_layer_temperature\s*[:=]\s*([0-9.]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r";\s*temperature\s*[:=]\s*([0-9.]+)", combined, re.IGNORECASE)
+        if not m:
+            m = re.search(r"M104\s+S([0-9.]+)", sample)
+        if m:
+            try:
+                meta["nozzle_temperature"] = float(m.group(1))
+            except ValueError:
+                pass
+
+    except Exception as e:
+        logger.debug("Failed to extract G-code metadata: %s", e)
+
+    return meta
+
+
 # Header values exposed as `{placeholder}` substitutions inside snippets.
 # Aliases let users write Prusa-style names (`{max_layer_z}`) that map onto
 # Bambu/Orca header keys (`max_z_height`).

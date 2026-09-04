@@ -435,11 +435,13 @@ class CC2Printer(Printer):
         storage: str = "local",
         auto_leveling: bool = True,
         timelapse: bool = False,
+        platform_type: int = 0,
     ) -> sdcp.ParsedMessage:
         self._require_control("start_print")
         params: dict[str, Any] = {
             "filename": filename,
             "storage_media": storage,
+            "platform_type": platform_type,
         }
         result = await self._cc2_request(1020, params, timeout=CONTROL_TIMEOUT_S)
         return self._wrap_result(1020, result)

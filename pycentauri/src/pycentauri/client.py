@@ -117,7 +117,10 @@ class Printer:
             mainboard_id=mainboard_id,
         )
         url = f"ws://{host}:{WS_PORT}{WS_PATH}"
-        self._ws = await asyncio.wait_for(connect(url, max_size=None), timeout=connect_timeout)
+        self._ws = await asyncio.wait_for(
+            connect(url, max_size=None, ping_interval=None, ping_timeout=None),
+            timeout=connect_timeout,
+        )
         self._reader = asyncio.create_task(self._read_loop(), name=f"pycentauri-reader-{host}")
         return self
 
@@ -227,8 +230,7 @@ class Printer:
                     yield await asyncio.wait_for(queue.get(), timeout=interval + 2)
                 except asyncio.TimeoutError:
                     mid = await self.wait_for_mainboard()
-                    with contextlib.suppress(PrinterError):
-                        await self._request(sdcp.Cmd.GET_PRINTER_STATUS, None, mid, timeout=8.0)
+                    await self._request(sdcp.Cmd.GET_PRINTER_STATUS, None, mid, timeout=8.0)
         finally:
             self._status_queues.discard(queue)
 
@@ -267,25 +269,41 @@ class Printer:
         storage: str = "local",
         auto_leveling: bool = True,
         timelapse: bool = False,
+        platform_type: int = 0,
     ) -> sdcp.ParsedMessage:
         """Start a print of an existing file on the printer.
 
         ``storage`` is either ``"local"`` (internal storage) or ``"udisk"``
         (USB). The filename is the name used by the printer, not a local path.
+        ``platform_type`` sets ``PrintPlatformType`` (0=Textured PEI/Default,
+        1=Smooth PEI/High Temp, 2=Engineering, 3=Cool Plate, 4=SuperTack).
         """
         self._require_control("start_print")
-        path_prefix = "/usb" if storage == "udisk" else "/local"
         data: dict[str, Any] = {
             "Filename": filename,
             "StartLayer": 0,
             "Calibration_switch": 1 if auto_leveling else 0,
-            "PrintPlatformType": 0,
+            "PrintPlatformType": platform_type,
             "Tlp_Switch": 1 if timelapse else 0,
             "slot_map": [],
-            "path_prefix": path_prefix,
         }
         mid = await self.wait_for_mainboard()
-        return await self._request(sdcp.Cmd.START_PRINT, data, mid)
+        resp = await self._request(sdcp.Cmd.START_PRINT, data, mid)
+        if resp.inner and isinstance(resp.inner, dict):
+            ack = resp.inner.get("Data", {}).get("Ack") if isinstance(resp.inner.get("Data"), dict) else resp.inner.get("Ack")
+            if ack is not None and ack != 0:
+                ack_messages = {
+                    1: "Printer is busy",
+                    2: "File not found on printer (/local/ storage)",
+                    3: "MD5 check failed",
+                    4: "File I/O error",
+                    5: "File resolution is invalid",
+                    6: "File format is invalid",
+                    7: "File model is invalid",
+                }
+                err_msg = ack_messages.get(ack, f"Unknown error (Ack={ack})")
+                raise PrinterError(f"Start print rejected by printer: {err_msg}")
+        return resp
 
     async def pause(self) -> sdcp.ParsedMessage:
         self._require_control("pause")

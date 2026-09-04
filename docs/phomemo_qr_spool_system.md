@@ -1,142 +1,219 @@
-# Master Implementation Plan & UX Guide: Direct Phomemo Bluetooth Thermal Printing, QR Translation & Spool NFC Ecosystem
+# Master Implementation Plan & UX Guide: Backend-First Spool QR API, Mobile Label Printing & Upstream PR #1606 Strategy
 
 ---
 
 ## Executive Overview
 
-This document outlines the complete implementation design for extending **PrintBuddy (Server)** and **BuddyDash (Android App)** to support:
-1. **Direct Phomemo Bluetooth Thermal Label Printing** for 30mm circular stickers directly from BuddyDash (without using the vendor Phomemo app).
-2. **Automated Spool Tare & Remaining Weight Calculation** referencing PrintBuddy's 90+ catalog empty spool weights and FilamentColors.xyz APIs.
-3. **Bluetooth Connection Sprites & Animations** in BuddyDash for device searching, connecting, and disconnecting states.
-4. **Unified QR-to-NFC Translation Pipeline** on the PrintBuddy server, allowing inexpensive thermal QR stickers to act as drop-in replacements for NFC tags.
-5. **Comprehensive Multi-Brand NFC/RFID Spool Ecosystem Support** (OpenSpool, Prusament NFC, Anycubic RFID, and Bambu Lab RFID).
+This document defines the complete backend-first architecture for extending **PrintBuddy (Server)** and **BuddyDash (Android App)** with spool QR management, mobile camera scanning, and direct Phomemo Bluetooth thermal label printing.
+
+### Core Architectural Principle
+> **The PrintBuddy FastAPI backend is the sole source of truth for QR resolution, payload parsing, target validation, idempotency, and single-location move semantics. BuddyDash Android app remains a thin client for camera capture, mobile UX, and Bluetooth thermal printing.**
+
+This architecture prevents merge conflicts with upstream **bambuddy** PR `#1606` (`feat(inventory): scan-to-location QR assignment`) while ensuring web, mobile, and future NFC systems execute identical, audited inventory rules.
 
 ---
 
-## Part 1: Complete End-to-End User Experience (UX) Guide
+## Part 1: Upstream PR #1606 Analysis & Merge Strategy
 
-### Scenario 1: Adding a Used Spool, Auto-Calculating Weight & Printing 30mm QR Label
+### 1. What Upstream PR #1606 Does
+Upstream PR `maziggy/bambuddy#1606` introduces:
+- A browser-based web camera QR scanner in `InventoryPage.tsx` and `SpoolBuddyInventoryPage.tsx`.
+- Frontend QR target assignment modals (`QrAssignTargetModal.tsx`) and client-side QR string utilities (`qrAssignTarget.ts`).
 
-```
-[ Step 1: Add Spool ] -> [ Step 2: Auto Tare & Scale Weight ] -> [ Step 3: Animated Bluetooth Connect ] -> [ Step 4: Stick Label ]
-```
-
-1. **Step 1 — Open Spool Inventory in BuddyDash**:
-   - Open BuddyDash on your Android phone. Tap **Inventory** -> **+ Add New Spool**.
-2. **Step 2 — Select Brand & Material (Automated Catalog Lookup)**:
-   - Select Brand (e.g., *Sunlu*) and Spool Type (*PLA - 1kg Plastic Spool*).
-   - **Automated Catalog Lookup**: BuddyDash queries PrintBuddy's built-in catalog defaults:
-     - **Auto-Fills Empty Spool Tare Weight**: `117g`
-     - **Auto-Fills Recommended Temps**: `210°C / 60°C`
-     - **Auto-Fills Hex Color Swatch**: `#1A1A1A` (Galaxy Black) via FilamentColors.xyz catalog.
-3. **Step 3 — Scale Weight Calculation (For Partially Used Spools)**:
-   - Put your spool on a digital kitchen scale and enter the gross weight (e.g., `617g`).
-   - BuddyDash automatically calculates:
-     $$\text{Remaining Filament} = \text{Gross Weight (617g)} - \text{Spool Tare (117g)} = \mathbf{500g}$$
-   - Tap **Save Spool to PrintHive**.
-4. **Step 4 — Animated Bluetooth Printer Connection**:
-   - BuddyDash pops up the **"Print 30mm Thermal Label"** modal with a live preview of the 240x240 px sticker.
-   - Tap **Print via Bluetooth**.
-   - **Device Connection Animation**:
-     - **Searching**: Pulsing radar wave animation sprite over the Phomemo printer icon.
-     - **Connecting**: Rotating progress spinner sprite with Bluetooth signal beams.
-     - **Connected & Printing**: Green checkmark burst sprite with animated paper feed motion.
-     - **Disconnected**: Subtle fade out indicator returning to ready state.
-5. **Step 5 — Apply Label**:
-   - The Phomemo printer outputs the 30mm round sticker in under 2 seconds. Place it on your spool side!
+### 2. Upstream Conflict-Avoidance Strategy
+To eliminate git merge conflicts when upstream merges PR `#1606`:
+1. **Isolated Local Testing Branch**: We test PR `#1606` in a dedicated local branch (`test/upstream-pr-1606`):
+   ```bash
+   git fetch origin pull/1606/head:test/upstream-pr-1606
+   git checkout test/upstream-pr-1606
+   ```
+2. **Backend-First Isolation**: We do not modify the frontend pages touched by PR `#1606`. Instead, all custom QR logic resides in dedicated backend modules (`backend/app/api/routes/inventory_qr.py` and `backend/app/services/qr_resolver.py`).
+3. **Upstream API Alignment**: If upstream later introduces server-side QR APIs, our endpoints serve as canonical handlers or lightweight aliases without breaking the mobile app.
 
 ---
 
-### Scenario 2: Loading a Spool into an AMS or Printer Slot
+## Part 2: Backend API Specifications & Error Contracts
 
-```
-[ Step 1: Tap Scan in BuddyDash ] -> [ Step 2: Point Camera at Spool ] -> [ Step 3: Tap Load to Slot 2 ]
-```
-
-1. **Step 1 — Open Camera Scanner in BuddyDash**:
-   - Tap the **Camera Scan** icon on the BuddyDash main dashboard or from any Printer Detail screen (*BambuLab X2D* or *Elegoo CC1*).
-2. **Step 2 — Point Phone Camera at Spool**:
-   - Point your phone camera at the 30mm QR sticker on the spool (or tap an NFC tag if using NFC).
-3. **Step 3 — Instant Recognition & 1-Tap Load**:
-   - BuddyDash instantly detects the QR code, queries PrintHive, and displays a card:
-     > **Matched Spool**: Sunlu PLA (Galaxy Black) — 500g remaining
-   - Select Target Slot (e.g., *Bambu AMS Slot 2* or *Elegoo External Spool*) and tap **Load Spool**.
-4. **Step 4 — Server Synchronization**:
-   - PrintHive updates the database, syncs with **Spoolman**, and sets the filament color/type on the printer.
+### 1. Flexible Payload Resolution Engine (`qr_resolver.py`)
+Parses and normalizes any of the following QR payload formats:
+- **Canonical Versioned Format**: `bambuddy://spool?v=1&id=42` (with optional `&sig=<token>` hook)
+- **Web URLs**: `http(s)://<host>/inventory?spool=42`, `http(s)://<host>/spools/42`
+- **Key-Value Strings**: `spool=42`, `id=42`
+- **Raw Integers**: `42`
 
 ---
 
-## Part 2: Supported Spool Tag Systems (Pros & Cons Comparison)
+### 2. Read-Only Resolution Endpoint: `POST /api/v1/inventory/spools/resolve-qr`
 
-PrintBuddy supports all major filament tag standards through a **Unified Translation Pipeline**. Below is a detailed breakdown of each supported tag system:
+100% read-only and side-effect free.
 
-| Tag System | Frequency / Format | Cost Per Spool | Pros | Cons | Recommendation |
-| :--- | :--- | :---: | :--- | :--- | :--- |
-| **Phomemo 30mm Thermal QR Stickers** | Visual QR Code (203 DPI Raster) | **<$0.005** | • Extremely cheap.<br>• No hardware alignment issues.<br>• Human-readable text + QR code.<br>• Instant camera scan from a distance. | • Requires line-of-sight scanning.<br>• Cannot be read directly by Bambu AMS internal RFID coils. | ⭐ **Highly Recommended (Primary)** |
-| **OpenSpool NFC (NTAG213/215/216)** | 13.56 MHz High Frequency NDEF | **$0.25 – $0.50** | • Open industry standard.<br>• Stores full metadata on-chip (vendor, color, temps).<br>• Rewritable and readable by phone NFC. | • Stickers can peel off or align poorly.<br>• Expensive for large spool collections. | ⭐ **Recommended for NFC** |
-| **Prusament NFC** | 13.56 MHz NTAG213 (UID Encoded) | **Free with spool** | • Factory-embedded in every Prusament spool.<br>• Unique chip UID automatically tracked in inventory.<br>• Pre-indexed in PrintBuddy catalog. | • Encrypted metadata (PrintBuddy tracks via UID lookup). | ✅ **Supported Out-of-the-Box** |
-| **Anycubic RFID** | 13.56 MHz High Frequency RFID | **Free with spool** | • Factory-embedded in Anycubic spools.<br>• Readable via BuddyDash phone NFC or SpoolBuddy scanner. | • Proprietary reader protocol on Anycubic hardware. | ✅ **Supported via UID Tracking** |
-| **Bambu Lab RFID** | 13.56 MHz Proprietary RFID | **Free with spool** | • Seamless auto-read inside Bambu AMS.<br>• Auto-populates color, material, and K-factor. | • Proprietary encryption (read-only by Bambu AMS).<br>• Cannot be written by end-users. | ✅ **Fully Supported on Bambu AMS** |
-
----
-
-## Part 3: Architecture & Data Specifications
-
-### 1. 30mm Round Label Graphic Specification
-
-```
-      ┌─────────────────────────┐
-      │   /---\                 │
-      │  /  Q  \   SUNLU        │
-      │ |   R   |  PLA          │
-      │ |  CODE |  Galaxy Black │
-      │  \     /   210°C / 60°C │
-      │   \---/                 │
-      │   240x240 px (203 DPI)  │
-      └─────────────────────────┘
+**Request Body**:
+```json
+{
+  "raw_qr": "bambuddy://spool?v=1&id=42"
+}
 ```
 
-- **Canvas Size**: 30mm round diameter = **240 x 240 pixels** at 203 DPI.
-- **Embedded Payload**: Standard URI format `bambuddy://spool?uuid=<tray_uuid>&id=<spool_id>`.
-- **Text Elements**: Brand Name, Material Type, Color Name, Nozzle/Bed Target Temps.
+**Success Response (`200 OK`)**:
+```json
+{
+  "spool_id": 42,
+  "matched": true,
+  "spool": {
+    "id": 42,
+    "brand": "Sunlu",
+    "material": "PLA",
+    "color_name": "Galaxy Black",
+    "color_hex": "#1A1A1A",
+    "remaining_weight_g": 520,
+    "current_location": "Shelf A"
+  },
+  "parsed_meta": {
+    "version": 1,
+    "scheme": "bambuddy",
+    "signature_present": false
+  }
+}
+```
+
+**Error Contracts**:
+- `400 Bad Request` (`INVALID_QR_FORMAT`): Payload cannot be parsed.
+- `404 Not Found` (`SPOOL_NOT_FOUND`): Spool ID does not exist.
+- `422 Unprocessable Entity` (`SPOOL_ARCHIVED`): Spool is archived/deleted.
 
 ---
 
-## Part 4: Technical Implementation Plan
+### 3. Atomic Assignment Endpoint: `POST /api/v1/inventory/spools/assign-from-qr`
 
-### Component 1: PrintBuddy Backend Server (`printBuddy`)
+Sole mutation endpoint for single-location moves.
 
-#### [NEW] [qr_label.py](file:///Users/anuragdeshpande/IdeaProjects/printBuddy/backend/app/api/routes/qr_label.py)
-- Endpoint `GET /api/v1/inventory/spools/{id}/qr-code`: Generates PNG/SVG QR code image for a spool.
-- Endpoint `POST /api/v1/spoolbuddy/qr/scan`: Translates scanned QR URI payloads into the standard `nfc_tag_scanned` pipeline so Spoolman, inventory matching, and WebSockets treat QR scans identically to NFC taps.
+**Request Body**:
+```json
+{
+  "raw_qr": "bambuddy://spool?v=1&id=42",
+  "target": {
+    "kind": "ams",
+    "printer_id": 1,
+    "ams_id": 0,
+    "tray_id": 1
+  },
+  "client_source": "BuddyDash_Android"
+}
+```
+
+**Success Response (`200 OK`)**:
+```json
+{
+  "success": true,
+  "modified": true,
+  "spool_id": 42,
+  "previous_location": "Storage: Shelf A",
+  "new_location": "Printer 1 - AMS 0 - Tray 1",
+  "audit_event_id": 892
+}
+```
+
+**Idempotent Double-Scan (`200 OK`)**:
+*(Returned when spool is scanned into the exact location it already occupies)*
+```json
+{
+  "success": true,
+  "modified": false,
+  "message": "Spool is already assigned to this location.",
+  "spool_id": 42,
+  "new_location": "Printer 1 - AMS 0 - Tray 1"
+}
+```
+
+**Error Contracts**:
+- `400 Bad Request` (`INVALID_TARGET`): Invalid printer/AMS slot.
+- `404 Not Found` (`SPOOL_NOT_FOUND`): Spool ID missing.
+- `409 Conflict` (`TARGET_OCCUPIED_LOCKED`): Target slot is locked by an active print job.
+- `403 Forbidden` (`INSUFFICIENT_PERMISSIONS`): API key lacks write access.
 
 ---
 
-### Component 2: BuddyDash Android App (`BuddyDash`)
+## Part 3: Audit Trail & Inventory Event Logging
 
-#### [NEW] [PhomemoBluetoothPrinter.kt](file:///Users/anuragdeshpande/IdeaProjects/BuddyDash/app/src/main/java/com/chronoswing/buddydash/printer/PhomemoBluetoothPrinter.kt)
-- Manages Bluetooth RFCOMM socket connections (`00001101-0000-1000-8000-00805F9B34FB`).
-- Encodes Android Jetpack Compose bitmaps into ESC/POS & TSPL 1-bit raster binary blocks (`1D 76 30 00 ...`).
+Every location move executed via `assign-from-qr` appends a record to `inventory_audit_logs`:
 
-#### [NEW] [StickerRenderer.kt](file:///Users/anuragdeshpande/IdeaProjects/BuddyDash/app/src/main/java/com/chronoswing/buddydash/printer/StickerRenderer.kt)
-- Uses ZXing (`com.google.zxing:core`) to render 240x240 px monochrome bitmaps for 30mm circular thermal labels.
+```json
+{
+  "timestamp": "2026-07-25T00:30:00Z",
+  "spool_id": 42,
+  "previous_location": "Storage: Shelf A",
+  "new_location": "Printer 1 - AMS 0 - Tray 1",
+  "client_source": "BuddyDash_Android",
+  "triggered_by": "api_key_root",
+  "method": "qr_scan"
+}
+```
 
-#### [NEW] [BluetoothConnectionAnimations.kt](file:///Users/anuragdeshpande/IdeaProjects/BuddyDash/app/src/main/java/com/chronoswing/buddydash/ui/components/BluetoothConnectionAnimations.kt)
-- Vector sprite & Lottie/Compose canvas animations for printer status transitions:
-  - `SearchingPrinterState`: Pulsing radar wave animation around Bluetooth logo.
-  - `ConnectingPrinterState`: Animated orbital progress spinner with signal indicator.
-  - `PrintingState`: Feed animation showing thermal sticker exiting printer.
-  - `DisconnectedState`: Soft fade out alert.
-
-#### [NEW] [QrCodeScannerActivity.kt](file:///Users/anuragdeshpande/IdeaProjects/BuddyDash/app/src/main/java/com/chronoswing/buddydash/ui/QrCodeScannerActivity.kt)
-- CameraX + Google ML Kit Barcode Scanning integration for instant, offline QR code scanning.
+This guarantees full auditability and synchronizes with **Spoolman** and **WebSockets** automatically.
 
 ---
 
-## Part 5: Verification & Safety Checklist
+## Part 4: BuddyDash Android Integration
 
-- [ ] Verify ESC/POS raster byte generation for 203 DPI Phomemo printers.
-- [ ] Verify offline CameraX QR scanning speed (< 100ms detection).
-- [ ] Verify automated tare weight subtraction ($617g - 117g = 500g$).
-- [ ] Verify smooth Bluetooth status animation transitions in Jetpack Compose.
-- [ ] Ensure Bluetooth SPP permissions (`BLUETOOTH_CONNECT`, `BLUETOOTH_SCAN`) follow Android 12+ runtime prompt rules.
+### Scanner Workflows
+- **1-Step Direct Scan Flow**: Tap empty slot -> Open CameraX -> Scan QR -> Direct `POST /assign-from-qr` call.
+- **2-Step Read-Only Flow**: Tap Scan QR -> Open CameraX -> Call `POST /resolve-qr` -> Preview Spool Detail Card -> Tap target slot modal.
+
+### Phomemo Bluetooth Thermal Printing
+- **Format**: 30mm circular label (240x240 px at 203 DPI).
+- **Transport**: Bluetooth RFCOMM socket (`PhomemoBluetoothPrinter.kt`).
+- **Raster Encoding**: 1-bit monochrome ESC/POS & TSPL binary commands.
+
+---
+
+## Part 5: Non-Goals for Phase 1
+
+1. Multi-tenant cryptographic QR signature enforcement.
+2. Offline-first local mobile database syncing.
+3. Hardware RFID/NFC tag write bridge.
+
+---
+
+## Part 6: Sequence Diagram & Verification Checklist
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant App as BuddyDash (Android)
+    participant API as PrintBuddy Backend
+    participant Audit as Audit Log / Spoolman
+    participant WS as WebSocket / UI
+
+    alt 1-Step Direct Scan Flow
+        User->>App: Tap "Assign to AMS Slot 1"
+        App->>User: Launch CameraX Scanner
+        User->>App: Point at Spool QR (v=1)
+        App->>API: POST /inventory/spools/assign-from-qr {raw_qr, target}
+        API->>API: Parse QR payload & validate
+        alt Same Location (Duplicate Scan)
+            API-->>App: 200 OK {success: true, modified: false}
+        else New Location Move
+            API->>Audit: Log move event & sync Spoolman
+            API->>WS: Broadcast slot update to dashboards
+            API-->>App: 200 OK {success: true, modified: true}
+        end
+        App->>User: Play haptic feedback & update UI
+    else 2-Step Read-Only Scan & Pick
+        User->>App: Tap "Scan QR"
+        App->>API: POST /inventory/spools/resolve-qr {raw_qr}
+        API-->>App: 200 OK {matched: true, spool: {...}}
+        App->>User: Render Spool Card & Target Selector Modal
+        User->>App: Select "Shelf B / AMS Slot 2"
+        App->>API: POST /inventory/spools/assign-from-qr
+        API->>Audit: Log move & update DB
+        API-->>App: 200 OK Success
+    end
+```
+
+### Manual Verification Checklist
+- [ ] Scan physical 30mm Phomemo printed label with phone camera & BuddyDash CameraX.
+- [ ] Test 1-step assignment to AMS Slot 1; verify UI updates instantly via WebSocket.
+- [ ] Test re-assigning spool to storage location; verify previous AMS slot is cleared.
+- [ ] Verify duplicate scan returns `modified: false`.
+- [ ] Checkout branch `test/upstream-pr-1606` and verify no rebase or file conflicts.

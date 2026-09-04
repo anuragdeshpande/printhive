@@ -768,6 +768,7 @@ class PrinterManager:
         use_ams: bool = True,
         nozzle_offset_cali: str = "auto",
         nozzle_mapping: str | None = None,
+        bed_type: str | int | None = None,
     ) -> bool:
         """Start a print on a connected printer.
 
@@ -798,6 +799,7 @@ class PrinterManager:
                 use_ams=use_ams,
                 nozzle_offset_cali=nozzle_offset_cali,
                 nozzle_mapping=nozzle_mapping,
+                bed_type=bed_type,
             )
         return False
 

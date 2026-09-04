@@ -1250,17 +1250,26 @@ class ArchiveService:
             del metadata["_thumbnail_data"]
             del metadata["_thumbnail_ext"]
         elif dest_file.suffix.lower() == ".gcode":
-            # Extract thumbnail embedded in .gcode header comments (; thumbnail begin ... ; thumbnail end)
+            # Extract thumbnail and metadata embedded in .gcode header/footer comments
             try:
                 from backend.app.api.routes.library import extract_gcode_thumbnail
+                from backend.app.utils.threemf_tools import extract_gcode_metadata
+
                 gcode_thumb = extract_gcode_thumbnail(dest_file)
                 if gcode_thumb:
                     thumb_file = archive_dir / "thumbnail.png"
                     thumb_file.write_bytes(gcode_thumb)
                     thumbnail_path = str(thumb_file.relative_to(settings.base_dir))
                     logger.info("Extracted G-code embedded thumbnail for %s", dest_file.name)
+
+                gcode_meta = extract_gcode_metadata(dest_file)
+                for k, v in gcode_meta.items():
+                    if v is not None and k not in metadata:
+                        metadata[k] = v
+                if "bed_type" in gcode_meta:
+                    logger.info("Extracted G-code bed_type for %s: %s", dest_file.name, gcode_meta["bed_type"])
             except Exception as e:
-                logger.warning("Failed to extract G-code thumbnail for %s: %s", dest_file.name, e)
+                logger.warning("Failed to extract G-code metadata for %s: %s", dest_file.name, e)
 
 
         # Merge with print data from MQTT

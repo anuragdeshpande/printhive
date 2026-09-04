@@ -43,6 +43,7 @@ async def upload_elegoo_file_async(
     local_path: Path,
     remote_filename: str,
     progress_callback=None,
+    timeout: float = 30.0,
 ) -> bool:
     """Upload a print file to an Elegoo CC1 printer via the chunked multipart protocol.
 
@@ -60,8 +61,9 @@ async def upload_elegoo_file_async(
     import uuid as _uuid
     import httpx
 
-    MAX_CHUNK = 2 * 1024 * 1024  # 2 MB per chunk for faster throughput
+    MAX_CHUNK = 1024 * 1024  # Elegoo's upload endpoint accepts at most 1 MB per chunk
 
+    chunk_label = "initialization"
     try:
         data = local_path.read_bytes()
         file_size = len(data)
@@ -72,8 +74,18 @@ async def upload_elegoo_file_async(
         num_chunks = max(1, (file_size + MAX_CHUNK - 1) // MAX_CHUNK)
         # Use HTTP/1.1 connection pool with keep-alive limits for fast chunk pipelining
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
-        async with httpx.AsyncClient(timeout=30.0, limits=limits) as client:
+        request_timeout = max(1.0, float(timeout))
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=min(5.0, request_timeout),
+                read=request_timeout,
+                write=request_timeout,
+                pool=min(5.0, request_timeout),
+            ),
+            limits=limits,
+        ) as client:
             for i in range(num_chunks):
+                chunk_label = f"chunk {i + 1}/{num_chunks}"
                 offset = i * MAX_CHUNK
                 chunk = data[offset: offset + MAX_CHUNK]
                 files = {"File": (remote_filename, chunk, "application/octet-stream")}
@@ -116,12 +128,19 @@ async def upload_elegoo_file_async(
                         "Elegoo upload chunk %d/%d: HTTP %d from printer",
                         i + 1, num_chunks, res.status_code
                     )
+                    return False
         logger.info("Elegoo HTTP upload of %s to %s succeeded (%d bytes)", remote_filename, ip_address, file_size)
         return True
 
 
     except Exception as e:
-        logger.warning("Elegoo chunked upload to %s failed: %s", ip_address, e)
+        logger.warning(
+            "Elegoo chunked upload to %s failed during %s (%s): %r",
+            ip_address,
+            chunk_label,
+            type(e).__name__,
+            e,
+        )
         return False
 
 from backend.app.services.notification_service import notification_service
@@ -3375,19 +3394,21 @@ class PrintScheduler:
         # pending->printing CAS) transparently open a fresh transaction.
         await db.commit()
 
-        # Delete existing file if present (avoids 553 error on overwrite)
-        try:
-            logger.debug("Queue item %s: Deleting existing file %s if present...", item.id, remote_path)
-            delete_result = await delete_file_async(
-                printer.ip_address,
-                printer.access_code,
-                remote_path,
-                socket_timeout=ftp_timeout,
-                printer_model=printer.model,
-            )
-            logger.debug("Queue item %s: Delete result: %s", item.id, delete_result)
-        except Exception as e:
-            logger.debug("Queue item %s: Delete failed (may not exist): %s", item.id, e)
+        # Elegoo's HTTP upload protocol replaces the target through its transfer
+        # session; it does not expose the FTP delete path used by Bambu printers.
+        if not is_elegoo_model(printer.model):
+            try:
+                logger.debug("Queue item %s: Deleting existing file %s if present...", item.id, remote_path)
+                delete_result = await delete_file_async(
+                    printer.ip_address,
+                    printer.access_code,
+                    remote_path,
+                    socket_timeout=ftp_timeout,
+                    printer_model=printer.model,
+                )
+                logger.debug("Queue item %s: Delete result: %s", item.id, delete_result)
+            except Exception as e:
+                logger.debug("Queue item %s: Delete failed (may not exist): %s", item.id, e)
 
         # Dispatch toast — announce the upload start with the total byte
         # count so the frontend can render an honest progress bar.
@@ -3417,13 +3438,28 @@ class PrintScheduler:
 
         try:
             if is_elegoo_model(printer.model):
-                uploaded = await upload_elegoo_file_async(
+                upload_args = (
                     printer.ip_address,
                     printer.access_code,
                     file_path,
                     remote_filename,
-                    progress_callback=progress_bridge,
                 )
+                if ftp_retry_enabled:
+                    uploaded = await with_ftp_retry(
+                        upload_elegoo_file_async,
+                        *upload_args,
+                        timeout=ftp_timeout,
+                        progress_callback=progress_bridge,
+                        max_retries=ftp_retry_count,
+                        retry_delay=ftp_retry_delay,
+                        operation_name=f"Elegoo upload to {printer.name}",
+                    )
+                else:
+                    uploaded = await upload_elegoo_file_async(
+                        *upload_args,
+                        timeout=ftp_timeout,
+                        progress_callback=progress_bridge,
+                    )
             elif ftp_retry_enabled:
                 uploaded = await with_ftp_retry(
                     upload_file_async,
@@ -3621,6 +3657,50 @@ class PrintScheduler:
         # FINISH-state fallback — no need to force a video.
         effective_timelapse = bool(item.timelapse)
 
+        # Resolve bed type for plate/platform configuration (Elegoo/Bambu plate support).
+        # Check source 3MF / G-code metadata first, then SDCP server options, then archive metadata.
+        effective_bed_type = None
+        if file_path is not None and file_path.exists():
+            if file_path.suffix.lower() in (".3mf", ".gcode.3mf"):
+                try:
+                    from backend.app.utils.threemf_tools import extract_bed_type_from_3mf
+
+                    effective_bed_type = extract_bed_type_from_3mf(file_path, item.plate_id)
+                except Exception:
+                    pass
+            elif file_path.suffix.lower() == ".gcode":
+                try:
+                    from backend.app.utils.threemf_tools import extract_bed_type_from_gcode
+
+                    effective_bed_type = extract_bed_type_from_gcode(file_path)
+                except Exception:
+                    pass
+
+        # Check SDCP options cached from OrcaSlicer WebSocket Cmd 128 (e.g. PrintPlatformType, Calibration_switch, Tlp_Switch)
+        effective_bed_levelling = item.bed_levelling
+        try:
+            from backend.app.services.virtual_printer.elegoo_sdcp_server import elegoo_sdcp_server
+
+            sdcp_opts = (
+                elegoo_sdcp_server.get_print_options(filename)
+                or elegoo_sdcp_server.get_print_options(remote_filename)
+            )
+            if sdcp_opts:
+                if not effective_bed_type:
+                    if sdcp_opts.get("platform_type") is not None:
+                        effective_bed_type = sdcp_opts["platform_type"]
+                    elif sdcp_opts.get("bed_type"):
+                        effective_bed_type = sdcp_opts["bed_type"]
+                if sdcp_opts.get("calibration_switch") is not None:
+                    effective_bed_levelling = bool(sdcp_opts["calibration_switch"])
+                if sdcp_opts.get("tlp_switch") is not None:
+                    effective_timelapse = bool(sdcp_opts["tlp_switch"])
+        except Exception:
+            pass
+
+        if not effective_bed_type and archive:
+            effective_bed_type = archive.bed_type
+
         # Start the print with AMS mapping, plate_id and print options.
         # nozzle_mapping rides through verbatim — JSON string captured from
         # Bambu Studio's project_file on VP intake (#1780); the MQTT layer
@@ -3631,7 +3711,7 @@ class PrintScheduler:
             remote_filename,
             plate_id=item.plate_id or 1,
             ams_mapping=ams_mapping,
-            bed_levelling=item.bed_levelling,
+            bed_levelling=effective_bed_levelling,
             flow_cali=item.flow_cali,
             vibration_cali=item.vibration_cali,
             layer_inspect=item.layer_inspect,
@@ -3639,6 +3719,7 @@ class PrintScheduler:
             use_ams=item.use_ams,
             nozzle_offset_cali=item.nozzle_offset_cali,
             nozzle_mapping=item.nozzle_mapping,
+            bed_type=effective_bed_type,
         )
 
         if started:

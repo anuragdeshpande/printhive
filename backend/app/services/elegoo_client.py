@@ -19,6 +19,58 @@ def is_elegoo_model(model: str | None) -> bool:
     return any(x in m for x in ["CENTAURI", "CC1", "CC2", "ELEGOO"])
 
 
+# Mapping of slicer bed/plate type names to Elegoo SDCP PrintPlatformType integers:
+# 0 = Textured PEI / Default
+# 1 = Smooth PEI / High Temp Plate / Cool Plate (OrcaSlicer uses 1 for Cool Plate on Elegoo CC1)
+# 2 = Engineering Plate
+# 4 = SuperTack / Epoxy Plate
+ELEGOO_PLATFORM_TYPES: dict[str, int] = {
+    # 0: Textured PEI / Default
+    "textured pei plate": 0,
+    "textured pei": 0,
+    "textured_plate": 0,
+    "pei plate": 0,
+    "pei": 0,
+    "default": 0,
+    "auto": 0,
+    # 1: Smooth PEI / High Temp Plate / Cool Plate
+    "high temp plate": 1,
+    "smooth pei plate": 1,
+    "smooth pei": 1,
+    "hot_plate": 1,
+    "smooth_plate": 1,
+    "cool plate": 1,
+    "cool_plate": 1,
+    "cool": 1,
+    "pc plate": 1,
+    "pc_plate": 1,
+    # 2: Engineering Plate
+    "engineering plate": 2,
+    "eng_plate": 2,
+    "engineering": 2,
+    # 4: SuperTack / Epoxy Plate
+    "supertack plate": 4,
+    "cool plate (supertack)": 4,
+    "bambu cool plate supertack": 4,
+    "epoxy_plate": 4,
+    "supertack": 4,
+}
+
+
+def map_bed_type_to_elegoo_platform_type(bed_type: str | int | None) -> int:
+    """Map a slicer bed-type string or numeric code to the Elegoo PrintPlatformType integer."""
+    if bed_type is None:
+        return 0
+    if isinstance(bed_type, int):
+        return bed_type
+    try:
+        return int(bed_type)
+    except (ValueError, TypeError):
+        pass
+    norm = str(bed_type).strip().lower()
+    return ELEGOO_PLATFORM_TYPES.get(norm, 0)
+
+
 class ElegooCentauriClient:
     """Compatibility wrapper that acts as a drop-in replacement for BambuMQTTClient,
     routing operations to an Elegoo printer via the pycentauri SDK.
@@ -101,25 +153,32 @@ class ElegooCentauriClient:
             self.on_state_change(self.state)
 
     async def _async_connect(self):
-        # Discover the mainboard_id once so we can pass it to connect_auto.
+        # Discover the mainboard_id so we can pass it to connect_auto.
         # The CC1 printer only pushes its mainboard ID when idle/active — when
         # paused or errored it is silent and any call that needs the ID (e.g.
         # attributes(), watch() internally) will time out waiting for it.
         # Passing mainboard_id= explicitly bypasses that wait entirely.
         _cached_mainboard_id: str | None = None
-        try:
-            discovered = await elegoo_discover(timeout=3.0)
-            for d in discovered:
-                if d.host == self.ip_address and d.mainboard_id:
-                    _cached_mainboard_id = d.mainboard_id
-                    logger.info("Discovered Elegoo mainboard_id=%s for %s", _cached_mainboard_id, self.ip_address)
-                    break
-        except Exception as e:
-            logger.warning("Elegoo discovery failed for %s, will rely on printer push: %s", self.ip_address, e)
 
         while True:
+            if not _cached_mainboard_id:
+                try:
+                    # Targeted discovery works from Docker/LXC networks where
+                    # LAN broadcast packets are not forwarded.
+                    discovered = await elegoo_discover(
+                        timeout=2.0,
+                        broadcast_address=self.ip_address,
+                    )
+                    for d in discovered:
+                        if d.host == self.ip_address and d.mainboard_id:
+                            _cached_mainboard_id = d.mainboard_id
+                            logger.info("Discovered Elegoo mainboard_id=%s for %s", _cached_mainboard_id, self.ip_address)
+                            break
+                except Exception as e:
+                    logger.debug("Elegoo discovery attempt failed for %s: %s", self.ip_address, e)
+
             try:
-                logger.info("Connecting to Elegoo printer at %s", self.ip_address)
+                logger.info("Connecting to Elegoo printer at %s (mainboard_id=%s)", self.ip_address, _cached_mainboard_id)
                 self._printer = await connect_auto(
                     self.ip_address,
                     access_code=self.access_code,
@@ -127,6 +186,8 @@ class ElegooCentauriClient:
                     enable_control=True,
                     mainboard_id=_cached_mainboard_id,
                 )
+                if self._printer.mainboard_id:
+                    _cached_mainboard_id = self._printer.mainboard_id
                 self.state.connected = True
 
                 if self.on_state_change:
@@ -134,6 +195,8 @@ class ElegooCentauriClient:
 
                 # Iterate watch loop to receive telemetry pushes
                 async for status in self._printer.watch():
+                    if self._printer.mainboard_id:
+                        _cached_mainboard_id = self._printer.mainboard_id
                     self._update_state(status)
 
             except asyncio.CancelledError:
@@ -166,6 +229,12 @@ class ElegooCentauriClient:
                     pass
                 self._printer = None
 
+            if self.state.connected:
+                self.state.connected = False
+                if self.on_state_change:
+                    self.on_state_change(self.state)
+            await asyncio.sleep(5.0)
+
 
 
     def _update_state(self, status: Status):
@@ -197,11 +266,17 @@ class ElegooCentauriClient:
             self.state.layer_num = status.print_info.current_layer or 0
             self.state.total_layers = status.print_info.total_layer or 0
             
-            # Map remaining time from ticks if available (ticks are typically ms or seconds depending on FW)
-            # Elegoo print ticks are in seconds. We divide by 60 to store in minutes to match Bambuddy's expected schema.
+            # Map remaining time from ticks if available (ticks are in seconds).
+            # We divide by 60 to store in minutes to match expected schema.
             cur_ticks = status.print_info.current_ticks or 0.0
             tot_ticks = status.print_info.total_ticks or 0.0
-            self.state.remaining_time = max(0, int((tot_ticks - cur_ticks) / 60))
+            if tot_ticks > cur_ticks:
+                self.state.remaining_time = max(1 if self.state.progress < 100 else 0, int(round((tot_ticks - cur_ticks) / 60.0)))
+            elif cur_ticks > 0 and 0 < self.state.progress < 100:
+                est_total = cur_ticks / (self.state.progress / 100.0)
+                self.state.remaining_time = max(1, int(round((est_total - cur_ticks) / 60.0)))
+            else:
+                self.state.remaining_time = 0
 
 
             
@@ -333,12 +408,16 @@ class ElegooCentauriClient:
         except Exception:
             pass
 
-    def _run_async(self, coro) -> bool:
+    def _run_async(self, coro, action_name: str = "action") -> bool:
         if self._loop and self._loop.is_running():
             task = self._loop.create_task(coro)
             def _handle_done(t: asyncio.Task):
-                if not t.cancelled() and t.exception():
-                    logger.error("Elegoo async task failed: %s", t.exception())
+                if not t.cancelled():
+                    exc = t.exception()
+                    if exc:
+                        logger.error("Elegoo %s task failed on %s: %s", action_name, self.ip_address, exc)
+                    else:
+                        logger.info("Elegoo %s completed successfully on %s: %s", action_name, self.ip_address, t.result())
             task.add_done_callback(_handle_done)
             return True
         return False
@@ -351,33 +430,54 @@ class ElegooCentauriClient:
         filename: str,
         plate_id: int = 1,
         ams_mapping: list[int] | None = None,
-        bed_levelling: bool = True,
-        flow_cali: bool = False,
+        bed_levelling: bool | str = True,
+        flow_cali: bool | str = False,
         vibration_cali: bool = True,
         layer_inspect: bool = False,
         timelapse: bool = False,
         use_ams: bool = True,
-        nozzle_offset_cali: bool = False,
+        nozzle_offset_cali: bool | str = False,
         nozzle_mapping: str | None = None,
+        bed_type: str | int | None = None,
     ) -> bool:
         if not self._printer:
+            logger.error("ElegooCentauriClient: cannot start_print on %s — printer client not connected", self.ip_address)
             return False
         # Optimistically record filename on state so current_print is available during PREPARE
         self.state.current_print = filename
         self.state.subtask_name = filename
         self.state.gcode_file = filename
-        return self._run_async(self._printer.start_print(filename, storage="local"))
+        auto_level = bed_levelling != "off" if isinstance(bed_levelling, str) else bool(bed_levelling)
+        platform_type = map_bed_type_to_elegoo_platform_type(bed_type)
+        logger.info(
+            "ElegooCentauriClient: Sending start_print to %s: file=%s, auto_level=%s, platform_type=%s, timelapse=%s",
+            self.ip_address,
+            filename,
+            auto_level,
+            platform_type,
+            timelapse,
+        )
+        return self._run_async(
+            self._printer.start_print(
+                filename,
+                storage="local",
+                auto_leveling=auto_level,
+                timelapse=timelapse,
+                platform_type=platform_type,
+            ),
+            action_name=f"start_print({filename})",
+        )
 
 
     def stop_print(self) -> bool:
         if not self._printer:
             return False
-        return self._run_async(self._printer.stop())
+        return self._run_async(self._printer.stop(), action_name="stop_print")
 
     def pause_print(self) -> bool:
         if not self._printer:
             return False
-        return self._run_async(self._printer.pause())
+        return self._run_async(self._printer.pause(), action_name="pause_print")
 
     def resume_print(self) -> bool:
         if not self._printer:
@@ -490,4 +590,3 @@ class ElegooCentauriClient:
 
     def check_staleness(self) -> bool:
         return self.state.connected
-

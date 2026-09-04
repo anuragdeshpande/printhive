@@ -32,23 +32,60 @@ class TestElegooCentauriClient:
         assert isinstance(client.state, PrinterState)
         assert client.connected is False
 
+    @patch("backend.app.services.elegoo_client.elegoo_discover", new_callable=AsyncMock)
     @patch("backend.app.services.elegoo_client.connect_auto", new_callable=AsyncMock)
     @pytest.mark.asyncio
-    async def test_async_connect(self, mock_connect, client):
+    async def test_async_connect(self, mock_connect, mock_discover, client):
+        mock_discover.return_value = []
+        async def mock_watch():
+            if False:
+                yield
+            raise asyncio.CancelledError()
+
         mock_printer = MagicMock()
-        mock_printer.attributes = AsyncMock(return_value=MagicMock(firmware_version="V1.0"))
+        mock_printer.watch = mock_watch
+        mock_printer.close = AsyncMock()
         mock_connect.return_value = mock_printer
 
         client._loop = asyncio.get_running_loop()
         await client._async_connect()
 
         assert client.state.connected is True
-        assert client.state.firmware_version == "V1.0"
+        mock_discover.assert_called_once_with(
+            timeout=2.0,
+            broadcast_address="192.168.1.150",
+        )
         mock_connect.assert_called_once_with(
             "192.168.1.150",
             access_code="Abcd12",
-            enable_control=True
+            connect_timeout=5.0,
+            enable_control=True,
+            mainboard_id=None,
         )
+
+    @patch("backend.app.services.elegoo_client.elegoo_discover", new_callable=AsyncMock)
+    @patch("backend.app.services.elegoo_client.connect_auto", new_callable=AsyncMock)
+    @pytest.mark.asyncio
+    async def test_async_connect_marks_normal_watch_disconnect_offline(
+        self, mock_connect, mock_discover, client, monkeypatch
+    ):
+        mock_discover.return_value = []
+        monkeypatch.setattr("backend.app.services.elegoo_client.asyncio.sleep", AsyncMock())
+
+        async def mock_watch():
+            if False:
+                yield
+
+        mock_printer = MagicMock()
+        mock_printer.mainboard_id = None
+        mock_printer.watch = mock_watch
+        mock_printer.close = AsyncMock()
+        mock_connect.side_effect = [mock_printer, asyncio.CancelledError()]
+
+        await client._async_connect()
+
+        assert client.state.connected is False
+        assert mock_printer.close.await_count == 1
 
     def test_update_state_running(self, client):
         status_payload = {
@@ -135,6 +172,7 @@ class TestElegooCentauriClient:
         client._printer.set_print_speed = AsyncMock()
         client._printer.set_temperatures = AsyncMock()
         client._printer.set_fan_speed = AsyncMock()
+        client._printer.start_print = AsyncMock()
         client._loop = MagicMock()
 
         assert client.stop_print() is True
@@ -144,3 +182,56 @@ class TestElegooCentauriClient:
         assert client.set_nozzle_temperature(230) is True
         assert client.set_bed_temperature(65) is True
         assert client.set_fan_speed(1, 128) is True
+
+    def test_start_print_platform_types(self, client):
+        from backend.app.services.elegoo_client import map_bed_type_to_elegoo_platform_type
+
+        # Verify platform type mapping
+        assert map_bed_type_to_elegoo_platform_type("Textured PEI Plate") == 0
+        assert map_bed_type_to_elegoo_platform_type("textured_plate") == 0
+        assert map_bed_type_to_elegoo_platform_type("High Temp Plate") == 1
+        assert map_bed_type_to_elegoo_platform_type("Smooth PEI Plate") == 1
+        assert map_bed_type_to_elegoo_platform_type("hot_plate") == 1
+        assert map_bed_type_to_elegoo_platform_type("Engineering Plate") == 2
+        assert map_bed_type_to_elegoo_platform_type("eng_plate") == 2
+        assert map_bed_type_to_elegoo_platform_type("Cool Plate") == 1
+        assert map_bed_type_to_elegoo_platform_type("cool_plate") == 1
+        assert map_bed_type_to_elegoo_platform_type("SuperTack Plate") == 4
+        assert map_bed_type_to_elegoo_platform_type("epoxy_plate") == 4
+        assert map_bed_type_to_elegoo_platform_type(None) == 0
+
+        # Verify start_print delegates with correct platform_type
+        mock_printer = MagicMock()
+        mock_printer.start_print = AsyncMock()
+        client._printer = mock_printer
+        client._loop = MagicMock()
+
+        # Test with High Temp / Smooth PEI
+        client.start_print("test.gcode", bed_type="High Temp Plate")
+        mock_printer.start_print.assert_called_with(
+            "test.gcode",
+            storage="local",
+            auto_leveling=True,
+            timelapse=False,
+            platform_type=1,
+        )
+
+        # Test with Engineering Plate
+        client.start_print("test.gcode", bed_type="Engineering Plate")
+        mock_printer.start_print.assert_called_with(
+            "test.gcode",
+            storage="local",
+            auto_leveling=True,
+            timelapse=False,
+            platform_type=2,
+        )
+
+        # Test with Cool Plate
+        client.start_print("test.gcode", bed_type="Cool Plate")
+        mock_printer.start_print.assert_called_with(
+            "test.gcode",
+            storage="local",
+            auto_leveling=True,
+            timelapse=False,
+            platform_type=1,
+        )
