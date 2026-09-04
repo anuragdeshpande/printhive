@@ -343,8 +343,8 @@ PYEOF
     log_info "Staging OrcaSlicer configurations and presets..."
     pct_exec "mkdir -p /opt/orcaslicer/config/.config/OrcaSlicer"
     COPYFILE_DISABLE=1 tar --format ustar --no-mac-metadata --no-xattrs -C "$ORCA_BACKUP_DIR" -cf - . | pve_exec "pct exec ${VMID} -- tar --warning=no-unknown-keyword -C /opt/orcaslicer/config/.config/OrcaSlicer -xf -"
-    pct_exec "find /opt/orcaslicer/config -name '._*' -delete 2>/dev/null || true && chown -R 1000:1000 /opt/orcaslicer"
-    log_ok "OrcaSlicer profiles imported."
+    pct_exec "mkdir -p /opt/orcaslicer/config/.config/labwc && printf '#!/usr/bin/env bash\n/opt/orcaslicer/AppRun &\n' > /opt/orcaslicer/config/.config/labwc/autostart && chmod +x /opt/orcaslicer/config/.config/labwc/autostart && find /opt/orcaslicer/config -name '._*' -delete 2>/dev/null || true && chown -R 1000:1000 /opt/orcaslicer"
+    log_ok "OrcaSlicer profiles imported and autostart configured."
 }
 
 # ------------------------------------------------------------------------------
