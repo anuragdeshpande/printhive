@@ -413,6 +413,8 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=America/Denver
+      - GTK_THEME=Adwaita:dark
+      - DARK_MODE=true
     volumes:
       - /opt/orcaslicer/config:/config
       - printhive_data:/prints:ro

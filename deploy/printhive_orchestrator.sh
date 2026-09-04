@@ -343,8 +343,8 @@ PYEOF
     log_info "Staging OrcaSlicer configurations and presets..."
     pct_exec "mkdir -p /opt/orcaslicer/config/.config/OrcaSlicer"
     COPYFILE_DISABLE=1 tar --format ustar --no-mac-metadata --no-xattrs -C "$ORCA_BACKUP_DIR" -cf - . | pve_exec "pct exec ${VMID} -- tar --warning=no-unknown-keyword -C /opt/orcaslicer/config/.config/OrcaSlicer -xf -"
-    pct_exec "mkdir -p /opt/orcaslicer/config/.config/labwc && printf '#!/usr/bin/env bash\n/opt/orcaslicer/AppRun &\n' > /opt/orcaslicer/config/.config/labwc/autostart && chmod +x /opt/orcaslicer/config/.config/labwc/autostart && find /opt/orcaslicer/config -name '._*' -delete 2>/dev/null || true && chown -R 1000:1000 /opt/orcaslicer"
-    log_ok "OrcaSlicer profiles imported and autostart configured."
+    pct_exec "mkdir -p /opt/orcaslicer/config/.config/labwc /opt/orcaslicer/config/.config/gtk-3.0 && printf '#!/usr/bin/env bash\nexport GTK_THEME=Adwaita:dark\nexport GTK_APPLICATION_PREFER_DARK_THEME=1\n/opt/orcaslicer/AppRun &\n' > /opt/orcaslicer/config/.config/labwc/autostart && chmod +x /opt/orcaslicer/config/.config/labwc/autostart && printf '[Settings]\ngtk-theme-name = Adwaita-dark\ngtk-application-prefer-dark-theme = 1\n' > /opt/orcaslicer/config/.config/gtk-3.0/settings.ini && sed -i 's/\"dark_color_mode\": \"0\"/\"dark_color_mode\": \"1\"/g' /opt/orcaslicer/config/.config/OrcaSlicer/OrcaSlicer.conf 2>/dev/null || true && find /opt/orcaslicer/config -name '._*' -delete 2>/dev/null || true && chown -R 1000:1000 /opt/orcaslicer"
+    log_ok "OrcaSlicer profiles imported and Dark Mode autostart configured."
 }
 
 # ------------------------------------------------------------------------------
@@ -540,6 +540,8 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=America/Denver
+      - GTK_THEME=Adwaita:dark
+      - DARK_MODE=true
     volumes:
       - /opt/orcaslicer/config:/config
       - printhive_data:/prints:ro
