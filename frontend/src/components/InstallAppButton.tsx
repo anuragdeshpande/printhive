@@ -41,7 +41,14 @@ export function InstallAppButton() {
     };
   }, []);
 
-  if (!promptEvent) {
+  const isApp = typeof window !== 'undefined' && (
+    window.matchMedia('(display-mode: standalone)').matches ||
+    (window.navigator as any).standalone ||
+    (window as any).isPrintHiveApp ||
+    navigator.userAgent.includes('PrintHiveApp')
+  );
+
+  if (!promptEvent || isApp) {
     return null;
   }
 

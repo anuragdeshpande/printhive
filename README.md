@@ -207,10 +207,11 @@ Run the automated helper script on your client laptop/desktop:
 chmod +x deploy/install_cert.sh
 ./deploy/install_cert.sh
 ```
-*Or single-line direct trust on macOS:*
+*Or single-line direct trust on macOS (no sudo needed):*
 ```bash
-curl -k -sSL https://printhive.local.home/cert | sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain -
+curl -kfsSL https://printhive.local.home/cert -o /tmp/printhive.crt && security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db /tmp/printhive.crt
 ```
+*(Or system-wide for all users with sudo: `sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /tmp/printhive.crt`)*
 
 ### 2. Apple iOS / iPadOS (1-Tap Profile Installation)
 1. Open **Safari** on your iPhone/iPad and navigate to:
@@ -227,10 +228,18 @@ curl -k -sSL https://printhive.local.home/cert | sudo security add-trusted-cert 
 2. In the top menu bar, click **File** $\rightarrow$ **Add to Dock...**.
 3. PrintHive will run as a standalone Mac application directly from your Dock and Launchpad.
 
-### 4. Chrome / Edge (Desktop & Android)
-1. Navigate to `https://printhive.local.home/`.
-2. Click the **Install PrintHive** icon in the address bar (`⊕`) or tap the in-app **Install App** button in the sidebar.
-3. On Android: tap Chrome menu (`⋮`) $\rightarrow$ **Install app**.
+### 4. Android (Dedicated Standalone App or PWA)
+
+#### Option A: Native Standalone App (Recommended)
+Download and install the standalone **PrintHive APK** directly onto your Android device:
+1. Download **`PrintHive.apk`** from the latest [**GitHub Releases**](https://github.com/anuragdeshpande/printBuddy/releases).
+2. Tap the downloaded `.apk` to install (allow installing unknown apps when prompted).
+3. Open **PrintHive** from your launcher. It launches in immersive full-screen with edge-to-edge status bar support, pull-to-refresh, file uploads, and zero browser address bars!
+
+#### Option B: Browser PWA (Desktop & Android)
+1. Navigate to `https://printhive.local.home/` or `https://<YOUR-SERVER-IP>/`.
+2. Desktop (Chrome/Edge): Click the **Install PrintHive** icon in the address bar (`⊕`) or click **Install app** in the sidebar.
+3. Android (Chrome/Firefox): Tap menu (`⋮`) $\rightarrow$ **Install app** or **Add to Home screen**.
 
 ---
 

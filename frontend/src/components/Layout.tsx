@@ -98,7 +98,10 @@ export function Layout() {
   const [showSwitchbar, setShowSwitchbar] = useState(false);
   const [showInstallModal, setShowInstallModal] = useState(false);
   const isStandalone = typeof window !== 'undefined' && 
-    (window.matchMedia('(display-mode: standalone)').matches || (window.navigator as any).standalone);
+    (window.matchMedia('(display-mode: standalone)').matches || 
+     (window.navigator as any).standalone ||
+     (window as any).isPrintHiveApp ||
+     navigator.userAgent.includes('PrintHiveApp'));
   const defaultSidebarOrder = useMemo(() => defaultNavItems.map(i => i.id), []);
   const [sidebarOrder, setSidebarOrder] = useState<string[]>(() => getSidebarOrder(defaultNavItems.map(i => i.id)));
   const [hiddenSystemItemIds, setHiddenSystemItemIds] = useState<string[]>(getHiddenSidebarSystemItemIds);
