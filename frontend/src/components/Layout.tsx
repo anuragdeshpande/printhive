@@ -521,142 +521,333 @@ export function Layout() {
         </header>
       )}
 
-      {/* Compact Drawer Backdrop */}
+      {/* Mobile Bottom Sheet Backdrop */}
       {isSidebarCompact && mobileDrawerOpen && (
         <div
-          className="fixed inset-0 bg-black/60 z-40 transition-opacity"
+          className="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 transition-opacity"
           onClick={() => setMobileDrawerOpen(false)}
         />
       )}
 
-      {/* Sidebar / Mobile Drawer */}
-      <aside
-        className={`bg-bambu-dark-secondary border-r border-bambu-dark-tertiary flex flex-col transition-all duration-300 ${
-          isSidebarCompact
-            ? `fixed inset-y-0 left-0 z-50 w-72 transform ${mobileDrawerOpen ? 'translate-x-0' : '-translate-x-full'}`
-            : `fixed inset-y-0 left-0 z-30 ${sidebarExpanded ? 'w-64' : 'w-16'}`
-        }`}
-        style={isSidebarCompact ? {
-          paddingTop: 'var(--safe-area-top, env(safe-area-inset-top, 0px))',
-          paddingBottom: 'max(1rem, var(--safe-area-bottom, env(safe-area-inset-bottom, 0px)))'
-        } : undefined}
-      >
-        {/* Logo */}
-        <div className={`border-b border-bambu-dark-tertiary flex items-center justify-center ${isSidebarCompact || sidebarExpanded ? 'p-4' : 'p-2'}`}>
-          <PrintHiveLogo 
-            className={isSidebarCompact || sidebarExpanded ? 'h-16 w-auto' : 'h-8 w-8'} 
-            showText={isSidebarCompact || sidebarExpanded} 
-          />
-        </div>
+      {/* Mobile Bottom Sheet */}
+      {isSidebarCompact && mobileDrawerOpen && (
+        <div
+          className="fixed inset-x-0 bottom-0 z-50 bg-bambu-dark-secondary rounded-t-3xl border-t border-bambu-dark-tertiary shadow-2xl flex flex-col max-h-[85vh] animate-slide-up"
+          style={{
+            paddingBottom: 'max(1.25rem, var(--safe-area-bottom, env(safe-area-inset-bottom, 0px)))'
+          }}
+        >
+          {/* Header & Drag Handle */}
+          <div className="flex flex-col items-center pt-3 pb-3 px-5 border-b border-bambu-dark-tertiary flex-shrink-0">
+            <div
+              className="w-12 h-1.5 bg-bambu-gray/40 rounded-full mb-3 cursor-pointer hover:bg-bambu-gray/60 transition-colors"
+              onClick={() => setMobileDrawerOpen(false)}
+            />
+            <div className="w-full flex items-center justify-between">
+              <PrintHiveLogo className="h-7" showText={true} />
+              <button
+                onClick={() => setMobileDrawerOpen(false)}
+                className="p-1.5 rounded-lg hover:bg-bambu-dark-tertiary text-bambu-gray-light hover:text-white transition-colors"
+                aria-label="Close menu"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
 
-        {/* Navigation */}
-        <nav className="flex-1 p-2 overflow-y-auto">
-          <ul className="space-y-2">
-            {orderedSidebarIds.map((id) => {
-              const isExternal = isExternalSidebarItemId(id);
+          {/* Scrollable Navigation List */}
+          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+            <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {orderedSidebarIds.map((id) => {
+                const isExternal = isExternalSidebarItemId(id);
 
-              if (isExternal) {
-                // Render external link
-                const link = extLinksMap.get(id);
-                if (!link) return null;
+                if (isExternal) {
+                  const link = extLinksMap.get(id);
+                  if (!link) return null;
 
-                const LinkIcon = link.custom_icon ? null : getIconByName(link.icon);
-                return (
-                  <li key={id}>
-                    {link.open_in_new_tab ? (
-                      <a
-                        href={link.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className={`flex items-center ${isSidebarCompact || sidebarExpanded ? 'gap-3 px-4' : 'justify-center px-2'} py-3 rounded-lg transition-colors group text-bambu-gray-light hover:bg-bambu-dark-tertiary hover:text-white`}
-                        title={!isSidebarCompact && !sidebarExpanded ? link.name : undefined}
-                      >
-                        {link.custom_icon ? (
-                          <img
-                            src={api.getExternalLinkIconUrl(link.id)}
-                            alt=""
-                            className="w-5 h-5 flex-shrink-0"
-                          />
-                        ) : (
-                          LinkIcon && <LinkIcon className="w-5 h-5 flex-shrink-0" />
-                        )}
-                        {(isSidebarCompact || sidebarExpanded) && <span>{link.name}</span>}
-                      </a>
-                    ) : (
+                  const LinkIcon = link.custom_icon ? null : getIconByName(link.icon);
+                  return (
+                    <li key={id}>
+                      {link.open_in_new_tab ? (
+                        <a
+                          href={link.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          onClick={() => {
+                            triggerHaptic(20);
+                            setMobileDrawerOpen(false);
+                          }}
+                          className="flex items-center gap-3 px-4 py-3 rounded-xl bg-bambu-dark/40 hover:bg-bambu-dark-tertiary text-bambu-gray-light hover:text-white transition-colors"
+                        >
+                          {link.custom_icon ? (
+                            <img
+                              src={api.getExternalLinkIconUrl(link.id)}
+                              alt=""
+                              className="w-5 h-5 flex-shrink-0"
+                            />
+                          ) : (
+                            LinkIcon && <LinkIcon className="w-5 h-5 flex-shrink-0" />
+                          )}
+                          <span className="font-medium text-sm truncate">{link.name}</span>
+                        </a>
+                      ) : (
+                        <NavLink
+                          to={`/external/${link.id}`}
+                          onClick={() => {
+                            triggerHaptic(20);
+                            setMobileDrawerOpen(false);
+                          }}
+                          className={({ isActive }) =>
+                            `flex items-center gap-3 px-4 py-3 rounded-xl transition-colors ${
+                              isActive
+                                ? 'bg-bambu-green text-white font-semibold shadow-md'
+                                : 'bg-bambu-dark/40 text-bambu-gray-light hover:bg-bambu-dark-tertiary hover:text-white'
+                            }`
+                          }
+                        >
+                          {link.custom_icon ? (
+                            <img
+                              src={api.getExternalLinkIconUrl(link.id)}
+                              alt=""
+                              className="w-5 h-5 flex-shrink-0"
+                            />
+                          ) : (
+                            LinkIcon && <LinkIcon className="w-5 h-5 flex-shrink-0" />
+                          )}
+                          <span className="font-medium text-sm truncate">{link.name}</span>
+                        </NavLink>
+                      )}
+                    </li>
+                  );
+                } else {
+                  const navItem = navItemsMap.get(id);
+                  if (!navItem) return null;
+
+                  const { to, icon: Icon, labelKey } = navItem;
+                  const showQueueBadge = id === 'queue' && pendingQueueCount > 0;
+                  const showArchiveBadge = id === 'archives' && pendingUploadsCount > 0;
+                  const badgeCount = showQueueBadge ? pendingQueueCount : showArchiveBadge ? pendingUploadsCount : 0;
+                  const showBadge = showQueueBadge || showArchiveBadge;
+                  const showClearPlateDot = id === 'printers' && needsClearPlate;
+
+                  return (
+                    <li key={id}>
                       <NavLink
-                        to={`/external/${link.id}`}
+                        to={to}
+                        onClick={() => {
+                          triggerHaptic(20);
+                          setMobileDrawerOpen(false);
+                        }}
                         className={({ isActive }) =>
-                          `flex items-center ${isSidebarCompact || sidebarExpanded ? 'gap-3 px-4' : 'justify-center px-2'} py-3 rounded-lg transition-colors group ${
+                          `flex items-center gap-3 px-4 py-3 rounded-xl transition-colors ${
+                            isActive
+                              ? 'bg-bambu-green text-white font-semibold shadow-md'
+                              : 'bg-bambu-dark/40 text-bambu-gray-light hover:bg-bambu-dark-tertiary hover:text-white'
+                          }`
+                        }
+                      >
+                        <div className="relative">
+                          <Icon className="w-5 h-5 flex-shrink-0" />
+                          {showClearPlateDot && (
+                            <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-yellow-500 rounded-full border border-bambu-dark-secondary" />
+                          )}
+                          {showBadge && (
+                            <span className={`absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center text-[10px] font-bold rounded-full ${
+                              showArchiveBadge ? 'bg-blue-500 text-white' : 'bg-yellow-500 text-black'
+                            }`}>
+                              {badgeCount > 99 ? '99+' : badgeCount}
+                            </span>
+                          )}
+                        </div>
+                        <span className="font-medium text-sm">{t(labelKey)}</span>
+                      </NavLink>
+                    </li>
+                  );
+                }
+              })}
+            </ul>
+
+            {/* Quick Actions & Preferences */}
+            <div className="pt-3 border-t border-bambu-dark-tertiary flex items-center justify-between gap-2 flex-wrap">
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    toggleMode();
+                    triggerHaptic(20);
+                  }}
+                  className="px-3 py-2 rounded-xl bg-bambu-dark/40 hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white flex items-center gap-2 text-xs font-medium"
+                  title={themeSwitchTitle}
+                >
+                  <ThemeIcon className="w-4 h-4" />
+                  <span className="capitalize">{mode}</span>
+                </button>
+                {hasPermission('system:read') && (
+                  <NavLink
+                    to="/system"
+                    onClick={() => {
+                      triggerHaptic(20);
+                      setMobileDrawerOpen(false);
+                    }}
+                    className="px-3 py-2 rounded-xl bg-bambu-dark/40 hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white flex items-center gap-2 text-xs font-medium"
+                    title={t('nav.system')}
+                  >
+                    <Info className="w-4 h-4" />
+                    <span>{t('nav.system')}</span>
+                  </NavLink>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                {authEnabled && user && (
+                  <>
+                    <button
+                      onClick={() => {
+                        setShowChangePasswordModal(true);
+                        setMobileDrawerOpen(false);
+                      }}
+                      className="p-2 rounded-xl bg-bambu-dark/40 hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                      title={t('changePassword.title')}
+                    >
+                      <Key className="w-4 h-4" />
+                    </button>
+                    <button
+                      onClick={() => {
+                        logout();
+                        setMobileDrawerOpen(false);
+                      }}
+                      className="p-2 rounded-xl bg-bambu-dark/40 hover:bg-red-500/20 text-red-400 hover:text-red-300 transition-colors"
+                      title={t('nav.logout', { defaultValue: 'Logout' })}
+                    >
+                      <LogOut className="w-4 h-4" />
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Desktop Sidebar */}
+      {!isSidebarCompact && (
+        <aside
+          className={`bg-bambu-dark-secondary border-r border-bambu-dark-tertiary flex flex-col transition-all duration-300 fixed inset-y-0 left-0 z-30 ${sidebarExpanded ? 'w-64' : 'w-16'}`}
+        >
+          {/* Logo */}
+          <div className={`border-b border-bambu-dark-tertiary flex items-center justify-center ${sidebarExpanded ? 'p-4' : 'p-2'}`}>
+            <PrintHiveLogo 
+              className={sidebarExpanded ? 'h-16 w-auto' : 'h-8 w-8'} 
+              showText={sidebarExpanded} 
+            />
+          </div>
+
+          {/* Navigation */}
+          <nav className="flex-1 p-2 overflow-y-auto">
+            <ul className="space-y-2">
+              {orderedSidebarIds.map((id) => {
+                const isExternal = isExternalSidebarItemId(id);
+
+                if (isExternal) {
+                  // Render external link
+                  const link = extLinksMap.get(id);
+                  if (!link) return null;
+
+                  const LinkIcon = link.custom_icon ? null : getIconByName(link.icon);
+                  return (
+                    <li key={id}>
+                      {link.open_in_new_tab ? (
+                        <a
+                          href={link.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className={`flex items-center ${sidebarExpanded ? 'gap-3 px-4' : 'justify-center px-2'} py-3 rounded-lg transition-colors group text-bambu-gray-light hover:bg-bambu-dark-tertiary hover:text-white`}
+                          title={!sidebarExpanded ? link.name : undefined}
+                        >
+                          {link.custom_icon ? (
+                            <img
+                              src={api.getExternalLinkIconUrl(link.id)}
+                              alt=""
+                              className="w-5 h-5 flex-shrink-0"
+                            />
+                          ) : (
+                            LinkIcon && <LinkIcon className="w-5 h-5 flex-shrink-0" />
+                          )}
+                          {sidebarExpanded && <span>{link.name}</span>}
+                        </a>
+                      ) : (
+                        <NavLink
+                          to={`/external/${link.id}`}
+                          className={({ isActive }) =>
+                            `flex items-center ${sidebarExpanded ? 'gap-3 px-4' : 'justify-center px-2'} py-3 rounded-lg transition-colors group ${
+                              isActive
+                                ? 'bg-bambu-green text-white'
+                                : 'text-bambu-gray-light hover:bg-bambu-dark-tertiary hover:text-white'
+                            }`
+                          }
+                          title={!sidebarExpanded ? link.name : undefined}
+                        >
+                          {link.custom_icon ? (
+                            <img
+                              src={api.getExternalLinkIconUrl(link.id)}
+                              alt=""
+                              className="w-5 h-5 flex-shrink-0"
+                            />
+                          ) : (
+                            LinkIcon && <LinkIcon className="w-5 h-5 flex-shrink-0" />
+                          )}
+                          {sidebarExpanded && <span>{link.name}</span>}
+                        </NavLink>
+                      )}
+                    </li>
+                  );
+                } else {
+                  // Render internal nav item
+                  const navItem = navItemsMap.get(id);
+                  if (!navItem) return null;
+
+                  const { to, icon: Icon, labelKey } = navItem;
+                  const showQueueBadge = id === 'queue' && pendingQueueCount > 0;
+                  const showArchiveBadge = id === 'archives' && pendingUploadsCount > 0;
+                  const badgeCount = showQueueBadge ? pendingQueueCount : showArchiveBadge ? pendingUploadsCount : 0;
+                  const showBadge = showQueueBadge || showArchiveBadge;
+                  const showClearPlateDot = id === 'printers' && needsClearPlate;
+
+                  return (
+                    <li key={id}>
+                      <NavLink
+                        to={to}
+                        className={({ isActive }) =>
+                          `flex items-center ${sidebarExpanded ? 'gap-3 px-4' : 'justify-center px-2'} py-3 rounded-lg transition-colors group ${
                             isActive
                               ? 'bg-bambu-green text-white'
                               : 'text-bambu-gray-light hover:bg-bambu-dark-tertiary hover:text-white'
                           }`
                         }
-                        title={!isSidebarCompact && !sidebarExpanded ? link.name : undefined}
+                        title={!sidebarExpanded ? t(labelKey) : undefined}
                       >
-                        {link.custom_icon ? (
-                          <img
-                            src={api.getExternalLinkIconUrl(link.id)}
-                            alt=""
-                            className="w-5 h-5 flex-shrink-0"
-                          />
-                        ) : (
-                          LinkIcon && <LinkIcon className="w-5 h-5 flex-shrink-0" />
-                        )}
-                        {(isSidebarCompact || sidebarExpanded) && <span>{link.name}</span>}
+                        <div className="relative">
+                          <Icon className="w-5 h-5 flex-shrink-0" />
+                          {showClearPlateDot && (
+                            <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-yellow-500 rounded-full border-2 border-bambu-dark-secondary" />
+                          )}
+                          {showBadge && (
+                            <span className={`absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center text-[10px] font-bold rounded-full ${
+                              showArchiveBadge ? 'bg-blue-500 text-white' : 'bg-yellow-500 text-black'
+                            }`}>
+                              {badgeCount > 99 ? '99+' : badgeCount}
+                            </span>
+                          )}
+                        </div>
+                        {sidebarExpanded && <span>{t(labelKey)}</span>}
                       </NavLink>
-                    )}
-                  </li>
-                );
-              } else {
-                // Render internal nav item
-                const navItem = navItemsMap.get(id);
-                if (!navItem) return null;
+                    </li>
+                  );
+                }
+              })}
+            </ul>
+          </nav>
 
-                const { to, icon: Icon, labelKey } = navItem;
-                const showQueueBadge = id === 'queue' && pendingQueueCount > 0;
-                const showArchiveBadge = id === 'archives' && pendingUploadsCount > 0;
-                const badgeCount = showQueueBadge ? pendingQueueCount : showArchiveBadge ? pendingUploadsCount : 0;
-                const showBadge = showQueueBadge || showArchiveBadge;
-                const showClearPlateDot = id === 'printers' && needsClearPlate;
-
-                return (
-                  <li key={id}>
-                    <NavLink
-                      to={to}
-                      className={({ isActive }) =>
-                        `flex items-center ${isSidebarCompact || sidebarExpanded ? 'gap-3 px-4' : 'justify-center px-2'} py-3 rounded-lg transition-colors group ${
-                          isActive
-                            ? 'bg-bambu-green text-white'
-                            : 'text-bambu-gray-light hover:bg-bambu-dark-tertiary hover:text-white'
-                        }`
-                      }
-                      title={!isSidebarCompact && !sidebarExpanded ? t(labelKey) : undefined}
-                    >
-                      <div className="relative">
-                        <Icon className="w-5 h-5 flex-shrink-0" />
-                        {showClearPlateDot && (
-                          <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-yellow-500 rounded-full border-2 border-bambu-dark-secondary" />
-                        )}
-                        {showBadge && (
-                          <span className={`absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center text-[10px] font-bold rounded-full ${
-                            showArchiveBadge ? 'bg-blue-500 text-white' : 'bg-yellow-500 text-black'
-                          }`}>
-                            {badgeCount > 99 ? '99+' : badgeCount}
-                          </span>
-                        )}
-                      </div>
-                      {(isSidebarCompact || sidebarExpanded) && <span>{t(labelKey)}</span>}
-                    </NavLink>
-                  </li>
-                );
-              }
-            })}
-          </ul>
-        </nav>
-
-        {/* Collapse toggle - hide on compact sidebar */}
-        {!isSidebarCompact && (
+          {/* Collapse toggle */}
           <button
             onClick={() => setSidebarExpanded(!sidebarExpanded)}
             className="p-2 mx-2 mb-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white flex items-center justify-center"
@@ -668,14 +859,124 @@ export function Layout() {
               <ChevronRight className="w-5 h-5" />
             )}
           </button>
-        )}
 
-        {/* Footer */}
-        <div className="flex-shrink-0 p-2 border-t border-bambu-dark-tertiary">
-          {isSidebarCompact || sidebarExpanded ? (
-            <div className="flex flex-col gap-2 px-2">
-              {/* Top row: icons */}
-              <div className="flex items-center justify-center gap-1 flex-wrap">
+          {/* Footer */}
+          <div className="flex-shrink-0 p-2 border-t border-bambu-dark-tertiary">
+            {sidebarExpanded ? (
+              <div className="flex flex-col gap-2 px-2">
+                {/* Top row: icons */}
+                <div className="flex items-center justify-center gap-1 flex-wrap">
+                  {hasSwitchbarPlugs && (
+                    <div className="relative">
+                      <button
+                        onMouseEnter={() => setShowSwitchbar(true)}
+                        className={`p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors ${
+                          showSwitchbar ? 'text-bambu-green' : 'text-bambu-gray-light hover:text-white'
+                        }`}
+                        title={t('nav.smartSwitches', { defaultValue: 'Smart Switches' })}
+                      >
+                        <Plug className="w-5 h-5" />
+                      </button>
+                      {showSwitchbar && (
+                        <SwitchbarPopover onClose={() => setShowSwitchbar(false)} />
+                      )}
+                    </div>
+                  )}
+                  {hasPermission('system:read') ? (
+                    <NavLink
+                      to="/system"
+                      className={({ isActive }) =>
+                        `p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors ${
+                          isActive ? 'text-bambu-green' : 'text-bambu-gray-light hover:text-white'
+                        }`
+                      }
+                      title={t('nav.system')}
+                    >
+                      <Info className="w-5 h-5" />
+                    </NavLink>
+                  ) : (
+                    <span
+                      className="p-2 rounded-lg text-bambu-gray/50 cursor-not-allowed"
+                      title="You do not have permission to view system information"
+                    >
+                      <Info className="w-5 h-5" />
+                    </span>
+                  )}
+                  <InstallAppButton />
+                  {!isStandalone && (
+                    <button
+                      onClick={() => setShowInstallModal(true)}
+                      className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                      title={t('pwa.installAppGuide', { defaultValue: 'Install App & SSL Guide' })}
+                      aria-label="Install App Guide"
+                    >
+                      <Smartphone className="w-5 h-5" />
+                    </button>
+                  )}
+                  <a
+                    href="https://github.com/anuragdeshpande/printBuddy"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                    title={t('nav.viewOnGithub')}
+                  >
+                    <Github className="w-5 h-5" />
+                  </a>
+                  <button
+                    onClick={() => setShowShortcuts(true)}
+                    className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                    title={t('nav.keyboardShortcuts')}
+                  >
+                    <Keyboard className="w-5 h-5" />
+                  </button>
+                </div>
+
+                {/* Bottom row: theme switch, change password (if logged in), logout button */}
+                <div className="flex items-center justify-between border-t border-bambu-dark-tertiary pt-2">
+                  <button
+                    onClick={toggleMode}
+                    className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                    title={themeSwitchTitle}
+                  >
+                    <ThemeIcon className="w-5 h-5" />
+                  </button>
+                  {authEnabled && user && (
+                    <>
+                      <button
+                        onClick={() => setShowChangePasswordModal(true)}
+                        className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                        title={t('changePassword.title')}
+                      >
+                        <Key className="w-5 h-5" />
+                      </button>
+                      <button
+                        onClick={logout}
+                        className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                        title={t('nav.logout', { defaultValue: 'Logout' })}
+                      >
+                        <LogOut className="w-5 h-5" />
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                {/* Bottom row: version */}
+                <div className="flex items-center justify-center gap-2">
+                  <span className="text-sm text-bambu-gray">v{versionInfo?.version || '...'}</span>
+                  {updateCheck?.update_available && (
+                    <button
+                      onClick={() => navigate('/settings')}
+                      className="flex items-center gap-1 text-xs text-bambu-green hover:text-bambu-green/80 transition-colors"
+                      title={t('nav.updateAvailable', { version: updateCheck.latest_version })}
+                    >
+                      <ArrowUpCircle className="w-4 h-4" />
+                      <span>{t('nav.update')}</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center gap-2">
                 {hasSwitchbarPlugs && (
                   <div className="relative">
                     <button
@@ -765,124 +1066,10 @@ export function Layout() {
                   </>
                 )}
               </div>
-              {/* Bottom row: version */}
-              <div className="flex items-center justify-center gap-2">
-                <span className="text-sm text-bambu-gray">v{versionInfo?.version || '...'}</span>
-                {updateCheck?.update_available && (
-                  <button
-                    onClick={() => navigate('/settings')}
-                    className="flex items-center gap-1 text-xs text-bambu-green hover:text-bambu-green/80 transition-colors"
-                    title={t('nav.updateAvailable', { version: updateCheck.latest_version })}
-                  >
-                    <ArrowUpCircle className="w-4 h-4" />
-                    <span>{t('nav.update')}</span>
-                  </button>
-                )}
-              </div>
-            </div>
-          ) : (
-            <div className="flex flex-col items-center gap-1 overflow-y-auto max-h-[50vh]">
-              {updateCheck?.update_available && (
-                <button
-                  onClick={() => navigate('/settings')}
-                  className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-green hover:text-bambu-green/80"
-                  title={t('nav.updateAvailable', { version: updateCheck.latest_version })}
-                >
-                  <ArrowUpCircle className="w-5 h-5" />
-                </button>
-              )}
-              {hasSwitchbarPlugs && (
-                <div className="relative">
-                  <button
-                    onMouseEnter={() => setShowSwitchbar(true)}
-                    className={`p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors ${
-                      showSwitchbar ? 'text-bambu-green' : 'text-bambu-gray-light hover:text-white'
-                    }`}
-                    title={t('nav.smartSwitches', { defaultValue: 'Smart Switches' })}
-                  >
-                    <Plug className="w-5 h-5" />
-                  </button>
-                  {showSwitchbar && (
-                    <SwitchbarPopover onClose={() => setShowSwitchbar(false)} />
-                  )}
-                </div>
-              )}
-              {hasPermission('system:read') ? (
-                <NavLink
-                  to="/system"
-                  className={({ isActive }) =>
-                    `p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors ${
-                      isActive ? 'text-bambu-green' : 'text-bambu-gray-light hover:text-white'
-                    }`
-                  }
-                  title={t('nav.system')}
-                >
-                  <Info className="w-5 h-5" />
-                </NavLink>
-              ) : (
-                <span
-                  className="p-2 rounded-lg text-bambu-gray/50 cursor-not-allowed"
-                  title="You do not have permission to view system information"
-                >
-                  <Info className="w-5 h-5" />
-                </span>
-              )}
-              <InstallAppButton />
-              {!isStandalone && (
-                <button
-                  onClick={() => setShowInstallModal(true)}
-                  className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
-                  title={t('pwa.installAppGuide', { defaultValue: 'Install App & SSL Guide' })}
-                  aria-label="Install App Guide"
-                >
-                  <Smartphone className="w-5 h-5" />
-                </button>
-              )}
-              <a
-                href="https://github.com/anuragdeshpande/printBuddy"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
-                title={t('nav.viewOnGithub')}
-              >
-                <Github className="w-5 h-5" />
-              </a>
-              <button
-                onClick={() => setShowShortcuts(true)}
-                className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
-                title={t('nav.keyboardShortcuts')}
-              >
-                <Keyboard className="w-5 h-5" />
-              </button>
-              <button
-                onClick={toggleMode}
-                className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
-                title={themeSwitchTitle}
-              >
-                <ThemeIcon className="w-5 h-5" />
-              </button>
-              {authEnabled && user && (
-                <>
-                  <button
-                    onClick={() => setShowChangePasswordModal(true)}
-                    className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
-                    title={t('changePassword.title')}
-                  >
-                    <Key className="w-5 h-5" />
-                  </button>
-                  <button
-                    onClick={logout}
-                    className="p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
-                    title={t('nav.logout', { defaultValue: 'Logout' })}
-                  >
-                    <LogOut className="w-5 h-5" />
-                  </button>
-                </>
-              )}
-            </div>
-          )}
-        </div>
-      </aside>
+            )}
+          </div>
+        </aside>
+      )}
 
       {/* Main content */}
       <main
