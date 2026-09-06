@@ -19,14 +19,16 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.graphics.Color
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.updatePadding
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 
 class MainActivity : AppCompatActivity() {
@@ -34,6 +36,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var swipeRefresh: SwipeRefreshLayout
     private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
+    private var cachedTopInsetDp: Int = 0
+    private var cachedBottomInsetDp: Int = 0
 
     private val filePickerLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -55,8 +59,21 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
+        // Ensure status bar and navigation bar are transparent with light icons
+        window.statusBarColor = Color.TRANSPARENT
+        window.navigationBarColor = Color.TRANSPARENT
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.isStatusBarContrastEnforced = false
+            window.isNavigationBarContrastEnforced = false
+        }
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
 
         swipeRefresh = findViewById(R.id.swipeRefresh)
         webView = findViewById(R.id.webView)
@@ -89,21 +106,41 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupInsets() {
-        // Ensure content is not drawn behind status bar / camera cutout or navigation bar
-        ViewCompat.setOnApplyWindowInsetsListener(swipeRefresh) { v, windowInsets ->
-            val insets = windowInsets.getInsets(
-                WindowInsetsCompat.Type.statusBars() or
-                WindowInsetsCompat.Type.displayCutout() or
+        // Draw edge-to-edge behind system bars without clipping or artificial letterboxing.
+        // We capture status and navigation insets and dynamically provide them as CSS variables.
+        ViewCompat.setOnApplyWindowInsetsListener(swipeRefresh) { _, windowInsets ->
+            val statusInsets = windowInsets.getInsets(
+                WindowInsetsCompat.Type.statusBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            val navInsets = windowInsets.getInsets(
                 WindowInsetsCompat.Type.navigationBars()
             )
-            v.updatePadding(
-                top = insets.top,
-                bottom = insets.bottom,
-                left = insets.left,
-                right = insets.right
+            val density = resources.displayMetrics.density
+            val topDp = if (density > 0) (statusInsets.top / density).toInt() else 0
+            val bottomDp = if (density > 0) (navInsets.bottom / density).toInt() else 0
+
+            cachedTopInsetDp = topDp
+            cachedBottomInsetDp = bottomDp
+
+            swipeRefresh.setProgressViewOffset(
+                false,
+                statusInsets.top,
+                statusInsets.top + (64 * density).toInt()
             )
+
+            injectSafeAreas(webView)
             windowInsets
         }
+    }
+
+    private fun injectSafeAreas(view: WebView? = webView) {
+        val script = """
+            (function() {
+                document.documentElement.style.setProperty('--safe-area-top', '${cachedTopInsetDp}px');
+                document.documentElement.style.setProperty('--safe-area-bottom', '${cachedBottomInsetDp}px');
+            })();
+        """.trimIndent()
+        view?.evaluateJavascript(script, null)
     }
 
     private fun setupSwipeRefresh() {
@@ -116,6 +153,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun injectStandaloneStyles(view: WebView?) {
+        injectSafeAreas(view)
         view?.evaluateJavascript("""
             (function() {
                 window.isPrintHiveApp = true;
@@ -135,7 +173,15 @@ class MainActivity : AppCompatActivity() {
 
                 function syncAuth() {
                     try {
-                        const token = sessionStorage.getItem('auth_token') || localStorage.getItem('auth_token') || '';
+                        let token = sessionStorage.getItem('auth_token') || localStorage.getItem('auth_token') || '';
+                        if (!token && window.PrintHiveBridge) {
+                            const bridgeToken = window.PrintHiveBridge.getAuthToken();
+                            if (bridgeToken) {
+                                localStorage.setItem('auth_token', bridgeToken);
+                                window.location.reload();
+                                return;
+                            }
+                        }
                         if (window.PrintHiveBridge && token) {
                             window.PrintHiveBridge.setAuthToken(token);
                         }
@@ -143,7 +189,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 syncAuth();
                 if (!window.__printhive_auth_sync_timer) {
-                    window.__printhive_auth_sync_timer = setInterval(syncAuth, 3000);
+                    window.__printhive_auth_sync_timer = setInterval(syncAuth, 10000);
                 }
             })();
         """.trimIndent(), null)
@@ -175,9 +221,16 @@ class MainActivity : AppCompatActivity() {
             }
 
             @android.webkit.JavascriptInterface
+            fun getAuthToken(): String {
+                return AuthStore.getToken(this@MainActivity) ?: ""
+            }
+
+            @android.webkit.JavascriptInterface
             fun setAuthToken(token: String?) {
-                AuthStore.setToken(this@MainActivity, token)
-                PrintHiveLiveService.triggerImmediatePoll(this@MainActivity)
+                val changed = AuthStore.setToken(this@MainActivity, token)
+                if (changed) {
+                    PrintHiveLiveService.triggerImmediatePoll(this@MainActivity)
+                }
             }
         }, "PrintHiveBridge")
 
@@ -208,9 +261,11 @@ class MainActivity : AppCompatActivity() {
                 view?.evaluateJavascript("(function() { return sessionStorage.getItem('auth_token') || localStorage.getItem('auth_token') || ''; })();") { token ->
                     val clean = token?.trim('"', ' ', '\'')?.takeIf { it.isNotBlank() && it != "null" }
                     if (clean != null) {
-                        AuthStore.setToken(this@MainActivity, clean)
+                        val changed = AuthStore.setToken(this@MainActivity, clean)
+                        if (changed) {
+                            PrintHiveLiveService.triggerImmediatePoll(this@MainActivity)
+                        }
                     }
-                    PrintHiveLiveService.triggerImmediatePoll(this@MainActivity)
                 }
             }
         }

@@ -2,10 +2,11 @@ import asyncio
 import logging
 import re
 import zipfile
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core import database
@@ -460,9 +461,9 @@ async def get_printer_status(
             connected=False,
         )
 
-    # Determine cover URL if there's an active print (including paused and prepare)
+    # Determine cover URL if there's an active print or finished print awaiting plate clear
     cover_url = None
-    if state.state in ("RUNNING", "PAUSE", "PREPARE") and state.gcode_file:
+    if (state.state in ("RUNNING", "PAUSE", "PREPARE", "FINISH") or printer_manager.is_awaiting_plate_clear(printer_id)):
         cover_url = f"/api/v1/printers/{printer_id}/cover"
 
 
@@ -718,7 +719,7 @@ async def get_printer_status(
     # is only meaningful then.
     current_archive_id: int | None = None
     current_plate_id: int | None = None
-    if state.state in ("RUNNING", "PAUSE", "PREPARE"):
+    if state.state in ("RUNNING", "PAUSE", "PREPARE", "FINISH") or printer_manager.is_awaiting_plate_clear(printer_id):
         current_plate_id = resolve_plate_id(state)
         from backend.app.models.archive import PrintArchive
         if state.subtask_id:
@@ -749,7 +750,6 @@ async def get_printer_status(
                 .where(
                     or_(
                         PrintArchive.filename.in_(clean_names),
-                        PrintArchive.subtask_name.in_(clean_names),
                         PrintArchive.print_name.in_(clean_names),
                     )
                 )
@@ -757,6 +757,24 @@ async def get_printer_status(
                 .limit(1)
             )
             current_archive_id = archive_row.scalar_one_or_none()
+
+        if not current_archive_id and (state.state == "FINISH" or printer_manager.is_awaiting_plate_clear(printer_id)):
+            from backend.app.models.print_log import PrintLogEntry
+            log_row = await db.execute(
+                select(PrintLogEntry.archive_id)
+                .where(PrintLogEntry.printer_id == printer_id, PrintLogEntry.archive_id != None)
+                .order_by(PrintLogEntry.id.desc())
+                .limit(1)
+            )
+            current_archive_id = log_row.scalar_one_or_none()
+            if not current_archive_id:
+                arch_row = await db.execute(
+                    select(PrintArchive.id)
+                    .where(PrintArchive.printer_id == printer_id)
+                    .order_by(PrintArchive.id.desc())
+                    .limit(1)
+                )
+                current_archive_id = arch_row.scalar_one_or_none()
 
     return PrinterStatus(
         id=printer_id,
@@ -1113,6 +1131,8 @@ def extract_gcode_thumbnail(gcode_bytes: bytes) -> bytes | None:
 async def get_printer_cover(
     printer_id: int,
     view: str | None = None,
+    archive: int | None = None,
+    job: str | None = None,
     _: None = RequireCameraStreamTokenIfAuthEnabled,
 ):
     """Get the cover image for the current print job.
@@ -1121,19 +1141,11 @@ async def get_printer_cover(
         view: Optional view type. Use "top" for the top-down build plate view or
               "pick" for the slicer's object-ID mask used by skip objects.
               Default returns angled 3D perspective view.
+        archive: Optional archive ID to fetch cover directly from archive.
+        job: Optional job/subtask name fallback.
     """
     # Fetch the printer in a short-lived session and release the pooled DB
-    # connection BEFORE the FTP download below. Previously this route took its
-    # row via Depends(get_db), whose session stays open for the whole request —
-    # so a 3MF cover download (up to 8 paths × 3 retries with backoff, minutes
-    # under FTP contention) pinned one pooled connection idle-in-transaction the
-    # entire time (issue #2572). db is used only for this one SELECT; everything
-    # after reads already-loaded printer.* scalars (expire_on_commit=False keeps
-    # them readable), printer_manager, and FTP/zip — no lazy loads.
-    #
-    # Reference async_session via the module so the maker is looked up at call
-    # time — keeps it in sync with reinitialize_database() and lets the test
-    # harness's patch of backend.app.core.database.async_session take effect.
+    # connection BEFORE the FTP download below.
     async with database.async_session() as db:
         result = await db.execute(select(Printer).where(Printer.id == printer_id))
         printer = result.scalar_one_or_none()
@@ -1144,8 +1156,44 @@ async def get_printer_cover(
     if not state:
         raise HTTPException(404, "Printer not connected")
 
+    # If archive query param provided, check if it has a thumbnail
+    if archive:
+        async with database.async_session() as db:
+            from backend.app.models.archive import PrintArchive
+            arch_res = await db.execute(select(PrintArchive).where(PrintArchive.id == archive))
+            arch_item = arch_res.scalar_one_or_none()
+            if arch_item and arch_item.thumbnail_path:
+                t_path = settings.base_dir / arch_item.thumbnail_path
+                if t_path.exists():
+                    return Response(content=t_path.read_bytes(), media_type="image/png")
+
     # Use subtask_name as the 3MF filename (gcode_file is the path inside the 3MF)
-    subtask_name = state.subtask_name
+    subtask_name = state.subtask_name or state.current_print or state.gcode_file or job
+    if not subtask_name:
+        # Check latest print log or archive for this printer
+        async with database.async_session() as db:
+            from backend.app.models.print_log import PrintLogEntry
+            from backend.app.models.archive import PrintArchive
+            log_res = await db.execute(
+                select(PrintLogEntry.print_name, PrintLogEntry.thumbnail_path, PrintLogEntry.archive_id)
+                .where(PrintLogEntry.printer_id == printer_id)
+                .order_by(PrintLogEntry.id.desc())
+                .limit(1)
+            )
+            latest_log = log_res.first()
+            if latest_log:
+                if latest_log.thumbnail_path:
+                    t_path = settings.base_dir / latest_log.thumbnail_path
+                    if t_path.exists():
+                        return Response(content=t_path.read_bytes(), media_type="image/png")
+                if latest_log.archive_id:
+                    arch_res = await db.execute(select(PrintArchive.thumbnail_path).where(PrintArchive.id == latest_log.archive_id))
+                    arch_th = arch_res.scalar_one_or_none()
+                    if arch_th:
+                        t_path = settings.base_dir / arch_th
+                        if t_path.exists():
+                            return Response(content=t_path.read_bytes(), media_type="image/png")
+                subtask_name = latest_log.print_name
     if not subtask_name:
         raise HTTPException(404, f"No subtask_name in printer state (state={state.state})")
 
@@ -1153,7 +1201,28 @@ async def get_printer_cover(
     if is_elegoo_model(printer.model):
         import os
         from backend.app.api.routes.library import extract_gcode_thumbnail as extract_local_gcode_thumbnail
+        from backend.app.models.archive import PrintArchive
         
+        # Step 0: Check database archives for matching print_name or filename
+        async with database.async_session() as db:
+            arch_res = await db.execute(
+                select(PrintArchive.thumbnail_path)
+                .where(
+                    or_(
+                        PrintArchive.print_name == subtask_name,
+                        PrintArchive.filename == subtask_name,
+                    ),
+                    PrintArchive.thumbnail_path != None,
+                )
+                .order_by(PrintArchive.id.desc())
+                .limit(1)
+            )
+            arch_thumb = arch_res.scalar_one_or_none()
+            if arch_thumb:
+                t_path = settings.base_dir / arch_thumb
+                if t_path.exists():
+                    return Response(content=t_path.read_bytes(), media_type="image/png")
+
         import re
         def norm_name(s: str) -> str:
             clean = s.split("/")[-1].replace(".gcode.3mf", "").replace(".gcode", "").replace(".3mf", "")
@@ -1168,8 +1237,9 @@ async def get_printer_cover(
         ]
         for sdir in archive_search_dirs:
             if sdir.exists():
-                for folder_name in os.listdir(sdir):
-                    if base_norm and base_norm in norm_name(folder_name):
+                for folder_name in sorted(os.listdir(sdir), reverse=True):
+                    fn_norm = norm_name(folder_name)
+                    if base_norm and (base_norm in fn_norm or fn_norm in base_norm):
                         dir_path = sdir / folder_name
                         if dir_path.is_dir():
                             for fname in os.listdir(dir_path):
@@ -1180,7 +1250,6 @@ async def get_printer_cover(
                         break
             if local_gcode_path:
                 break
-
                 
         if local_gcode_path:
             logger.info("Elegoo cover: parsing local gcode file: %s", local_gcode_path)
@@ -1190,6 +1259,7 @@ async def get_printer_cover(
 
         # Step 2: Fallback to HTTP request to printer if not found locally
         import httpx
+        clean_subtask = subtask_name.lstrip("/")
         parts = clean_subtask.split("/")
         if len(parts) > 1 and parts[0] in ("local", "usb", "udisk"):
             simple_filename = "/".join(parts[1:])
@@ -1220,6 +1290,7 @@ async def get_printer_cover(
                 headers = {"Range": "bytes=0-1048576"}
                 response = await http_client.get(gcode_url, headers=headers)
                 if response.status_code in (200, 206):
+                    from backend.app.api.routes.printers import extract_gcode_thumbnail
                     thumbnail_bytes = extract_gcode_thumbnail(response.content)
                     if thumbnail_bytes:
                         return Response(content=thumbnail_bytes, media_type="image/png")

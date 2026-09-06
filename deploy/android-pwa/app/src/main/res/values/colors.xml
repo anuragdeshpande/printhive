@@ -1,5 +1,6 @@
 <resources>
-    <color name="background">#0b0f19</color>
-    <color name="primary">#f59e0b</color>
-    <color name="nav_bar">#0b0f19</color>
+    <color name="background">#1a1a1a</color>
+    <color name="header_bg">#2d2d2d</color>
+    <color name="primary">#00ae42</color>
+    <color name="nav_bar">#2d2d2d</color>
 </resources>

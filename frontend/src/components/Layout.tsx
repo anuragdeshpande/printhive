@@ -21,7 +21,7 @@ import { useToast } from '../contexts/ToastContext';
 import { Card, CardHeader, CardContent } from './Card';
 import { parseUTCDate } from '../utils/date';
 import { Button } from './Button';
-import { BugReportBubble } from './BugReportBubble';
+import { isAndroidWebclient, triggerHaptic } from '../utils/androidBridge';
 import {
   getHiddenSidebarSystemItemIds,
   getSidebarOrder,
@@ -489,27 +489,35 @@ export function Layout() {
     <div className="flex min-h-screen">
       {/* Compact Header */}
       {isSidebarCompact && (
-        <header className="fixed top-0 left-0 right-0 z-40 h-14 bg-bambu-dark-secondary border-b border-bambu-dark-tertiary flex items-center justify-between px-4">
-          <div className="flex items-center">
-            <button
-              onClick={() => setMobileDrawerOpen(true)}
-              className="p-2 -ml-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors"
-              aria-label="Open menu"
-            >
-              <Menu className="w-6 h-6 text-white" />
-            </button>
-            <PrintHiveLogo className="h-8 ml-3" showText={true} />
+        <header
+          className="fixed top-0 left-0 right-0 z-40 bg-bambu-dark-secondary border-b border-bambu-dark-tertiary flex flex-col justify-end"
+          style={{
+            paddingTop: 'var(--safe-area-top, env(safe-area-inset-top, 0px))',
+            height: 'calc(3.5rem + var(--safe-area-top, env(safe-area-inset-top, 0px)))',
+          }}
+        >
+          <div className={`w-full h-14 flex items-center justify-between px-4 ${isAndroidWebclient() ? 'pr-16' : ''}`}>
+            <div className="flex items-center">
+              <button
+                onClick={() => setMobileDrawerOpen(true)}
+                className="p-2 -ml-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors"
+                aria-label="Open menu"
+              >
+                <Menu className="w-6 h-6 text-white" />
+              </button>
+              <PrintHiveLogo className="h-8 ml-3" showText={true} />
+            </div>
+            {!isStandalone && (
+              <button
+                onClick={() => setShowInstallModal(true)}
+                className="px-2.5 py-1.5 bg-orange-500/10 hover:bg-orange-500/20 border border-orange-500/30 text-orange-400 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors"
+                title={t('pwa.installApp', { defaultValue: 'Install App' })}
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>{t('pwa.install', { defaultValue: 'Install' })}</span>
+              </button>
+            )}
           </div>
-          {!isStandalone && (
-            <button
-              onClick={() => setShowInstallModal(true)}
-              className="px-2.5 py-1.5 bg-orange-500/10 hover:bg-orange-500/20 border border-orange-500/30 text-orange-400 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors"
-              title={t('pwa.installApp', { defaultValue: 'Install App' })}
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>{t('pwa.install', { defaultValue: 'Install' })}</span>
-            </button>
-          )}
         </header>
       )}
 
@@ -528,6 +536,10 @@ export function Layout() {
             ? `fixed inset-y-0 left-0 z-50 w-72 transform ${mobileDrawerOpen ? 'translate-x-0' : '-translate-x-full'}`
             : `fixed inset-y-0 left-0 z-30 ${sidebarExpanded ? 'w-64' : 'w-16'}`
         }`}
+        style={isSidebarCompact ? {
+          paddingTop: 'var(--safe-area-top, env(safe-area-inset-top, 0px))',
+          paddingBottom: 'max(1rem, var(--safe-area-bottom, env(safe-area-inset-bottom, 0px)))'
+        } : undefined}
       >
         {/* Logo */}
         <div className={`border-b border-bambu-dark-tertiary flex items-center justify-center ${isSidebarCompact || sidebarExpanded ? 'p-4' : 'p-2'}`}>
@@ -873,9 +885,12 @@ export function Layout() {
       </aside>
 
       {/* Main content */}
-      <main className={`flex-1 bg-bambu-dark overflow-auto transition-all duration-300 ${
-        isSidebarCompact ? 'mt-14' : sidebarExpanded ? 'ml-64' : 'ml-16'
-      }`}>
+      <main
+        className={`flex-1 bg-bambu-dark overflow-auto transition-all duration-300 ${
+          isSidebarCompact ? 'pb-bottom-nav md:pb-0' : sidebarExpanded ? 'ml-64' : 'ml-16'
+        }`}
+        style={isSidebarCompact ? { marginTop: 'calc(3.5rem + var(--safe-area-top, env(safe-area-inset-top, 0px)))' } : undefined}
+      >
         {/* Debug logging indicator */}
         {debugLoggingState?.enabled && (
           <div className="bg-amber-100 dark:bg-amber-500/20 border-b border-amber-300 dark:border-amber-500/30 px-4 py-2 flex items-center justify-between">
@@ -945,6 +960,118 @@ export function Layout() {
         )}
         <Outlet />
       </main>
+
+      {/* Mobile Bottom Navigation Bar (M3 pattern, screens < 768px) */}
+      <nav
+        className="fixed bottom-0 left-0 right-0 z-40 bg-bambu-dark-secondary/95 backdrop-blur-md border-t border-bambu-dark-tertiary flex items-center justify-around px-2 pt-1 md:hidden"
+        style={{
+          paddingBottom: 'max(0.375rem, var(--safe-area-bottom, env(safe-area-inset-bottom, 0px)))',
+        }}
+      >
+        <NavLink
+          to="/"
+          onClick={() => triggerHaptic(20)}
+          className={({ isActive }) =>
+            `flex flex-col items-center justify-center flex-1 py-1 min-h-[48px] rounded-xl transition-colors ${
+              isActive ? 'text-bambu-green font-medium' : 'text-bambu-gray-light hover:text-white'
+            }`
+          }
+        >
+          {({ isActive }) => (
+            <>
+              <div className={`relative px-3 py-0.5 rounded-full transition-colors ${isActive ? 'bg-bambu-green/20' : ''}`}>
+                <Printer className="w-5 h-5" />
+                {needsClearPlate && (
+                  <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-yellow-500 rounded-full border border-bambu-dark-secondary" />
+                )}
+              </div>
+              <span className="text-[10px] mt-0.5">{t('nav.printers')}</span>
+            </>
+          )}
+        </NavLink>
+
+        <NavLink
+          to="/inventory"
+          onClick={() => triggerHaptic(20)}
+          className={({ isActive }) =>
+            `flex flex-col items-center justify-center flex-1 py-1 min-h-[48px] rounded-xl transition-colors ${
+              isActive ? 'text-bambu-green font-medium' : 'text-bambu-gray-light hover:text-white'
+            }`
+          }
+        >
+          {({ isActive }) => (
+            <>
+              <div className={`px-3 py-0.5 rounded-full transition-colors ${isActive ? 'bg-bambu-green/20' : ''}`}>
+                <Disc3 className="w-5 h-5" />
+              </div>
+              <span className="text-[10px] mt-0.5">{t('nav.inventory')}</span>
+            </>
+          )}
+        </NavLink>
+
+        <NavLink
+          to="/queue"
+          onClick={() => triggerHaptic(20)}
+          className={({ isActive }) =>
+            `flex flex-col items-center justify-center flex-1 py-1 min-h-[48px] rounded-xl transition-colors ${
+              isActive ? 'text-bambu-green font-medium' : 'text-bambu-gray-light hover:text-white'
+            }`
+          }
+        >
+          {({ isActive }) => (
+            <>
+              <div className={`relative px-3 py-0.5 rounded-full transition-colors ${isActive ? 'bg-bambu-green/20' : ''}`}>
+                <ListOrdered className="w-5 h-5" />
+                {pendingQueueCount > 0 && (
+                  <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 flex items-center justify-center text-[9px] font-bold rounded-full bg-yellow-500 text-black">
+                    {pendingQueueCount > 99 ? '99+' : pendingQueueCount}
+                  </span>
+                )}
+              </div>
+              <span className="text-[10px] mt-0.5">{t('nav.queue')}</span>
+            </>
+          )}
+        </NavLink>
+
+        <NavLink
+          to="/archives"
+          onClick={() => triggerHaptic(20)}
+          className={({ isActive }) =>
+            `flex flex-col items-center justify-center flex-1 py-1 min-h-[48px] rounded-xl transition-colors ${
+              isActive ? 'text-bambu-green font-medium' : 'text-bambu-gray-light hover:text-white'
+            }`
+          }
+        >
+          {({ isActive }) => (
+            <>
+              <div className={`relative px-3 py-0.5 rounded-full transition-colors ${isActive ? 'bg-bambu-green/20' : ''}`}>
+                <Archive className="w-5 h-5" />
+                {pendingUploadsCount > 0 && (
+                  <span className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 flex items-center justify-center text-[9px] font-bold rounded-full bg-blue-500 text-white">
+                    {pendingUploadsCount > 99 ? '99+' : pendingUploadsCount}
+                  </span>
+                )}
+              </div>
+              <span className="text-[10px] mt-0.5">{t('nav.archives')}</span>
+            </>
+          )}
+        </NavLink>
+
+        <button
+          type="button"
+          onClick={() => {
+            triggerHaptic(20);
+            setMobileDrawerOpen(true);
+          }}
+          className="flex flex-col items-center justify-center flex-1 py-1 min-h-[48px] rounded-xl text-bambu-gray-light hover:text-white transition-colors"
+          aria-label={t('common.more', { defaultValue: 'More' })}
+        >
+          <div className="px-3 py-0.5 rounded-full">
+            <Menu className="w-5 h-5" />
+          </div>
+          <span className="text-[10px] mt-0.5">{t('nav.more', { defaultValue: 'More' })}</span>
+        </button>
+      </nav>
 
       <UnknownSpoolModal
         prompt={unknownSpool.prompt}
@@ -1148,7 +1275,6 @@ export function Layout() {
           </Card>
         </div>
       )}
-      <BugReportBubble />
     </div>
   );
 }

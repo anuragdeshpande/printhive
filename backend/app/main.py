@@ -23,7 +23,6 @@ from backend.app.api.routes import (
     archive_purge,
     archives,
     auth,
-    bug_report,
     camera,
     camwall,
     cloud,
@@ -3376,18 +3375,49 @@ async def on_print_start(printer_id: int, data: dict):
                             if cand_path.exists():
                                 local_gcode_path = cand_path
                         
+                        # Check if another archive already has a thumbnail for this print
+                        existing_arch = await db.execute(
+                            select(PrintArchive)
+                            .where(
+                                or_(
+                                    PrintArchive.print_name == print_name,
+                                    PrintArchive.filename == (filename or subtask_name),
+                                    PrintArchive.print_name == subtask_name,
+                                ),
+                                PrintArchive.thumbnail_path != None,
+                            )
+                            .order_by(PrintArchive.id.desc())
+                            .limit(1)
+                        )
+                        matched_arch = existing_arch.scalar_one_or_none()
+                        if matched_arch and matched_arch.thumbnail_path:
+                            cand_t = app_settings.base_dir / matched_arch.thumbnail_path
+                            if cand_t.exists():
+                                fallback_archive.thumbnail_path = matched_arch.thumbnail_path
+                                fallback_archive.extra_data["no_3mf_available"] = False
+                                thumb_bytes = True
+
                         # Fallback: scan local folder matching subtask_name
-                        if not local_gcode_path:
-                            for folder_name in os.listdir(app_settings.archive_dir / "unassigned"):
-                                if subtask_name in folder_name:
-                                    dir_path = app_settings.archive_dir / "unassigned" / folder_name
-                                    if dir_path.is_dir():
-                                        for fname in os.listdir(dir_path):
-                                            if fname.endswith(".gcode"):
-                                                local_gcode_path = dir_path / fname
-                                                break
-                                if local_gcode_path:
-                                    break
+                        if not local_gcode_path and not thumb_bytes:
+                            import re
+
+                            def norm_name(s: str) -> str:
+                                return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
+
+                            target_norm = norm_name(subtask_name)
+                            unassigned_dir = app_settings.archive_dir / "unassigned"
+                            if unassigned_dir.exists():
+                                for folder_name in sorted(os.listdir(unassigned_dir), reverse=True):
+                                    fn_norm = norm_name(folder_name)
+                                    if target_norm and (target_norm in fn_norm or fn_norm in target_norm):
+                                        dir_path = unassigned_dir / folder_name
+                                        if dir_path.is_dir():
+                                            for fname in os.listdir(dir_path):
+                                                if fname.endswith(".gcode"):
+                                                    local_gcode_path = dir_path / fname
+                                                    break
+                                    if local_gcode_path:
+                                        break
                                     
                         thumb_bytes = None
                         if local_gcode_path:
@@ -7144,7 +7174,6 @@ async def trace_id_middleware(request, call_next):
 # API routes
 app.include_router(auth.router, prefix=app_settings.api_prefix)
 app.include_router(mfa.router, prefix=app_settings.api_prefix)
-app.include_router(bug_report.router, prefix=app_settings.api_prefix)
 app.include_router(users.router, prefix=app_settings.api_prefix)
 app.include_router(groups.router, prefix=app_settings.api_prefix)
 app.include_router(printers.router, prefix=app_settings.api_prefix)

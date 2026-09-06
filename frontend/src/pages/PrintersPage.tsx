@@ -61,6 +61,7 @@ import {
   AirVent,
   Download,
   ScanSearch,
+  Check,
   CheckCircle,
   CheckSquare,
   XCircle,
@@ -124,6 +125,7 @@ import { FilamentSlotCircle } from '../components/FilamentSlotCircle';
 import { Collapsible } from '../components/Collapsible';
 import { ConnectionDiagnosticModal, DiagnosticChecklist } from '../components/ConnectionDiagnostic';
 import { getColorName, parseFilamentColor, isLightColor } from '../utils/colors';
+import { isAndroidWebclient, triggerHaptic } from '../utils/androidBridge';
 
 export interface SpoolmanSlotAssignmentRow {
   printer_id: number;
@@ -1177,7 +1179,7 @@ function ToolbarMenu({
       <button
         type="button"
         onClick={() => setIsOpen(open => !open)}
-        className="h-8 w-8 rounded-lg border bg-bambu-dark border-bambu-dark-tertiary text-white hover:bg-bambu-dark-tertiary transition-colors flex items-center justify-center"
+        className="h-9 w-9 sm:h-8 sm:w-8 rounded-lg border bg-bambu-dark border-bambu-dark-tertiary text-white hover:bg-bambu-dark-tertiary transition-colors flex items-center justify-center touch-press"
         aria-label={label}
         title={label}
       >
@@ -1187,7 +1189,7 @@ function ToolbarMenu({
       {isOpen && (
         <>
           <div className="fixed inset-0 z-10" onClick={() => setIsOpen(false)} />
-          <div className="absolute right-0 top-full z-20 mt-1 min-w-40 rounded-lg border border-bambu-dark-tertiary bg-bambu-dark-secondary p-2 shadow-xl">
+          <div className="absolute right-0 top-full z-20 mt-1 min-w-44 max-w-[calc(100vw-2rem)] rounded-lg border border-bambu-dark-tertiary bg-bambu-dark-secondary p-2 shadow-xl">
             {children}
           </div>
         </>
@@ -1262,21 +1264,24 @@ function IndicatorControlPopover({
     onSubmit?.(Math.round(bounded));
   };
 
+  const isMobileViewport = typeof window !== 'undefined' && window.innerWidth < 640;
+
   return (
     <>
       <span ref={anchorRef} className="hidden" aria-hidden="true" />
       {createPortal(
         <>
-          <div className="fixed inset-0 z-[1000]" onClick={onClose} />
+          <div className="fixed inset-0 z-[1000] bg-black/40 sm:bg-transparent backdrop-blur-[1px] sm:backdrop-blur-none" onClick={onClose} />
           <div
-            className={`fixed z-[1001] flex ${widthClass} flex-col overflow-hidden rounded-xl border border-bambu-dark-tertiary bg-bambu-dark-secondary shadow-2xl`}
-            style={{
+            className={`fixed z-[1001] flex flex-col overflow-hidden bg-bambu-dark-secondary shadow-2xl max-sm:inset-x-0 max-sm:bottom-0 max-sm:w-full max-sm:rounded-t-2xl max-sm:border-t max-sm:border-bambu-dark-tertiary max-sm:animate-slide-up max-sm:pb-safe sm:rounded-xl sm:border sm:border-bambu-dark-tertiary sm:${widthClass}`}
+            style={isMobileViewport ? undefined : {
               top: coords?.top ?? -9999,
               left: coords?.left ?? -9999,
               visibility: coords ? 'visible' : 'hidden',
             }}
             onClick={e => e.stopPropagation()}
           >
+        <div className="mx-auto mt-2.5 h-1 w-10 rounded-full bg-bambu-dark-tertiary sm:hidden" />
         <div className="shrink-0 px-3 py-2.5 text-center text-sm font-medium text-white">{title}</div>
         <div className="shrink-0 h-px bg-bambu-dark-tertiary" />
         {options.length > 0 && (
@@ -3825,20 +3830,21 @@ function PrinterCard({
                     >
                       <button
                         type="button"
-                        className="absolute top-0.5 right-0.5 p-0.5 rounded text-bambu-gray hover:text-white hover:bg-white/10 transition-colors"
+                        className="absolute top-0.5 right-0.5 p-1 rounded text-bambu-gray hover:text-white hover:bg-white/10 transition-colors touch-press min-w-[24px] min-h-[24px] flex items-center justify-center"
                         title={t('printers.heaterHistory.openLabel', 'View heater history')}
                         onClick={(e) => {
                           e.stopPropagation();
+                          triggerHaptic(20);
                           setHeaterHistoryModal({ initialKind: 'nozzle', availableKinds: availableHeaterKinds });
                         }}
                       >
-                        <LineChartIcon className="w-2.5 h-2.5" />
+                        <LineChartIcon className="w-3 h-3 sm:w-2.5 sm:h-2.5" />
                       </button>
                       <HeaterThermometer className="w-3.5 h-3.5 mb-0.5" color="text-orange-400" isHeating={nozzleHeating} />
                       {(status.temperatures.nozzle_2 !== undefined || status.temperatures.nozzle_1 !== undefined) ? (
                         <>
-                          <p className="text-[9px] text-bambu-gray">T0 / T1</p>
-                          <p className="text-[11px] text-white">
+                          <p className="text-[10px] sm:text-[9px] text-bambu-gray">{printer.model === 'H2D' ? 'L / R' : 'T0 / T1'}</p>
+                          <p className="text-xs sm:text-[11px] text-white font-medium">
                             {Math.round(status.temperatures.nozzle_0 ?? status.temperatures.nozzle ?? 0)}° / {Math.round(status.temperatures.nozzle_2 ?? status.temperatures.nozzle_1 ?? 0)}°
                           </p>
                         </>
@@ -3846,16 +3852,16 @@ function PrinterCard({
 
                         <NozzleSlotHoverCard slot={singleNozzleSlot} index={0} activeStatus filamentName={singleNozzleSlot.filament_id ? filamentInfo?.[singleNozzleSlot.filament_id]?.name : undefined}>
                           <div className="cursor-default">
-                            <p className="text-[9px] text-bambu-gray">{t('printers.temperatures.nozzle')}</p>
-                            <p className="text-[11px] text-white">
+                            <p className="text-[10px] sm:text-[9px] text-bambu-gray">{t('printers.temperatures.nozzle')}</p>
+                            <p className="text-xs sm:text-[11px] text-white font-medium">
                               {Math.round(status.temperatures.nozzle || 0)}°C
                             </p>
                           </div>
                         </NozzleSlotHoverCard>
                       ) : (
                         <>
-                          <p className="text-[9px] text-bambu-gray">{t('printers.temperatures.nozzle')}</p>
-                          <p className="text-[11px] text-white">
+                          <p className="text-[10px] sm:text-[9px] text-bambu-gray">{t('printers.temperatures.nozzle')}</p>
+                          <p className="text-xs sm:text-[11px] text-white font-medium">
                             {Math.round(status.temperatures.nozzle || 0)}°C
                           </p>
                         </>
@@ -3912,18 +3918,19 @@ function PrinterCard({
                     >
                       <button
                         type="button"
-                        className="absolute top-0.5 right-0.5 p-0.5 rounded text-bambu-gray hover:text-white hover:bg-white/10 transition-colors"
+                        className="absolute top-0.5 right-0.5 p-1 rounded text-bambu-gray hover:text-white hover:bg-white/10 transition-colors touch-press min-w-[24px] min-h-[24px] flex items-center justify-center"
                         title={t('printers.heaterHistory.openLabel', 'View heater history')}
                         onClick={(e) => {
                           e.stopPropagation();
+                          triggerHaptic(20);
                           setHeaterHistoryModal({ initialKind: 'bed', availableKinds: availableHeaterKinds });
                         }}
                       >
-                        <LineChartIcon className="w-2.5 h-2.5" />
+                        <LineChartIcon className="w-3 h-3 sm:w-2.5 sm:h-2.5" />
                       </button>
                       <HeaterThermometer className="w-3.5 h-3.5 mb-0.5" color="text-blue-400" isHeating={bedHeating} />
-                      <p className="text-[9px] text-bambu-gray">{t('printers.temperatures.bed')}</p>
-                      <p className="text-[11px] text-white">
+                      <p className="text-[10px] sm:text-[9px] text-bambu-gray">{t('printers.temperatures.bed')}</p>
+                      <p className="text-xs sm:text-[11px] text-white font-medium">
                         {Math.round(status.temperatures.bed || 0)}°C
                       </p>
                       {statusControlMenu === 'bed-temp' && (
@@ -3959,14 +3966,15 @@ function PrinterCard({
                             title={t('printers.heaterHistory.openLabel', 'View heater history')}
                             onClick={(e) => {
                               e.stopPropagation();
+                              triggerHaptic(20);
                               setHeaterHistoryModal({ initialKind: 'chamber', availableKinds: availableHeaterKinds });
                             }}
                           >
-                            <LineChartIcon className="w-2.5 h-2.5" />
+                            <LineChartIcon className="w-3 h-3 sm:w-2.5 sm:h-2.5" />
                           </button>
                           <HeaterThermometer className="w-3.5 h-3.5 mb-0.5" color="text-green-400" isHeating={chamberHeating} />
-                          <p className="text-[9px] text-bambu-gray">{t('printers.temperatures.chamber')}</p>
-                          <p className="text-[11px] text-white">
+                          <p className="text-[10px] sm:text-[9px] text-bambu-gray">{t('printers.temperatures.chamber')}</p>
+                          <p className="text-xs sm:text-[11px] text-white font-medium">
                             {Math.round(status.temperatures.chamber || 0)}°C
                           </p>
                           {hasChamberHeater && statusControlMenu === 'chamber-temp' && (
@@ -4039,14 +4047,19 @@ function PrinterCard({
                       return (
                         <div
                           key={key}
-                          className={`relative px-2 py-1.5 bg-bambu-dark rounded-lg flex-1 min-w-0 flex items-center justify-center gap-1 transition-colors ${
+                          className={`relative px-2 py-2 sm:py-1.5 bg-bambu-dark rounded-lg flex-1 min-w-0 flex items-center justify-center gap-1.5 transition-colors touch-press ${
                             canUseStatusControls ? 'cursor-pointer hover:bg-bambu-dark-tertiary' : 'cursor-default opacity-80'
                           }`}
                           title={canUseStatusControls ? label : statusControlTitle}
-                          onClick={() => canUseStatusControls && setStatusControlMenu(statusControlMenu === `fan-${key}` ? null : `fan-${key}`)}
+                          onClick={() => {
+                            if (canUseStatusControls) {
+                              triggerHaptic(20);
+                              setStatusControlMenu(statusControlMenu === `fan-${key}` ? null : `fan-${key}`);
+                            }
+                          }}
                         >
-                          <Icon className={`w-3 h-3 shrink-0 ${active ? activeClass : 'text-bambu-gray/50'}`} />
-                          <span className={`text-[10px] leading-none ${active ? 'text-white' : 'text-bambu-gray/50'}`}>
+                          <Icon className={`w-3.5 h-3.5 sm:w-3 sm:h-3 shrink-0 ${active ? activeClass : 'text-bambu-gray/50'}`} />
+                          <span className={`text-xs sm:text-[10px] leading-none ${active ? 'text-white font-medium' : 'text-bambu-gray/50'}`}>
                             {value}%
                           </span>
                           {statusControlMenu === `fan-${key}` && (
@@ -4094,8 +4107,8 @@ function PrinterCard({
               const isPrinting = isRunning || isPaused;
               const isControlBusy = stopPrintMutation.isPending || pausePrintMutation.isPending || resumePrintMutation.isPending;
               const unavailablePrintActionClass = 'bg-bambu-dark text-bambu-gray/50 cursor-not-allowed opacity-50';
-              const iconControlClass = 'flex h-8 w-8 items-center justify-center rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
-              const printControlClass = 'flex h-8 w-20 items-center justify-center gap-1 px-2 rounded-lg text-xs font-medium transition-colors';
+              const iconControlClass = 'flex h-10 w-10 sm:h-8 sm:w-8 items-center justify-center rounded-lg text-xs font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed touch-press';
+              const printControlClass = 'flex min-h-[40px] sm:h-8 min-w-[76px] items-center justify-center gap-1.5 px-3 sm:px-2 rounded-lg text-xs font-medium transition-colors touch-press';
 
               return (
                 <div className="mt-3">
@@ -4141,8 +4154,9 @@ function PrinterCard({
                             </button>
                             {showAirductMenu === printer.id && (
                               <>
-                                <div className="fixed inset-0 z-40" onClick={() => setShowAirductMenu(null)} />
-                                <div className="absolute bottom-full left-0 mb-1 z-50 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg shadow-lg py-1 min-w-[130px]">
+                                <div className="fixed inset-0 z-40 bg-black/40 sm:bg-transparent backdrop-blur-[1px] sm:backdrop-blur-none" onClick={() => setShowAirductMenu(null)} />
+                                <div className="sm:absolute sm:bottom-full sm:left-0 sm:mb-1 z-50 bg-bambu-dark-secondary border border-bambu-dark-tertiary sm:rounded-lg shadow-lg py-1 min-w-[140px] max-sm:fixed max-sm:inset-x-0 max-sm:bottom-0 max-sm:w-full max-sm:rounded-t-2xl max-sm:border-t max-sm:animate-slide-up max-sm:pb-safe">
+                                  <div className="mx-auto mt-2.5 mb-2 h-1 w-10 rounded-full bg-bambu-dark-tertiary sm:hidden" />
                                   {([
                                     { mode: 'cooling', label: t('printers.airduct.cooling'), modeId: 0 },
                                     { mode: 'heating', label: t('printers.airduct.heating'), modeId: 1 },
@@ -4150,16 +4164,17 @@ function PrinterCard({
                                     <button
                                       key={mode}
                                       onClick={() => {
+                                        triggerHaptic(25);
                                         airductMutation.mutate(mode);
                                         setShowAirductMenu(null);
                                       }}
-                                      className={`w-full text-left px-3 py-1.5 text-xs transition-colors flex items-center gap-2 ${
+                                      className={`w-full text-left px-4 sm:px-3 py-3 sm:py-1.5 text-sm sm:text-xs min-h-[44px] sm:min-h-0 transition-colors flex items-center gap-2 ${
                                         status.airduct_mode === modeId
-                                          ? 'text-bambu-green bg-bambu-green/10'
+                                          ? 'text-bambu-green bg-bambu-green/10 font-medium'
                                           : 'text-white hover:bg-bambu-dark-tertiary'
                                       }`}
                                     >
-                                      {mode === 'heating' ? <Flame className="w-3 h-3" /> : <Snowflake className="w-3 h-3" />}
+                                      {mode === 'heating' ? <Flame className="w-4 h-4 sm:w-3 sm:h-3" /> : <Snowflake className="w-4 h-4 sm:w-3 sm:h-3" />}
                                       {label}
                                     </button>
                                   ))}
@@ -4175,8 +4190,9 @@ function PrinterCard({
                         const canControl = hasPermission('printers:control');
                         const disabled = isPrinting || !canControl;
                         const bambuIsPlateBelow = true; // positive Z moves plate away from nozzle
-                        const jogButtonClass = 'flex h-8 w-8 items-center justify-center rounded bg-indigo-100 dark:bg-indigo-500/15 text-indigo-700 dark:text-indigo-300 transition-colors hover:bg-indigo-200 dark:hover:bg-indigo-500/30 disabled:cursor-not-allowed disabled:opacity-50';
+                        const jogButtonClass = 'flex h-11 w-11 sm:h-8 sm:w-8 items-center justify-center rounded-lg sm:rounded bg-indigo-100 dark:bg-indigo-500/15 text-indigo-700 dark:text-indigo-300 transition-colors hover:bg-indigo-200 dark:hover:bg-indigo-500/30 disabled:cursor-not-allowed disabled:opacity-50 touch-press';
                         const requestZJog = (direction: 1 | -1) => {
+                          triggerHaptic(25);
                           const signed = direction * bedJogStep * (bambuIsPlateBelow ? 1 : -1);
                           // The jog never disables the soft endstops (#2579), so it's always
                           // safe: the firmware clamps the move at the travel limit, or refuses
@@ -4184,9 +4200,11 @@ function PrinterCard({
                           bedJogMutation.mutate({ distance: signed });
                         };
                         const requestXyJog = (x: number, y: number) => {
+                          triggerHaptic(25);
                           xyJogMutation.mutate({ x, y });
                         };
                         const requestExtruderJog = (distance: number) => {
+                          triggerHaptic(25);
                           extruderJogMutation.mutate(distance);
                         };
                         return (
@@ -4205,9 +4223,10 @@ function PrinterCard({
                             </button>
                             {showBedJogMenu === printer.id && (
                               <>
-                                <div className="fixed inset-0 z-40" onClick={() => setShowBedJogMenu(null)} />
-                                <div className="absolute bottom-full left-0 mb-1 z-50 flex w-[216px] flex-col overflow-hidden rounded-xl border border-bambu-dark-tertiary bg-bambu-dark-secondary shadow-2xl">
-                                  <div className="shrink-0 px-3 py-2.5 text-center text-sm font-medium text-white">
+                                <div className="fixed inset-0 z-40 bg-black/40 sm:bg-transparent backdrop-blur-[1px] sm:backdrop-blur-none" onClick={() => setShowBedJogMenu(null)} />
+                                <div className="sm:absolute sm:bottom-full sm:left-0 sm:mb-1 z-50 flex max-sm:fixed max-sm:inset-x-0 max-sm:bottom-0 max-sm:w-full max-sm:rounded-t-2xl max-sm:border-t max-sm:border-bambu-dark-tertiary max-sm:animate-slide-up max-sm:pb-safe sm:w-[240px] flex-col overflow-hidden sm:rounded-xl border border-bambu-dark-tertiary bg-bambu-dark-secondary shadow-2xl">
+                                  <div className="mx-auto mt-2.5 h-1 w-10 rounded-full bg-bambu-dark-tertiary sm:hidden" />
+                                  <div className="shrink-0 px-3 py-2 text-center text-sm font-medium text-white">
                                     {t('printers.bedJog.title')}
                                   </div>
                                   <div className="h-px bg-bambu-dark-tertiary" />
@@ -4347,11 +4366,7 @@ function PrinterCard({
                         <button
                           onClick={handleTogglePlateDetection}
                           disabled={!status.connected || plateDetectionMutation.isPending || !hasPermission('printers:update')}
-                          className={`${iconControlClass} rounded-r-none ${
-                            printer.plate_detection_enabled
-                              ? 'bg-green-50 dark:bg-green-500/10 text-green-700 dark:text-green-400 hover:bg-green-500/20'
-                              : 'bg-bambu-dark text-bambu-gray/50 hover:bg-bambu-dark-tertiary hover:text-white'
-                          }`}
+                          className={`${iconControlClass} rounded-r-none`}
                           title={!hasPermission('printers:update') ? t('printers.plateDetection.noPermission') : (printer.plate_detection_enabled ? t('printers.plateDetection.enabledClick') : t('printers.plateDetection.disabledClick'))}
                         >
                           {plateDetectionMutation.isPending ? (
@@ -4396,8 +4411,9 @@ function PrinterCard({
                           </button>
                           {showSpeedMenu === printer.id && (
                             <>
-                              <div className="fixed inset-0 z-40" onClick={() => setShowSpeedMenu(null)} />
-                              <div className="absolute bottom-full left-0 mb-1 z-50 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg shadow-lg py-1 min-w-[130px]">
+                              <div className="fixed inset-0 z-40 bg-black/40 sm:bg-transparent backdrop-blur-[1px] sm:backdrop-blur-none" onClick={() => setShowSpeedMenu(null)} />
+                              <div className="sm:absolute sm:bottom-full sm:left-0 sm:mb-1 z-50 bg-bambu-dark-secondary border border-bambu-dark-tertiary sm:rounded-lg shadow-lg py-1 min-w-[140px] max-sm:fixed max-sm:inset-x-0 max-sm:bottom-0 max-sm:w-full max-sm:rounded-t-2xl max-sm:border-t max-sm:animate-slide-up max-sm:pb-safe">
+                                <div className="mx-auto mt-2.5 mb-2 h-1 w-10 rounded-full bg-bambu-dark-tertiary sm:hidden" />
                                 {([
                                   { mode: 1, label: t('printers.speed.silent') },
                                   { mode: 2, label: t('printers.speed.standard') },
@@ -4407,16 +4423,18 @@ function PrinterCard({
                                   <button
                                     key={mode}
                                     onClick={() => {
+                                      triggerHaptic(25);
                                       printSpeedMutation.mutate(mode);
                                       setShowSpeedMenu(null);
                                     }}
-                                    className={`w-full text-left px-3 py-1.5 text-xs transition-colors ${
+                                    className={`w-full text-left px-4 sm:px-3 py-3 sm:py-1.5 text-sm sm:text-xs min-h-[44px] sm:min-h-0 transition-colors flex items-center justify-between ${
                                       status.speed_level === mode
-                                        ? 'text-bambu-green bg-bambu-green/10'
+                                        ? 'text-bambu-green bg-bambu-green/10 font-medium'
                                         : 'text-white hover:bg-bambu-dark-tertiary'
                                     }`}
                                   >
-                                    {label}
+                                    <span>{label}</span>
+                                    {status.speed_level === mode && <Check className="w-4 h-4 text-bambu-green" />}
                                   </button>
                                 ))}
                               </div>
@@ -4434,20 +4452,23 @@ function PrinterCard({
                         const pauseUnavailable = !isPrinting || isControlBusy || !hasPermission('printers:control');
                         return (
                       <button
-                        onClick={() => isPaused ? setShowResumeConfirm(true) : setShowPauseConfirm(true)}
+                        onClick={() => {
+                          triggerHaptic(30);
+                          isPaused ? setShowResumeConfirm(true) : setShowPauseConfirm(true);
+                        }}
                         disabled={pauseUnavailable}
                         className={`
                           ${printControlClass}
                           ${pauseUnavailable
                             ? unavailablePrintActionClass
                             : isPaused
-                              ? 'bg-bambu-green/20 text-bambu-green hover:bg-bambu-green/30'
-                              : 'bg-yellow-100 dark:bg-yellow-500/20 text-yellow-700 dark:text-yellow-400 hover:bg-yellow-500/30'
+                              ? 'bg-bambu-green text-white hover:bg-bambu-green/90 shadow-sm'
+                              : 'bg-yellow-500/20 text-yellow-600 dark:text-yellow-400 border border-yellow-500/30 hover:bg-yellow-500/30'
                           }
                         `}
                         title={!hasPermission('printers:control') ? t('printers.permission.noControl') : (isPaused ? t('printers.resume') : t('printers.pause'))}
                       >
-                        {isPaused ? <Play className="w-3 h-3" /> : <Pause className="w-3 h-3" />}
+                        {isPaused ? <Play className="w-3.5 h-3.5" /> : <Pause className="w-3.5 h-3.5" />}
                         {isPaused ? t('printers.resume') : t('printers.pause')}
                       </button>
                         );
@@ -4458,18 +4479,21 @@ function PrinterCard({
                         const stopUnavailable = !isPrinting || isControlBusy || !hasPermission('printers:control');
                         return (
                       <button
-                        onClick={() => setShowStopConfirm(true)}
+                        onClick={() => {
+                          triggerHaptic(40);
+                          setShowStopConfirm(true);
+                        }}
                         disabled={stopUnavailable}
                         className={`
-                          ${printControlClass}
+                          ${printControlClass} ml-1
                           ${stopUnavailable
                             ? unavailablePrintActionClass
-                            : 'bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-400 hover:bg-red-500/30'
+                            : 'bg-red-500/10 border border-red-500/30 text-red-600 dark:text-red-400 hover:bg-red-500/20'
                           }
                         `}
                         title={!hasPermission('printers:control') ? t('printers.permission.noControl') : t('printers.stop')}
                       >
-                        <Square className="w-3 h-3" />
+                        <Square className="w-3.5 h-3.5" />
                         {t('printers.stop')}
                       </button>
                         );
@@ -4521,7 +4545,7 @@ function PrinterCard({
                   </div>
 
                   {/* AMS Content */}
-                  <div className="flex flex-wrap gap-2">
+                  <div className="flex flex-wrap max-sm:flex-nowrap max-sm:overflow-x-auto max-sm:scrollbar-hide max-sm:pb-1 gap-2">
                     {/* Regular AMS units */}
                     {regularAms.map((ams) => {
                       const mappedExtruderId = amsExtruderMap[String(ams.id)];
@@ -5726,8 +5750,12 @@ function PrinterCard({
                   variant="secondary"
                   size="sm"
                   onClick={() => {
-                    if (cameraViewMode === 'embedded' && onOpenEmbeddedCamera) {
+                    triggerHaptic(20);
+                    const isMobileOrStandalone = typeof window !== 'undefined' && (window.innerWidth < 768 || isAndroidWebclient());
+                    if ((cameraViewMode === 'embedded' || isMobileOrStandalone) && onOpenEmbeddedCamera) {
                       onOpenEmbeddedCamera(printer.id, printer.name);
+                    } else if (isMobileOrStandalone) {
+                      navigate(`/camera/${printer.id}`);
                     } else {
                       // Use saved window state or defaults
                       const saved = localStorage.getItem('cameraWindowState');
@@ -8643,14 +8671,14 @@ export function PrintersPage() {
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder={t('printers.search')}
                 aria-label={t('printers.search')}
-                className="w-full h-8 pl-9 pr-8 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm placeholder:text-bambu-gray/50 focus:outline-none focus:border-bambu-green"
+                className="w-full h-10 sm:h-8 pl-9 pr-10 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-base sm:text-sm placeholder:text-bambu-gray/50 focus:outline-none focus:border-bambu-green"
               />
               {search && (
                 <button
                   type="button"
                   aria-label={t('common.clear')}
                   onClick={() => setSearch('')}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-bambu-gray hover:text-white"
+                  className="absolute right-1 top-1/2 -translate-y-1/2 w-8 h-8 flex items-center justify-center text-bambu-gray hover:text-white touch-press"
                 >
                   <X className="w-4 h-4" />
                 </button>

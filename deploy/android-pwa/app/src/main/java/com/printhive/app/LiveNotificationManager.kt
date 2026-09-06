@@ -19,7 +19,7 @@ import java.util.Locale
 data class LivePrintStatus(
     val printerId: Int,
     val printerName: String,
-    val state: String, // RUNNING, PAUSE, PREPARE, FINISH, FAILED, IDLE
+    val state: String, // RUNNING, PAUSE, PREPARE, FINISH, FAILED, IDLE, WAITING
     val subtaskName: String?,
     val progress: Int, // 0-100
     val remainingSeconds: Int?,
@@ -30,12 +30,15 @@ data class LivePrintStatus(
     val stageName: String?, // e.g., "Auto bed leveling", "Heatbed preheating"
     val filamentType: String?, // e.g., "PLA Basic"
     val filamentColorHex: String?, // e.g., "#FFFFFF"
-    val coverUrl: String?
+    val coverUrl: String?,
+    val currentArchiveId: Int? = null,
+    val isWaitingForPlateClear: Boolean = false,
+    val isFinishedAwaitingClear: Boolean = false
 )
 
 object LiveNotificationManager {
 
-    const val CHANNEL_ID = "printhive_live_activity_v2"
+    const val CHANNEL_ID = "printhive_live_activity_v3"
     const val COMPLETION_CHANNEL_ID = "printhive_completion"
     const val NOTIFICATION_ID_BASE = 10000
 
@@ -45,13 +48,14 @@ object LiveNotificationManager {
 
             try {
                 manager.deleteNotificationChannel("printhive_live_activity")
+                manager.deleteNotificationChannel("printhive_live_activity_v2")
             } catch (e: Exception) {}
 
-            // 1. Live Ongoing Channel
+            // 1. Live Ongoing Channel (Low importance prevents sound, vibration, screen wake, and icon blinking on refresh)
             val liveChannel = NotificationChannel(
                 CHANNEL_ID,
                 "Live Print Activity",
-                NotificationManager.IMPORTANCE_DEFAULT
+                NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Live progress, preparation states, and controls for prints in progress"
                 setShowBadge(true)
@@ -76,13 +80,59 @@ object LiveNotificationManager {
         }
     }
 
+    const val GROUP_KEY = "printhive_live_activities"
+
+    fun buildGroupSummaryNotification(
+        context: Context,
+        activeCount: Int,
+        activePrinterNames: List<String>
+    ): Notification {
+        val tapIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val contentPendingIntent = PendingIntent.getActivity(
+            context,
+            NOTIFICATION_ID_BASE,
+            tapIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val title = "PrintHive • $activeCount Active Prints"
+        val summaryText = activePrinterNames.joinToString(", ")
+
+        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle(title)
+            .setContentText(summaryText)
+            .setContentIntent(contentPendingIntent)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setLocalOnly(true)
+            .setGroup(GROUP_KEY)
+            .setGroupSummary(true)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
+            .setStyle(
+                NotificationCompat.InboxStyle()
+                    .setBigContentTitle(title)
+                    .setSummaryText("$activeCount prints active")
+            )
+
+        if (Build.VERSION.SDK_INT >= 31) {
+            builder.setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+        }
+
+        return builder.build()
+    }
+
     fun buildLiveNotification(
         context: Context,
         status: LivePrintStatus,
-        thumbnailBitmap: Bitmap? = null
+        thumbnailBitmap: Bitmap? = null,
+        promoteOngoing: Boolean = true
     ): Notification {
-        createNotificationChannels(context)
-
         val notificationId = NOTIFICATION_ID_BASE + status.printerId
 
         // Content intent: open PrintHive MainActivity
@@ -97,11 +147,15 @@ object LiveNotificationManager {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val isFinished = status.isFinishedAwaitingClear || status.state == "FINISH"
+        val isWaiting = status.isWaitingForPlateClear || status.state == "WAITING"
         val isPreparing = status.state == "PREPARE" || (!status.stageName.isNullOrBlank() && status.stageName != "Printing" && status.progress <= 1)
         val isPaused = status.state == "PAUSE"
 
         // Build Title
         val title = when {
+            isWaiting -> "${status.printerName} • Waiting to Print"
+            isFinished -> "${status.printerName} • Finished"
             isPaused -> "${status.printerName} • Paused (${status.progress}%)"
             isPreparing -> "${status.printerName} • ${status.stageName ?: "Preparing"}"
             else -> "${status.printerName} • ${status.progress}%"
@@ -120,7 +174,11 @@ object LiveNotificationManager {
         if (layerInfo != null) detailsList.add(layerInfo)
         if (etaInfo != null) detailsList.add(etaInfo)
 
-        val contentText = detailsList.joinToString(" • ")
+        val contentText = when {
+            isWaiting -> "Queued: $fileName • Waiting for plate to be cleared"
+            isFinished -> "$fileName • Plate waiting to be cleared"
+            else -> detailsList.joinToString(" • ")
+        }
 
         // Subtext / Hardware info (Filament + Temperatures)
         val filamentText = buildFilamentLabel(status.filamentType, status.filamentColorHex)
@@ -132,28 +190,56 @@ object LiveNotificationManager {
             .setContentTitle(title)
             .setContentText(contentText)
             .setContentIntent(contentPendingIntent)
-            .setOngoing(true)
+            .setOngoing(!isFinished)
+            .setAutoCancel(isFinished)
             .setOnlyAlertOnce(true)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setShowWhen(false)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setCategory(NotificationCompat.CATEGORY_PROGRESS)
+            .setCategory(if (isFinished) NotificationCompat.CATEGORY_STATUS else NotificationCompat.CATEGORY_PROGRESS)
+            .setLocalOnly(true)
+            .setGroup(GROUP_KEY)
+            .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY)
+            .setSortKey(String.format("%04d", status.printerId))
 
-        if (subText.isNotBlank()) {
+        if (Build.VERSION.SDK_INT >= 31) {
+            builder.setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+        }
+
+        if (isFinished) {
+            val jobTag = status.subtaskName ?: "finished"
+            val dismissPendingIntent = PrintNotificationActionReceiver.createDismissPendingIntent(
+                context, status.printerId, jobTag
+            )
+            builder.setDeleteIntent(dismissPendingIntent)
+        }
+
+        if (subText.isNotBlank() && !isFinished && !isWaiting) {
             builder.setSubText(subText)
         }
 
         // Progress bar
-        if (isPreparing && status.progress <= 0) {
-            builder.setProgress(0, 0, true) // Indeterminate during preparation/homing
-        } else {
-            builder.setProgress(100, status.progress.coerceIn(0, 100), false)
+        when {
+            isWaiting -> builder.setProgress(0, 0, true) // Indeterminate spinner while waiting
+            isFinished -> builder.setProgress(100, 100, false)
+            isPreparing && status.progress <= 0 -> builder.setProgress(0, 0, true) // Indeterminate during preparation/homing
+            else -> builder.setProgress(100, status.progress.coerceIn(0, 100), false)
         }
 
         // Android 16 & 17 Rich Ongoing Notification / Live Activity Extras
         val extras = Bundle().apply {
-            putBoolean("android.requestPromotedOngoing", true)
+            if (promoteOngoing) {
+                putBoolean("android.requestPromotedOngoing", true)
+            }
             putString("android.substName", status.printerName)
-            if (layerInfo != null) putString("android.shortCriticalText", "${status.progress}%")
+            val chipText = when {
+                isWaiting -> "WAIT"
+                isPaused -> "PAUSE"
+                isPreparing -> "PREP"
+                status.progress > 0 -> "${status.progress}%"
+                else -> "PRINT"
+            }
+            putString("android.shortCriticalText", chipText)
         }
         builder.addExtras(extras)
 
@@ -178,8 +264,27 @@ object LiveNotificationManager {
             builder.setStyle(bigTextStyle)
         }
 
-        // Action Buttons: Pause / Resume / Cancel
-        if (isPaused) {
+        // Action Buttons: Clear Plate, Pause / Resume, Cancel
+        if (isWaiting || isFinished) {
+            val clearPendingIntent = PrintNotificationActionReceiver.createActionPendingIntent(
+                context, status.printerId, PrintNotificationActionReceiver.ACTION_CLEAR_PLATE
+            )
+            builder.addAction(
+                android.R.drawable.ic_menu_rotate,
+                "Clear Plate",
+                clearPendingIntent
+            )
+            if (isWaiting) {
+                val stopPendingIntent = PrintNotificationActionReceiver.createActionPendingIntent(
+                    context, status.printerId, PrintNotificationActionReceiver.ACTION_STOP
+                )
+                builder.addAction(
+                    android.R.drawable.ic_menu_close_clear_cancel,
+                    "Cancel",
+                    stopPendingIntent
+                )
+            }
+        } else if (isPaused) {
             val resumePendingIntent = PrintNotificationActionReceiver.createActionPendingIntent(
                 context, status.printerId, PrintNotificationActionReceiver.ACTION_RESUME
             )
@@ -187,6 +292,14 @@ object LiveNotificationManager {
                 android.R.drawable.ic_media_play,
                 "Resume",
                 resumePendingIntent
+            )
+            val stopPendingIntent = PrintNotificationActionReceiver.createActionPendingIntent(
+                context, status.printerId, PrintNotificationActionReceiver.ACTION_STOP
+            )
+            builder.addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Cancel",
+                stopPendingIntent
             )
         } else {
             val pausePendingIntent = PrintNotificationActionReceiver.createActionPendingIntent(
@@ -197,21 +310,27 @@ object LiveNotificationManager {
                 "Pause",
                 pausePendingIntent
             )
+            val stopPendingIntent = PrintNotificationActionReceiver.createActionPendingIntent(
+                context, status.printerId, PrintNotificationActionReceiver.ACTION_STOP
+            )
+            builder.addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Cancel",
+                stopPendingIntent
+            )
         }
-
-        val stopPendingIntent = PrintNotificationActionReceiver.createActionPendingIntent(
-            context, status.printerId, PrintNotificationActionReceiver.ACTION_STOP
-        )
-        builder.addAction(
-            android.R.drawable.ic_menu_close_clear_cancel,
-            "Cancel",
-            stopPendingIntent
-        )
 
         return builder.build()
     }
 
-    fun showCompletionNotification(context: Context, printerId: Int, printerName: String, fileName: String?) {
+    fun showCompletionNotification(
+        context: Context,
+        printerId: Int,
+        printerName: String,
+        fileName: String?,
+        thumbnailBitmap: Bitmap? = null,
+        jobTag: String? = null
+    ) {
         createNotificationChannels(context)
 
         val tapIntent = Intent(context, MainActivity::class.java).apply {
@@ -225,18 +344,50 @@ object LiveNotificationManager {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val clearPendingIntent = PrintNotificationActionReceiver.createActionPendingIntent(
+            context, printerId, PrintNotificationActionReceiver.ACTION_CLEAR_PLATE
+        )
+
         val cleanName = fileName?.substringAfterLast('/') ?: "3D Print"
-        val notification = NotificationCompat.Builder(context, COMPLETION_CHANNEL_ID)
+        val effectiveTag = jobTag ?: cleanName
+        val dismissPendingIntent = PrintNotificationActionReceiver.createDismissPendingIntent(
+            context, printerId, effectiveTag
+        )
+
+        val builder = NotificationCompat.Builder(context, COMPLETION_CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle("$printerName • Print Finished! 🎉")
-            .setContentText("$cleanName completed successfully.")
+            .setContentText("$cleanName completed successfully. Ready for pickup.")
             .setContentIntent(contentPendingIntent)
+            .setDeleteIntent(dismissPendingIntent)
             .setAutoCancel(true)
+            .setOngoing(false)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .build()
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .addAction(
+                android.R.drawable.ic_menu_rotate,
+                "Clear Plate",
+                clearPendingIntent
+            )
+
+        if (thumbnailBitmap != null) {
+            builder.setLargeIcon(thumbnailBitmap)
+            val bigPictureStyle = NotificationCompat.BigPictureStyle()
+                .bigPicture(thumbnailBitmap)
+                .setBigContentTitle("$printerName • Print Finished! 🎉")
+                .setSummaryText("$cleanName completed successfully. Ready for pickup.")
+            builder.setStyle(bigPictureStyle)
+        }
 
         val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(NOTIFICATION_ID_BASE + 500 + printerId, notification)
+        manager.notify(NOTIFICATION_ID_BASE + 500 + printerId, builder.build())
+    }
+
+    fun dismissCompletion(context: Context, printerId: Int) {
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.cancel(NOTIFICATION_ID_BASE + 500 + printerId)
     }
 
     fun dismissLiveNotification(context: Context, printerId: Int) {

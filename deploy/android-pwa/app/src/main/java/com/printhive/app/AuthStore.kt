@@ -21,11 +21,16 @@ object AuthStore {
         return saved
     }
 
-    fun setToken(context: Context, token: String?) {
+    fun setToken(context: Context, token: String?): Boolean {
         val clean = token?.trim('"', ' ', '\'')?.takeIf { it.isNotBlank() && it != "null" }
+        val current = getToken(context)
+        if (clean == current) {
+            return false
+        }
         inMemoryToken = clean
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putString(KEY_AUTH_TOKEN, clean).apply()
         Log.d(TAG, "Auth token updated (present=${!clean.isNullOrBlank()}, length=${clean?.length ?: 0})")
+        return true
     }
 }

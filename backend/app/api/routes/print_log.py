@@ -3,7 +3,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.auth import (
@@ -125,14 +125,78 @@ async def get_print_log_thumbnail(
     log list will simply not request this thumbnail again.
     """
     entry = await db.get(PrintLogEntry, entry_id)
-    if not entry or not entry.thumbnail_path:
-        raise HTTPException(404, "Thumbnail not found")
+    if not entry:
+        raise HTTPException(404, "Print log entry not found")
 
-    thumb_path = settings.base_dir / entry.thumbnail_path
-    if not thumb_path.exists():
-        entry.thumbnail_path = None
-        await db.commit()
-        raise HTTPException(404, "Thumbnail file not found")
+    thumb_path = (settings.base_dir / entry.thumbnail_path) if entry.thumbnail_path else None
+    if not thumb_path or not thumb_path.exists():
+        resolved_thumb = None
+        # 1. Check associated archive
+        if entry.archive_id:
+            from backend.app.models.archive import PrintArchive
+            archive = await db.get(PrintArchive, entry.archive_id)
+            if archive and archive.thumbnail_path:
+                p = settings.base_dir / archive.thumbnail_path
+                if p.exists():
+                    resolved_thumb = archive.thumbnail_path
+                    thumb_path = p
+
+        # 2. Check other archives matching print_name
+        if not resolved_thumb and entry.print_name:
+            from backend.app.models.archive import PrintArchive
+            archive_res = await db.execute(
+                select(PrintArchive.thumbnail_path)
+                .where(
+                    or_(
+                        PrintArchive.print_name == entry.print_name,
+                        PrintArchive.filename == entry.print_name,
+                    ),
+                    PrintArchive.thumbnail_path != None,
+                )
+                .order_by(PrintArchive.id.desc())
+                .limit(1)
+            )
+            cand = archive_res.scalar_one_or_none()
+            if cand:
+                p = settings.base_dir / cand
+                if p.exists():
+                    resolved_thumb = cand
+                    thumb_path = p
+
+        # 3. Check archive folders on disk
+        if not resolved_thumb and entry.print_name:
+            import os
+            import re
+
+            def norm_name(s: str) -> str:
+                return re.sub(r"[^a-zA-Z0-9]", "", s).lower()
+
+            norm_target = norm_name(entry.print_name)
+            search_dirs = [
+                settings.archive_dir / str(entry.printer_id) if entry.printer_id else None,
+                settings.archive_dir / "unassigned",
+            ]
+            for sdir in search_dirs:
+                if sdir and sdir.exists():
+                    for folder_name in sorted(os.listdir(sdir), reverse=True):
+                        fn_norm = norm_name(folder_name)
+                        if norm_target and (norm_target in fn_norm or fn_norm in norm_target):
+                            cand_f = sdir / folder_name / "thumbnail.png"
+                            if cand_f.exists():
+                                resolved_thumb = str(cand_f.relative_to(settings.base_dir))
+                                thumb_path = cand_f
+                                break
+                    if resolved_thumb:
+                        break
+
+        if resolved_thumb and thumb_path and thumb_path.exists():
+            entry.thumbnail_path = resolved_thumb
+            await db.commit()
+        else:
+            if entry.thumbnail_path:
+                entry.thumbnail_path = None
+                await db.commit()
+            raise HTTPException(404, "Thumbnail file not found")
 
     return FileResponse(
         path=thumb_path,

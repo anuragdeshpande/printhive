@@ -7,8 +7,9 @@ import {
   Search, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight,
   TrendingDown, Layers, Printer, AlertTriangle, X, Clock, LayoutGrid, TableProperties, Columns,
   ArrowUp, ArrowDown, ArrowUpDown, Group, ChevronDown, Check, RefreshCw, TrendingUp, Lock, Copy, Eraser, MapPin,
-  Upload, Download,
+  Upload, Download, MoreHorizontal, Radio,
 } from 'lucide-react';
+import { isAndroidWebclient, triggerHaptic, requestNfcScan } from '../utils/androidBridge';
 import { ForecastPanel } from '../components/ForecastPanel';
 import { api, spoolbuddyApi, ApiError } from '../api/client';
 import type { InventorySpool, SpoolCatalogEntry } from '../api/client';
@@ -506,7 +507,24 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
   const [spoolFilter, setSpoolFilter] = useState('');
   const [stockFilter, setStockFilter] = useState<'all' | 'stock' | 'configured'>('all');
   const [search, setSearch] = useState('');
-  const [viewMode, setViewMode] = useState<ViewMode>('table');
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    try {
+      const saved = localStorage.getItem('bambuddy-inventory-viewmode');
+      if (saved === 'table' || saved === 'cards' || saved === 'forecast') {
+        return saved;
+      }
+    } catch { /* ignore */ }
+    return typeof window !== 'undefined' && window.innerWidth < 768 ? 'cards' : 'table';
+  });
+  const [showMobileActions, setShowMobileActions] = useState(false);
+
+  const handleSetViewMode = (mode: ViewMode) => {
+    setViewMode(mode);
+    triggerHaptic(20);
+    try {
+      localStorage.setItem('bambuddy-inventory-viewmode', mode);
+    } catch { /* ignore */ }
+  };
   const [sortState, setSortState] = useState<SortState>(loadSortState);
   const [columnConfig, setColumnConfig] = useState<ColumnConfig[]>(loadColumnConfig);
   const [showColumnModal, setShowColumnModal] = useState(false);
@@ -1310,10 +1328,44 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           <h1 className="text-2xl font-bold text-white flex items-center gap-3">
             <Package className="w-7 h-7 text-bambu-green" />
             {t('inventory.title')}
+            {stats && !isLoading && (
+              <span className="text-sm font-normal text-bambu-gray bg-bambu-dark-secondary px-2.5 py-0.5 rounded-full">
+                {stats.totalSpools}
+              </span>
+            )}
           </h1>
-          <p className="text-bambu-gray mt-1">{t('inventory.subtitle')}</p>
+          <p className="text-bambu-gray mt-1 text-sm">{t('inventory.subtitle')}</p>
         </div>
-        <div className="flex items-center gap-2">
+
+        {/* Mobile secondary actions trigger + quick add */}
+        <div className="flex sm:hidden items-center gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              triggerHaptic(20);
+              setShowMobileActions(true);
+            }}
+            className="h-9 w-9 rounded-lg border bg-bambu-dark-secondary border-bambu-dark-tertiary flex items-center justify-center text-white touch-press"
+            aria-label="More actions"
+            title="More actions"
+          >
+            <MoreHorizontal className="w-5 h-5" />
+          </button>
+          <Button
+            size="sm"
+            onClick={() => {
+              triggerHaptic(20);
+              setFormModal({ spool: null, mode: 'create' });
+            }}
+            className="touch-press"
+          >
+            <Plus className="w-4 h-4" />
+            <span>{t('inventory.addSpool')}</span>
+          </Button>
+        </div>
+
+        {/* Desktop actions */}
+        <div className="hidden sm:flex items-center gap-2">
           {/* CSV import/export (#1576). Operates on Bambuddy's local inventory.
               In Spoolman mode the buttons stay visible (feature parity) but are
               disabled with a hint pointing at Spoolman's own CSV export, since
@@ -1343,9 +1395,6 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           <Button
             variant="secondary"
             disabled={filteredSpools.length === 0}
-            // Pre-select every visible spool so the user lands in "all
-            // checked", then refines downward in the modal. Per-card icon
-            // pre-selects only that spool — both flows share the same picker.
             onClick={() => setLabelPickerSpoolIds(filteredSpools.map((s) => s.id))}
             title={
               filteredSpools.length === 0
@@ -1363,11 +1412,99 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
         </div>
       </div>
 
+      {/* Mobile secondary actions bottom sheet */}
+      {showMobileActions && (
+        <div className="sm:hidden fixed inset-0 z-50 flex items-end">
+          <div
+            className="fixed inset-0 bg-black/60 backdrop-blur-sm"
+            onClick={() => setShowMobileActions(false)}
+          />
+          <div className="relative w-full bg-bambu-dark-secondary border-t border-bambu-dark-tertiary rounded-t-2xl shadow-2xl p-4 animate-slide-up pb-safe space-y-3">
+            <div className="flex justify-center -mt-1 mb-2">
+              <div className="w-10 h-1 bg-bambu-gray/40 rounded-full" />
+            </div>
+            <div className="flex items-center justify-between pb-2 border-b border-bambu-dark-tertiary">
+              <h3 className="font-semibold text-white text-base">{t('inventory.title')} Actions</h3>
+              <button
+                type="button"
+                onClick={() => setShowMobileActions(false)}
+                className="p-1.5 text-bambu-gray hover:text-white rounded-lg touch-press"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="space-y-2">
+              {isAndroidWebclient() && (
+                <Button
+                  variant="secondary"
+                  className="w-full justify-start gap-3 !h-12 text-base touch-press"
+                  onClick={() => {
+                    setShowMobileActions(false);
+                    triggerHaptic(30);
+                    requestNfcScan();
+                  }}
+                >
+                  <Radio className="w-5 h-5 text-bambu-green" />
+                  Scan NFC Spool Tag
+                </Button>
+              )}
+              <Button
+                variant="secondary"
+                disabled={filteredSpools.length === 0}
+                className="w-full justify-start gap-3 !h-12 text-base touch-press"
+                onClick={() => {
+                  setShowMobileActions(false);
+                  setLabelPickerSpoolIds(filteredSpools.map((s) => s.id));
+                }}
+              >
+                <Printer className="w-5 h-5" />
+                {t('inventory.labels.printLabels', 'Print labels…')}
+              </Button>
+              <Button
+                variant="secondary"
+                className="w-full justify-start gap-3 !h-12 text-base touch-press"
+                onClick={() => {
+                  setShowMobileActions(false);
+                  setLocationsModalOpen(true);
+                }}
+              >
+                <MapPin className="w-5 h-5" />
+                {t('locations.manage')}
+              </Button>
+              <Button
+                variant="secondary"
+                disabled={spoolmanMode}
+                className="w-full justify-start gap-3 !h-12 text-base touch-press"
+                onClick={() => {
+                  setShowMobileActions(false);
+                  setCsvImportOpen(true);
+                }}
+              >
+                <Upload className="w-5 h-5" />
+                {t('inventory.csv.importButton', 'Import CSV')}
+              </Button>
+              <Button
+                variant="secondary"
+                disabled={spoolmanMode || exportingCsv}
+                className="w-full justify-start gap-3 !h-12 text-base touch-press"
+                onClick={() => {
+                  setShowMobileActions(false);
+                  handleExportCsv();
+                }}
+              >
+                {exportingCsv ? <Loader2 className="w-5 h-5 animate-spin" /> : <Download className="w-5 h-5" />}
+                {t('inventory.csv.exportButton', 'Export CSV')}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Stats Bar */}
       {stats && !isLoading && (
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+        <div className="max-sm:flex max-sm:overflow-x-auto max-sm:scrollbar-hide max-sm:snap-x max-sm:gap-2.5 max-sm:pb-1 max-sm:-mx-4 max-sm:px-4 sm:grid sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
           {/* Total Inventory */}
-          <div className="bg-bambu-dark-secondary rounded-lg p-4">
+          <div className="bg-bambu-dark-secondary rounded-lg p-4 max-sm:min-w-[170px] max-sm:snap-start max-sm:p-3 max-sm:shrink-0">
             <div className="flex items-center gap-2 mb-1">
               <Package className="w-4 h-4 text-bambu-green" />
               <span className="text-xs text-bambu-gray font-medium uppercase tracking-wide">{t('inventory.totalInventory')}</span>
@@ -1377,7 +1514,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           </div>
 
           {/* Total Consumed */}
-          <div className="bg-bambu-dark-secondary rounded-lg p-4">
+          <div className="bg-bambu-dark-secondary rounded-lg p-4 max-sm:min-w-[170px] max-sm:snap-start max-sm:p-3 max-sm:shrink-0">
             <div className="flex items-center justify-between gap-2 mb-1">
               <div className="flex items-center gap-2">
                 <TrendingDown className="w-4 h-4 text-blue-600 dark:text-blue-400" />
@@ -1386,7 +1523,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
               {stats.totalConsumed > 0 && resetableSpoolIds.length > 0 && (
                 <button
                   onClick={() => setConfirmAction({ type: 'reset-all-consumed-counters' })}
-                  className="p-1 text-bambu-gray hover:text-red-600 dark:hover:text-red-400 rounded transition-colors"
+                  className="p-1 text-bambu-gray hover:text-red-600 dark:hover:text-red-400 rounded transition-colors touch-press"
                   title={t('inventory.resetAllConsumedCountersTooltip')}
                   aria-label={t('inventory.resetAllConsumedCounters')}
                 >
@@ -1399,7 +1536,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           </div>
 
           {/* By Material */}
-          <div className="bg-bambu-dark-secondary rounded-lg p-4">
+          <div className="bg-bambu-dark-secondary rounded-lg p-4 max-sm:min-w-[200px] max-sm:snap-start max-sm:p-3 max-sm:shrink-0">
             <div className="flex items-center gap-2 mb-1">
               <Layers className="w-4 h-4 text-green-600 dark:text-green-400" />
               <span className="text-xs text-bambu-gray font-medium uppercase tracking-wide">{t('inventory.byMaterial')}</span>
@@ -1417,7 +1554,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           </div>
 
           {/* In Printer */}
-          <div className="bg-bambu-dark-secondary rounded-lg p-4">
+          <div className="bg-bambu-dark-secondary rounded-lg p-4 max-sm:min-w-[160px] max-sm:snap-start max-sm:p-3 max-sm:shrink-0">
             <div className="flex items-center gap-2 mb-1">
               <Printer className="w-4 h-4 text-purple-600 dark:text-purple-400" />
               <span className="text-xs text-bambu-gray font-medium uppercase tracking-wide">{t('inventory.inPrinter')}</span>
@@ -1427,7 +1564,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           </div>
 
           {/* Low Stock */}
-          <div className="bg-bambu-dark-secondary rounded-lg p-4">
+          <div className="bg-bambu-dark-secondary rounded-lg p-4 max-sm:min-w-[170px] max-sm:snap-start max-sm:p-3 max-sm:shrink-0">
             <div className="flex items-center gap-2 mb-1">
               <AlertTriangle className="w-4 h-4 text-yellow-600 dark:text-yellow-400" />
               <span className="text-xs text-bambu-gray font-medium uppercase tracking-wide">{t('inventory.lowStock')}</span>
@@ -1474,7 +1611,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                 <>
                   <span className="text-bambu-gray">{'< '}{lowStockThreshold}%</span>
                   <button
-                    className="p-1.5 text-bambu-gray hover:text-white rounded transition-colors"
+                    className="p-1.5 text-bambu-gray hover:text-white rounded transition-colors touch-press"
                     title={t('common.edit')}
                     onClick={() => {
                       setThresholdInput(lowStockThreshold.toString());
@@ -1491,58 +1628,61 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
       )}
 
       {/* Toolbar: Search + View toggle */}
-      <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center justify-between">
-        <div className={`relative flex-1 max-w-md ${viewMode === 'forecast' ? 'invisible pointer-events-none' : ''}`}>
+      <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center justify-between">
+        <div className={`relative flex-1 max-w-md w-full ${viewMode === 'forecast' ? 'invisible pointer-events-none' : ''}`}>
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-bambu-gray/50" />
           <input
             type="text"
             value={search}
             onChange={(e) => { setSearch(e.target.value); resetPage(); }}
             placeholder={t('inventory.search')}
-            className="w-full pl-10 pr-8 py-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white text-sm placeholder:text-bambu-gray/50 focus:outline-none focus:border-bambu-green"
+            className="w-full pl-10 pr-9 py-2.5 sm:py-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white text-base sm:text-sm placeholder:text-bambu-gray/50 focus:outline-none focus:border-bambu-green"
           />
           {search && (
             <button
               onClick={() => { setSearch(''); resetPage(); }}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-bambu-gray hover:text-white"
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 w-8 h-8 flex items-center justify-center text-bambu-gray hover:text-white touch-press"
             >
               <X className="w-4 h-4" />
             </button>
           )}
         </div>
 
-        <div className="flex items-center gap-2">
-          {/* Columns button (table view only) */}
-          {viewMode === 'table' && (
-            <button
-              onClick={() => setShowColumnModal(true)}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-bambu-gray border border-bambu-dark-tertiary rounded-lg hover:bg-bambu-dark-tertiary transition-colors"
-              title={t('inventory.configureColumns')}
-            >
-              <Columns className="w-4 h-4" />
-              <span className="hidden sm:inline">{t('inventory.columns')}</span>
-            </button>
-          )}
-          {/* Group similar toggle — hidden in forecast mode */}
-          {viewMode !== 'forecast' && (
-            <button
-              onClick={toggleGroupSimilar}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium border rounded-lg transition-colors ${
-                groupSimilar
-                  ? 'bg-bambu-green/20 text-bambu-green border-bambu-green/30'
-                  : 'text-bambu-gray border-bambu-dark-tertiary hover:bg-bambu-dark-tertiary'
-              }`}
-              title={t('inventory.groupSimilar')}
-            >
-              <Group className="w-4 h-4" />
-              <span className="hidden sm:inline">{t('inventory.groupSimilar')}</span>
-            </button>
-          )}
+        <div className="flex items-center gap-2 max-sm:w-full max-sm:justify-between">
+          <div className="flex items-center gap-2">
+            {/* Columns button (table view only) */}
+            {viewMode === 'table' && (
+              <button
+                onClick={() => setShowColumnModal(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-bambu-gray border border-bambu-dark-tertiary rounded-lg hover:bg-bambu-dark-tertiary transition-colors touch-press"
+                title={t('inventory.configureColumns')}
+              >
+                <Columns className="w-4 h-4" />
+                <span className="hidden sm:inline">{t('inventory.columns')}</span>
+              </button>
+            )}
+            {/* Group similar toggle — hidden in forecast mode */}
+            {viewMode !== 'forecast' && (
+              <button
+                onClick={toggleGroupSimilar}
+                className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium border rounded-lg transition-colors touch-press ${
+                  groupSimilar
+                    ? 'bg-bambu-green/20 text-bambu-green border-bambu-green/30'
+                    : 'text-bambu-gray border-bambu-dark-tertiary hover:bg-bambu-dark-tertiary'
+                }`}
+                title={t('inventory.groupSimilar')}
+              >
+                <Group className="w-4 h-4" />
+                <span className="hidden sm:inline">{t('inventory.groupSimilar')}</span>
+              </button>
+            )}
+          </div>
+
           {/* Table / Cards toggle */}
           <div className="flex bg-bambu-dark-primary border border-bambu-dark-tertiary rounded-lg overflow-hidden">
             <button
-              onClick={() => setViewMode('table')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium transition-colors ${
+              onClick={() => handleSetViewMode('table')}
+              className={`flex items-center gap-1.5 px-3 py-2 sm:py-1.5 text-sm font-medium transition-colors touch-press ${
                 viewMode === 'table'
                   ? 'bg-bambu-green text-white'
                   : 'text-bambu-gray hover:bg-bambu-dark-tertiary'
@@ -1552,8 +1692,8 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
               <span className="hidden sm:inline">{t('inventory.table')}</span>
             </button>
             <button
-              onClick={() => setViewMode('cards')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium transition-colors ${
+              onClick={() => handleSetViewMode('cards')}
+              className={`flex items-center gap-1.5 px-3 py-2 sm:py-1.5 text-sm font-medium transition-colors touch-press ${
                 viewMode === 'cards'
                   ? 'bg-bambu-green text-white'
                   : 'text-bambu-gray hover:bg-bambu-dark-tertiary'
@@ -1563,10 +1703,10 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
               <span className="hidden sm:inline">{t('inventory.cards')}</span>
             </button>
             <button
-              onClick={() => canViewForecast && setViewMode('forecast')}
+              onClick={() => canViewForecast && handleSetViewMode('forecast')}
               disabled={!canViewForecast}
               title={canViewForecast ? undefined : t('forecast.noReadAccess')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+              className={`flex items-center gap-1.5 px-3 py-2 sm:py-1.5 text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed touch-press ${
                 viewMode === 'forecast'
                   ? 'bg-bambu-green text-white'
                   : 'text-bambu-gray hover:bg-bambu-dark-tertiary'
@@ -1580,7 +1720,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
       </div>
 
       {/* Filter chips row — hidden in forecast mode */}
-      <div className={`flex flex-wrap items-center gap-2 ${viewMode === 'forecast' ? 'hidden' : ''}`}>
+      <div className={`flex items-center gap-2 ${viewMode === 'forecast' ? 'hidden' : ''} max-sm:overflow-x-auto max-sm:scrollbar-hide max-sm:flex-nowrap max-sm:-mx-4 max-sm:px-4 max-sm:py-1 sm:flex-wrap [&>*]:shrink-0`}>
         {/* Active / Archived chips */}
         <div className="flex items-center rounded-lg border border-bambu-dark-tertiary overflow-hidden">
           <button
@@ -2327,6 +2467,38 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
         onClose={() => setLocationsModalOpen(false)}
         onPickLocation={(id) => setStorageLocationFilter(String(id))}
       />
+
+      {/* Mobile M3 Floating Action Button (hidden in forecast mode) */}
+      {viewMode !== 'forecast' && (
+        <div className="sm:hidden fixed bottom-20 right-4 z-30 flex flex-col items-end gap-2.5 pb-safe pointer-events-none">
+          {isAndroidWebclient() && (
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic(30);
+                requestNfcScan();
+              }}
+              className="pointer-events-auto flex items-center justify-center w-11 h-11 rounded-full bg-bambu-dark-secondary border border-bambu-dark-tertiary text-white shadow-lg active:scale-95 transition-transform touch-press"
+              aria-label="Scan NFC Spool Tag"
+              title="Scan NFC Spool Tag"
+            >
+              <Radio className="w-5 h-5 text-bambu-green" />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              triggerHaptic(25);
+              setFormModal({ spool: null, mode: 'create' });
+            }}
+            className="pointer-events-auto flex items-center gap-2 px-4 py-3 rounded-full bg-bambu-green text-white font-medium shadow-2xl active:scale-95 transition-transform touch-press"
+            aria-label={t('inventory.addSpool')}
+          >
+            <Plus className="w-5 h-5" />
+            <span className="text-sm font-semibold">{t('inventory.addSpool')}</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -2432,16 +2604,21 @@ function SpoolCard({
       className={`bg-bambu-dark-secondary rounded-lg overflow-hidden border border-bambu-dark-tertiary hover:border-bambu-green transition-colors cursor-pointer ${spool.archived_at ? 'opacity-50' : ''}`}
       onClick={onClick}
     >
-      <div className="h-14 flex items-center justify-center" style={bannerStyle}>
-        <span className="bg-white/90 text-gray-800 px-3 py-0.5 rounded-full text-sm font-medium">
+      <div className="relative h-14 flex items-center justify-center" style={bannerStyle}>
+        <span className="bg-white/90 text-gray-800 px-3 py-0.5 rounded-full text-sm font-medium shadow-sm">
           {resolveSpoolColorName(spool.color_name, spool.rgba) || '-'}
         </span>
         {onCopy && (
           <button
             type="button"
-            onClick={(e) => { e.stopPropagation(); onCopy(); }}
-            className="p-1.5 bg-black/20 hover:bg-black/40 text-white rounded-full transition-colors"
+            onClick={(e) => {
+              e.stopPropagation();
+              triggerHaptic(20);
+              onCopy();
+            }}
+            className="absolute right-2 top-2 p-2 bg-black/30 hover:bg-black/50 text-white rounded-full transition-colors touch-press flex items-center justify-center"
             title={t('inventory.copySpool')}
+            aria-label={t('inventory.copySpool')}
           >
             <Copy className="w-3.5 h-3.5" />
           </button>
@@ -2458,8 +2635,12 @@ function SpoolCard({
           <div className="flex items-center gap-1">
             {onPrintLabel && (
               <button
-                onClick={(e) => { e.stopPropagation(); onPrintLabel(); }}
-                className="p-1 text-bambu-gray hover:text-white rounded transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  triggerHaptic(20);
+                  onPrintLabel();
+                }}
+                className="p-2 -mr-1 text-bambu-gray hover:text-white rounded-lg transition-colors touch-press flex items-center justify-center"
                 title={t('inventory.labels.printOne')}
                 aria-label={t('inventory.labels.printOne')}
               >

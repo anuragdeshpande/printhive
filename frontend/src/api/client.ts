@@ -7618,37 +7618,6 @@ export const spoolbuddyApi = {
     ),
 };
 
-export interface BugReportRequest {
-  description: string;
-  email?: string;
-  screenshot_base64?: string;
-  include_support_info?: boolean;
-  debug_logs?: string;
-}
-
-export interface BugReportResponse {
-  success: boolean;
-  message: string;
-  issue_url?: string;
-  issue_number?: number;
-}
-
-export const bugReportApi = {
-  submit: (data: BugReportRequest) =>
-    request<BugReportResponse>('/bug-report/submit', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    }),
-  startLogging: () =>
-    request<{ started: boolean; was_debug: boolean }>('/bug-report/start-logging', {
-      method: 'POST',
-    }),
-  stopLogging: (wasDebug: boolean) =>
-    request<{ logs: string }>(`/bug-report/stop-logging?was_debug=${wasDebug}`, {
-      method: 'POST',
-    }),
-};
-
 export interface SponsorPromptCheckResponse {
   show: boolean;
   milestone?: string;

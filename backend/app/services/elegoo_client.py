@@ -115,6 +115,7 @@ class ElegooCentauriClient:
         
         self._was_running = False
         self._completion_triggered = False
+        self._last_known_job_name = ""
         self._last_layer_num = 0
         self._last_bed_temp = 0.0
         self._drying_targets = {}
@@ -271,6 +272,7 @@ class ElegooCentauriClient:
                 self.state.current_print = status.print_info.filename
                 self.state.subtask_name = status.print_info.filename
                 self.state.gcode_file = status.print_info.filename
+                self._last_known_job_name = status.print_info.filename
             self.state.progress = float(status.print_info.progress or 0)
 
             self.state.layer_num = status.print_info.current_layer or 0
@@ -288,8 +290,6 @@ class ElegooCentauriClient:
             else:
                 self.state.remaining_time = 0
 
-
-            
             # Map speed level (1=silent, 2=standard, 3=sport, 4=ludicrous)
             pct = status.print_info.print_speed
             if pct == 50:
@@ -338,11 +338,18 @@ class ElegooCentauriClient:
             self.state.state = state_str
             self.state.stg_cur = stg_cur
 
-
+            if state_str == "FINISH" and not self.state.subtask_name:
+                if self._last_known_job_name:
+                    self.state.subtask_name = self._last_known_job_name
+                    self.state.current_print = self._last_known_job_name
+                    self.state.gcode_file = self._last_known_job_name
+                else:
+                    asyncio.create_task(self._recover_finished_job_name())
 
             # Trigger state callbacks
             if state_str in ("RUNNING", "PREPARE") and not self._was_running:
                 self._was_running = True
+                self._completion_triggered = False
                 if self.on_print_start:
                     self.on_print_start({
                         "filename": self.state.current_print,
@@ -352,6 +359,7 @@ class ElegooCentauriClient:
 
             if state_str == "FINISH" and not self._completion_triggered:
                 self._completion_triggered = True
+                self._was_running = False
                 if self.on_print_complete:
                     self.on_print_complete({
                         "filename": self.state.current_print,
@@ -359,14 +367,16 @@ class ElegooCentauriClient:
                         "status": "completed",
                     })
 
-
-
-            if state_str in ("IDLE", "FINISH", "FAILED"):
+            if state_str in ("IDLE", "FAILED"):
                 self._was_running = False
                 self._completion_triggered = False
                 self.state.current_print = ""
                 self.state.subtask_name = ""
                 self.state.gcode_file = ""
+            elif state_str == "FINISH":
+                self._was_running = False
+                # Do NOT clear current_print or subtask_name in FINISH state (waiting for plate clear)
+                # and do NOT reset _completion_triggered to false to avoid repeated callbacks.
 
 
 
@@ -387,6 +397,26 @@ class ElegooCentauriClient:
 
         if self.on_state_change:
             self.on_state_change(self.state)
+
+    async def _recover_finished_job_name(self):
+        if not self._printer or not hasattr(self._printer, "print_history"):
+            return
+        try:
+            hist = await self._printer.print_history()
+            tasks = (hist or {}).get("history_task_list") or []
+            if tasks:
+                latest = tasks[-1]
+                t_name = latest.get("task_name")
+                if t_name and not self.state.subtask_name:
+                    self.state.subtask_name = t_name
+                    self.state.current_print = t_name
+                    self.state.gcode_file = t_name
+                    self._last_known_job_name = t_name
+                    logger.info("Recovered finished job name from Elegoo print history: %s", t_name)
+                    if self.on_state_change:
+                        self.on_state_change(self.state)
+        except Exception as e:
+            logger.debug("Failed to recover finished job name from Elegoo history: %s", e)
 
     async def _update_canvas_status(self):
         try:

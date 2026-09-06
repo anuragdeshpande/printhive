@@ -786,13 +786,18 @@ export function SpoolFormModal({
   const isPending = createMutation.isPending || bulkCreateMutation.isPending || updateMutation.isPending || deleteTagMutation.isPending || unassignMutation.isPending;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center">
       <div
         className="absolute inset-0 bg-black/60 backdrop-blur-sm"
         onClick={onClose}
       />
 
-      <div className="relative w-full max-w-xl mx-4 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] flex flex-col">
+      <div className="relative w-full sm:max-w-xl sm:mx-4 bg-bambu-dark-secondary border-t sm:border border-bambu-dark-tertiary rounded-t-2xl sm:rounded-xl shadow-2xl max-h-[92vh] sm:max-h-[90vh] flex flex-col animate-slide-up sm:animate-none pb-safe">
+        {/* Mobile drag handle */}
+        <div className="sm:hidden flex justify-center pt-2 pb-1">
+          <div className="w-10 h-1 bg-bambu-gray/40 rounded-full" />
+        </div>
+
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary flex-shrink-0">
           <h2 className="text-lg font-semibold text-white flex items-baseline gap-2">
@@ -803,7 +808,7 @@ export function SpoolFormModal({
           </h2>
           <button
             onClick={onClose}
-            className="p-1 text-bambu-gray hover:text-white rounded transition-colors"
+            className="p-1.5 text-bambu-gray hover:text-white rounded-lg transition-colors touch-press"
           >
             <X className="w-5 h-5" />
           </button>
@@ -983,47 +988,51 @@ export function SpoolFormModal({
         </div>
 
         {/* Footer */}
-        <div className="flex gap-2 p-4 border-t border-bambu-dark-tertiary flex-shrink-0">
+        <div className="flex flex-wrap items-center justify-between gap-2 p-4 border-t border-bambu-dark-tertiary flex-shrink-0 bg-bambu-dark-secondary">
           {isEditing && (
-            <div className="flex gap-2 mr-auto">
+            <div className="flex gap-2 max-sm:w-full max-sm:order-2">
               <Button
                 variant="secondary"
                 onClick={() => deleteTagMutation.mutate()}
                 disabled={isPending || !spool?.tag_uid}
+                className="max-sm:flex-1 max-sm:min-h-[44px]"
               >
                 <Tag className="w-4 h-4" />
-                {t('inventory.clearRfid', 'Clear RFID Tag')}
+                <span className="max-sm:hidden">{t('inventory.clearRfid', 'Clear RFID Tag')}</span>
+                <span className="sm:hidden">Clear RFID</span>
               </Button>
               <Button
                 variant="secondary"
                 onClick={() => unassignMutation.mutate()}
                 disabled={isPending || !spoolAssignment}
+                className="max-sm:flex-1 max-sm:min-h-[44px]"
               >
                 <Unlink className="w-4 h-4" />
                 {t('inventory.unassignSpool', 'Unassign')}
               </Button>
             </div>
           )}
-          <div className="flex gap-2 ml-auto">
-          <Button variant="secondary" onClick={onClose}>
-            {t('common.cancel')}
-          </Button>
-          <Button
-            onClick={handleSubmit}
-            disabled={isPending}
-          >
-            {isPending ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                {t('common.saving')}
-              </>
-            ) : (
-              <>
-                <Save className="w-4 h-4" />
-                {isEditing ? t('common.save') : isCopying ? t('inventory.copySpool') : t('inventory.addSpool')}
-              </>
-            )}
-          </Button>
+          <div className="flex gap-2 ml-auto max-sm:w-full max-sm:order-1">
+            <Button variant="secondary" onClick={onClose} className="max-sm:flex-1 max-sm:min-h-[44px]">
+              {t('common.cancel')}
+            </Button>
+            <Button
+              onClick={handleSubmit}
+              disabled={isPending}
+              className="max-sm:flex-1 max-sm:min-h-[44px]"
+            >
+              {isPending ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {t('common.saving')}
+                </>
+              ) : (
+                <>
+                  <Save className="w-4 h-4" />
+                  {isEditing ? t('common.save') : isCopying ? t('inventory.copySpool') : t('inventory.addSpool')}
+                </>
+              )}
+            </Button>
           </div>
         </div>
       </div>
