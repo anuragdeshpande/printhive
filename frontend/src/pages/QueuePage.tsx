@@ -8,6 +8,7 @@ import {
   closestCenter,
   KeyboardSensor,
   PointerSensor,
+  TouchSensor,
   useSensor,
   useSensors,
 } from '@dnd-kit/core';
@@ -453,38 +454,40 @@ function SortableQueueItem({
       <div className="flex items-start sm:items-center gap-2 sm:gap-4 p-3 sm:p-4">
         {/* Mobile selection indicator — left accent bar only, no tick */}
 
-        {/* Selection checkbox for pending items - hidden on mobile, tap card instead */}
+        {/* Selection checkbox for pending items */}
         {isPending && onToggleSelect && (
           <button
             onClick={(e) => {
               e.stopPropagation();
               onToggleSelect();
             }}
-            className={`hidden sm:flex items-center justify-center w-6 h-6 rounded border transition-colors shrink-0 ${
+            className={`flex items-center justify-center w-5 h-5 sm:w-6 sm:h-6 rounded border transition-colors shrink-0 self-center ${
               isSelected
                 ? 'bg-bambu-green border-bambu-green text-white'
                 : 'border-white/30 bg-black/30 hover:border-bambu-green/50'
             }`}
           >
-            {isSelected && <Check className="w-4 h-4" />}
+            {isSelected && <Check className="w-3.5 h-3.5 sm:w-4 sm:h-4" />}
           </button>
         )}
 
-        {/* Drag handle or position number - hidden on mobile */}
+        {/* Drag handle or position number */}
         {isPending ? (
           <div
             {...attributes}
             {...listeners}
-            className="hidden sm:flex items-center justify-center w-8 h-8 rounded-lg bg-bambu-dark cursor-grab active:cursor-grabbing hover:bg-bambu-dark-tertiary transition-colors touch-manipulation shrink-0"
+            onClick={(e) => e.stopPropagation()}
+            className="flex items-center justify-center w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-bambu-dark cursor-grab active:cursor-grabbing hover:bg-bambu-dark-tertiary transition-colors touch-none shrink-0 self-center"
+            title={t('queue.dragToReorder', { defaultValue: 'Drag to reorder' })}
           >
             <GripVertical className="w-4 h-4 text-bambu-gray" />
           </div>
         ) : position !== undefined ? (
-          <div className="hidden sm:flex items-center justify-center w-8 h-8 rounded-lg bg-bambu-dark text-bambu-gray text-sm font-medium shrink-0">
+          <div className="flex items-center justify-center w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-bambu-dark text-bambu-gray text-xs sm:text-sm font-medium shrink-0 self-center">
             #{position}
           </div>
         ) : (
-          <div className="hidden sm:block w-8 shrink-0" />
+          <div className="w-7 sm:w-8 shrink-0" />
         )}
 
         {/* Thumbnail - use plate-specific thumbnail if plate_id is set */}
@@ -919,20 +922,21 @@ function SortableBatchRow({
               }
             });
           }}
-          className={`hidden sm:flex items-center justify-center w-6 h-6 rounded border transition-colors shrink-0 ${
+          className={`flex items-center justify-center w-5 h-5 sm:w-6 sm:h-6 rounded border transition-colors shrink-0 ${
             allSelected
               ? 'bg-bambu-green border-bambu-green text-white'
               : 'border-white/30 bg-black/30 hover:border-bambu-green/50'
           }`}
           title={allSelected ? t('queue.bulkEdit.deselectAll') : t('queue.bulkEdit.selectAll')}
         >
-          {allSelected && <Check className="w-4 h-4" />}
+          {allSelected && <Check className="w-3.5 h-3.5 sm:w-4 sm:h-4" />}
         </button>
         {canReorder && (
           <div
             {...attributes}
             {...listeners}
-            className="hidden sm:flex items-center justify-center w-8 h-8 rounded-lg bg-bambu-dark cursor-grab active:cursor-grabbing hover:bg-bambu-dark-tertiary transition-colors touch-manipulation shrink-0"
+            onClick={(e) => e.stopPropagation()}
+            className="flex items-center justify-center w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-bambu-dark cursor-grab active:cursor-grabbing hover:bg-bambu-dark-tertiary transition-colors touch-none shrink-0"
             title={t('queue.batch.dragGroup', { defaultValue: 'Drag group' })}
           >
             <GripVertical className="w-4 h-4 text-bambu-gray" />
@@ -1341,7 +1345,8 @@ export function QueuePage() {
   }, [batchCollapsed]);
 
   const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
 
