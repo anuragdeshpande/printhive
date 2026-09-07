@@ -28,10 +28,16 @@ if ('serviceWorker' in navigator) {
       navigator.serviceWorker.register('/sw.js')
         .then((registration) => {
           console.log('SW registered:', registration.scope);
+          registration.update();
         })
         .catch((error) => {
           console.log('SW registration failed:', error);
         });
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        navigator.serviceWorker.getRegistration().then((reg) => reg?.update());
+      }
     });
   }
 }
