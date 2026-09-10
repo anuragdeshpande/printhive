@@ -596,6 +596,107 @@ async def login(raw_request: Request, request: LoginRequest, response: Response,
     )
 
 
+@router.post("/refresh", response_model=LoginResponse)
+async def refresh_token(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(security)] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Refresh an unexpired or recently expired JWT access token to automatically extend user session."""
+    auth_enabled = await is_auth_enabled(db)
+    if not auth_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Authentication is not enabled",
+        )
+
+    token = None
+    if credentials is not None:
+        token = credentials.credentials
+    if not token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.replace("Bearer ", "").strip()
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if token.startswith("bb_"):
+        api_key = await _validate_api_key(db, token)
+        if not api_key:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+        return LoginResponse(
+            access_token=token,
+            token_type="bearer",
+            user=_api_key_to_user_response(api_key),
+        )
+
+    try:
+        payload = _jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+            options={"verify_exp": False},
+        )
+    except PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token signature",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    jti = payload.get("jti")
+    if jti and await is_jti_revoked(db, jti):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    exp = payload.get("exp")
+    if exp:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        # Allow renewal up to 30 days past previous exp timestamp for persistent logins
+        if now_ts - exp > 30 * 24 * 3600:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token expired beyond auto-renewal window; please log in again",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    user = await get_user_by_username(db, username)
+    if not user or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is inactive or no longer exists",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    result = await db.execute(select(User).where(User.id == user.id).options(selectinload(User.groups)))
+    user = result.scalar_one()
+
+    access_token_expires = timedelta(minutes=await resolve_session_max_minutes(db))
+    new_token = create_access_token(data={"sub": user.username}, expires_delta=access_token_expires)
+
+    return LoginResponse(
+        access_token=new_token,
+        token_type="bearer",
+        user=_user_to_response(user),
+    )
+
+
 @router.post("/ws-token")
 async def mint_websocket_token(
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.WEBSOCKET_CONNECT),

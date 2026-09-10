@@ -101,7 +101,44 @@ export function Layout() {
     (window.matchMedia('(display-mode: standalone)').matches || 
      (window.navigator as any).standalone ||
      (window as any).isPrintHiveApp ||
-     navigator.userAgent.includes('PrintHiveApp'));
+     Boolean((window as any).PrintHiveNative) ||
+     navigator.userAgent.includes('PrintHiveApp') ||
+     isAndroidWebclient());
+
+  const [sheetDragY, setSheetDragY] = useState(0);
+  const [isSheetDragging, setIsSheetDragging] = useState(false);
+  const dragStartYRef = useRef(0);
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    dragStartYRef.current = e.touches[0].clientY;
+    setIsSheetDragging(true);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (!isSheetDragging) return;
+    const deltaY = e.touches[0].clientY - dragStartYRef.current;
+    if (deltaY > 0) {
+      setSheetDragY(deltaY);
+    } else {
+      setSheetDragY(0);
+    }
+  };
+
+  const handleTouchEnd = () => {
+    if (sheetDragY > 75) {
+      triggerHaptic(20);
+      setMobileDrawerOpen(false);
+    }
+    setSheetDragY(0);
+    setIsSheetDragging(false);
+  };
+
+  const handleCloseDrawer = () => {
+    setSheetDragY(0);
+    setIsSheetDragging(false);
+    setMobileDrawerOpen(false);
+  };
+
   const defaultSidebarOrder = useMemo(() => defaultNavItems.map(i => i.id), []);
   const [sidebarOrder, setSidebarOrder] = useState<string[]>(() => getSidebarOrder(defaultNavItems.map(i => i.id)));
   const [hiddenSystemItemIds, setHiddenSystemItemIds] = useState<string[]>(getHiddenSidebarSystemItemIds);
@@ -496,18 +533,11 @@ export function Layout() {
             height: 'calc(3.5rem + var(--safe-area-top, env(safe-area-inset-top, 0px)))',
           }}
         >
-          <div className={`w-full h-14 flex items-center justify-between px-4 ${isAndroidWebclient() ? 'pr-16' : ''}`}>
+          <div className="w-full h-14 flex items-center justify-between px-4">
             <div className="flex items-center">
-              <button
-                onClick={() => setMobileDrawerOpen(true)}
-                className="p-2 -ml-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors"
-                aria-label="Open menu"
-              >
-                <Menu className="w-6 h-6 text-white" />
-              </button>
-              <PrintHiveLogo className="h-8 ml-3" showText={true} />
+              <PrintHiveLogo className="h-8" showText={true} />
             </div>
-            {!isStandalone && (
+            {!isStandalone && !isAndroidWebclient() && (
               <button
                 onClick={() => setShowInstallModal(true)}
                 className="px-2.5 py-1.5 bg-orange-500/10 hover:bg-orange-500/20 border border-orange-500/30 text-orange-400 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors"
@@ -525,28 +555,36 @@ export function Layout() {
       {isSidebarCompact && mobileDrawerOpen && (
         <div
           className="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 transition-opacity"
-          onClick={() => setMobileDrawerOpen(false)}
+          onClick={handleCloseDrawer}
         />
       )}
 
       {/* Mobile Bottom Sheet */}
       {isSidebarCompact && mobileDrawerOpen && (
         <div
-          className="fixed inset-x-0 bottom-0 z-50 bg-bambu-dark-secondary rounded-t-3xl border-t border-bambu-dark-tertiary shadow-2xl flex flex-col max-h-[85vh] animate-slide-up"
+          className={`fixed inset-x-0 bottom-0 z-50 bg-bambu-dark-secondary rounded-t-3xl border-t border-bambu-dark-tertiary shadow-2xl flex flex-col max-h-[85vh] ${
+            isSheetDragging ? '' : 'animate-slide-up transition-transform duration-200 ease-out'
+          }`}
           style={{
-            paddingBottom: 'max(1.25rem, var(--safe-area-bottom, env(safe-area-inset-bottom, 0px)))'
+            paddingBottom: 'max(1.25rem, var(--safe-area-bottom, env(safe-area-inset-bottom, 0px)))',
+            transform: sheetDragY > 0 ? `translateY(${sheetDragY}px)` : undefined,
           }}
         >
           {/* Header & Drag Handle */}
-          <div className="flex flex-col items-center pt-3 pb-3 px-5 border-b border-bambu-dark-tertiary flex-shrink-0">
+          <div 
+            className="flex flex-col items-center pt-3 pb-3 px-5 border-b border-bambu-dark-tertiary flex-shrink-0 cursor-grab active:cursor-grabbing touch-none select-none"
+            onTouchStart={handleTouchStart}
+            onTouchMove={handleTouchMove}
+            onTouchEnd={handleTouchEnd}
+          >
             <div
               className="w-12 h-1.5 bg-bambu-gray/40 rounded-full mb-3 cursor-pointer hover:bg-bambu-gray/60 transition-colors"
-              onClick={() => setMobileDrawerOpen(false)}
+              onClick={handleCloseDrawer}
             />
             <div className="w-full flex items-center justify-between">
               <PrintHiveLogo className="h-7" showText={true} />
               <button
-                onClick={() => setMobileDrawerOpen(false)}
+                onClick={handleCloseDrawer}
                 className="p-1.5 rounded-lg hover:bg-bambu-dark-tertiary text-bambu-gray-light hover:text-white transition-colors"
                 aria-label="Close menu"
               >

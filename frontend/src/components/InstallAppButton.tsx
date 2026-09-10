@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Download } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useToast } from '../contexts/ToastContext';
+import { isAndroidWebclient } from '../utils/androidBridge';
 
 // The beforeinstallprompt event is not in the standard TS DOM lib.
 interface BeforeInstallPromptEvent extends Event {
@@ -45,7 +46,9 @@ export function InstallAppButton() {
     window.matchMedia('(display-mode: standalone)').matches ||
     (window.navigator as any).standalone ||
     (window as any).isPrintHiveApp ||
-    navigator.userAgent.includes('PrintHiveApp')
+    Boolean((window as any).PrintHiveNative) ||
+    navigator.userAgent.includes('PrintHiveApp') ||
+    isAndroidWebclient()
   );
 
   if (!promptEvent || isApp) {

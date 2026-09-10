@@ -3603,6 +3603,16 @@ export const api = {
     request<{ message: string }>('/auth/logout', {
       method: 'POST',
     }),
+  refreshToken: async (): Promise<LoginResponse> => {
+    const res = await request<LoginResponse>('/auth/refresh', {
+      method: 'POST',
+    });
+    if (res.access_token) {
+      const isPersistent = !!localStorage.getItem('auth_token');
+      setAuthToken(res.access_token, isPersistent ? 'persistent' : 'session');
+    }
+    return res;
+  },
   getCurrentUser: () => request<UserResponse>('/auth/me'),
   disableAuth: () =>
     request<{ message: string; auth_enabled: boolean }>('/auth/disable', {

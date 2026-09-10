@@ -72,17 +72,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
               currentUser = await api.getCurrentUser();
+              // Proactively refresh to extend the session window
+              api.refreshToken().catch(() => {});
               break;
             } catch (err) {
               if (!mountedRef.current) return;
-              // 401 invalid-token → genuinely logged out. `request()` has
-              // already cleared the token; stop retrying.
               if (err instanceof ApiError && err.status === 401) {
-                definitiveAuthFailure = true;
-                break;
+                // Attempt a silent token refresh before giving up
+                try {
+                  const refreshResp = await api.refreshToken();
+                  if (refreshResp?.user) {
+                    currentUser = refreshResp.user;
+                    break;
+                  }
+                } catch {
+                  definitiveAuthFailure = true;
+                  break;
+                }
               }
-              // Transient (network / 5xx / other) → back off and retry. Leave
-              // the token in place so a subsequent load can recover.
+              // Transient (network / 5xx / other) → back off and retry.
               if (attempt < maxAttempts) {
                 await new Promise((r) => setTimeout(r, 400 * attempt));
               }
@@ -96,10 +104,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
               setAuthToken(urlToken, 'persistent');
             }
           } else {
-            // No user: either a definitive 401 (token already cleared by
-            // request()) or transient failures exhausted their retries. In the
-            // transient case we deliberately keep the token so a reload retries
-            // rather than forcing a re-login.
             if (definitiveAuthFailure) {
               setAuthToken(null);
             }
@@ -128,19 +132,41 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // Check auth status on mount
     checkAuthStatus();
 
-    // Listen for token-expiry events from the API client. setAuthToken(null)
-    // in client.ts only clears storage; without this listener, `user` stays
-    // populated and ProtectedRoute keeps rendering the protected tree until a
-    // manual refresh — every request silently fails in the meantime (#1698).
+    // Listen for token-expiry events from the API client.
     const handleAuthExpired = () => {
       if (!mountedRef.current) return;
       setUser(null);
     };
     window.addEventListener('auth:expired', handleAuthExpired);
 
+    // Periodic sliding-window auto-renewal every 20 minutes while active
+    const renewalInterval = setInterval(() => {
+      if (getAuthToken()) {
+        api.refreshToken().then((res) => {
+          if (mountedRef.current && res?.user) {
+            setUser(res.user);
+          }
+        }).catch(() => {});
+      }
+    }, 20 * 60 * 1000);
+
+    // Auto-renew on window focus / visibility change
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && getAuthToken()) {
+        api.refreshToken().then((res) => {
+          if (mountedRef.current && res?.user) {
+            setUser(res.user);
+          }
+        }).catch(() => {});
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
       mountedRef.current = false;
       window.removeEventListener('auth:expired', handleAuthExpired);
+      clearInterval(renewalInterval);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, []);
 

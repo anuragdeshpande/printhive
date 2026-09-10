@@ -147,7 +147,7 @@ export function LoginPage() {
   const [emailOTPSent, setEmailOTPSent] = useState(false);
   const twoFAInputRef = useRef<HTMLInputElement>(null);
 
-  const [rememberMe, setRememberMe] = useState(false);
+  const [rememberMe, setRememberMe] = useState(true);
 
   // H-6: Password reset step state
   const [resetToken, setResetToken] = useState('');

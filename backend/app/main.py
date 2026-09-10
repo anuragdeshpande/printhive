@@ -6766,9 +6766,10 @@ app = FastAPI(
 # =============================================================================
 # Public routes that don't require authentication even when auth is enabled
 PUBLIC_API_ROUTES = {
-    # Auth routes needed before/during login
+    # Auth routes needed before/during login and token auto-renewal
     "/api/v1/auth/status",
     "/api/v1/auth/login",
+    "/api/v1/auth/refresh",
     "/api/v1/auth/setup",  # Needed for initial setup and recovery
     # Advanced auth status needed for login page
     "/api/v1/auth/advanced-auth/status",
