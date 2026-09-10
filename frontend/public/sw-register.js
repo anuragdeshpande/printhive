@@ -1,11 +1,17 @@
 if ('serviceWorker' in navigator) {
-  if (location.pathname.startsWith('/spoolbuddy')) {
+  const isAndroidClient = Boolean(
+    (window as any).PrintHiveNative ||
+    (window as any).isPrintHiveApp ||
+    navigator.userAgent.includes('PrintHiveApp')
+  );
+
+  if (location.pathname.startsWith('/spoolbuddy') || isAndroidClient) {
     navigator.serviceWorker.getRegistrations().then((regs) => {
       if (regs.length > 0) {
         Promise.all([
           ...regs.map((r) => r.unregister()),
           caches.keys().then((names) => Promise.all(names.map((n) => caches.delete(n)))),
-        ]).then(() => location.reload());
+        ]);
       }
     });
   } else {
