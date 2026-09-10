@@ -1,6 +1,6 @@
 // PrintHive Service Worker
-const CACHE_NAME = 'printhive-v34';
-const STATIC_CACHE = 'printhive-static-v33';
+const CACHE_NAME = 'printhive-v35';
+const STATIC_CACHE = 'printhive-static-v35';
 
 // Static assets to cache on install
 const STATIC_ASSETS = [
