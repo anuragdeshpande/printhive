@@ -19,6 +19,8 @@ interface PrintHiveNativeInterface {
   triggerVibration(durationMs?: number): void;
   scanNfc(): void;
   getServerUrl(): string;
+  setAuthToken(token: string | null): void;
+  getAuthToken(): string;
 }
 
 declare global {
@@ -81,6 +83,35 @@ export function getNativeDeviceInfo(): AndroidDeviceInfo | null {
     try {
       return JSON.parse(window.PrintHiveNative.getDeviceInfo()) as AndroidDeviceInfo;
     } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Synchronizes the auth token with the native Android app if present.
+ */
+export function syncNativeAuthToken(token: string | null): void {
+  if (typeof window !== 'undefined' && window.PrintHiveNative?.setAuthToken) {
+    try {
+      window.PrintHiveNative.setAuthToken(token || null);
+    } catch (err) {
+      console.warn('syncNativeAuthToken failed:', err);
+    }
+  }
+}
+
+/**
+ * Retrieves the persisted auth token from the native Android app if available.
+ */
+export function getNativeAuthToken(): string | null {
+  if (typeof window !== 'undefined' && window.PrintHiveNative?.getAuthToken) {
+    try {
+      const token = window.PrintHiveNative.getAuthToken();
+      return token && token.trim().length > 0 ? token.trim() : null;
+    } catch (err) {
+      console.warn('getNativeAuthToken failed:', err);
       return null;
     }
   }

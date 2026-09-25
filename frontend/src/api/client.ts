@@ -1,4 +1,5 @@
 import type { ArchivePlatesResponse, LibraryFilePlatesResponse } from '../types/plates';
+import { getNativeAuthToken, syncNativeAuthToken } from '../utils/androidBridge';
 
 const API_BASE = '/api/v1';
 
@@ -33,7 +34,23 @@ export class ApiError extends Error {
 // 'persistent' also writes to localStorage so the token survives tab close
 // (used by Remember Me and the ?token= kiosk bootstrap).
 let authToken: string | null =
-  sessionStorage.getItem('auth_token') ?? localStorage.getItem('auth_token');
+  (typeof window !== 'undefined'
+    ? (sessionStorage.getItem('auth_token') ?? localStorage.getItem('auth_token') ?? getNativeAuthToken())
+    : null);
+
+// If token was retrieved from native bridge but localStorage is empty, persist it
+if (
+  typeof window !== 'undefined' &&
+  authToken &&
+  !sessionStorage.getItem('auth_token') &&
+  !localStorage.getItem('auth_token')
+) {
+  try {
+    localStorage.setItem('auth_token', authToken);
+  } catch (err) {
+    console.warn('Persisting native token to localStorage failed', err);
+  }
+}
 
 export type TokenPersistence = 'session' | 'persistent';
 
@@ -57,6 +74,13 @@ export function setAuthToken(token: string | null, persistence: TokenPersistence
     }
   } catch (err) {
     console.warn('setAuthToken: localStorage operation failed', err);
+  }
+
+  // Always keep Android native client in sync
+  try {
+    syncNativeAuthToken(token);
+  } catch (err) {
+    console.warn('setAuthToken: syncNativeAuthToken failed', err);
   }
 }
 
@@ -127,6 +151,50 @@ function buildSlicerUrlFilename(filename: string): string {
   return safe.toLowerCase().endsWith('.3mf') ? safe : `${safe}.3mf`;
 }
 
+let activeRefreshPromise: Promise<string | null> | null = null;
+
+async function doRefreshToken(): Promise<string | null> {
+  const tokenToUse =
+    authToken ??
+    (typeof window !== 'undefined'
+      ? (sessionStorage.getItem('auth_token') ?? localStorage.getItem('auth_token') ?? getNativeAuthToken())
+      : null);
+
+  if (!tokenToUse) {
+    return null;
+  }
+
+  try {
+    const refreshHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${tokenToUse}`,
+    };
+
+    const res = await fetch(`${API_BASE}/auth/refresh`, {
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'include',
+      headers: refreshHeaders,
+    });
+
+    if (!res.ok) {
+      return null;
+    }
+
+    const data = await res.json();
+    if (data?.access_token) {
+      const isPersistent =
+        typeof window !== 'undefined' &&
+        (!!localStorage.getItem('auth_token') || !!getNativeAuthToken());
+      setAuthToken(data.access_token, isPersistent ? 'persistent' : 'session');
+      return data.access_token as string;
+    }
+  } catch (err) {
+    console.warn('Silent token auto-refresh failed:', err);
+  }
+  return null;
+}
+
 async function request<T>(
   endpoint: string,
   options: RequestInit = {}
@@ -178,15 +246,48 @@ async function request<T>(
       ? (detail as Record<string, unknown>)
       : null;
 
-    // Handle 401 Unauthorized - only clear token if it's actually invalid
-    // Don't clear on "Authentication required" which might be a timing issue
+    // Handle 401 Unauthorized
     if (response.status === 401) {
+      // If the token is expired and we are not already refreshing/logging in, attempt silent refresh & retry
+      if (
+        endpoint !== '/auth/refresh' &&
+        endpoint !== '/auth/login' &&
+        message.includes('Token has expired')
+      ) {
+        if (!activeRefreshPromise) {
+          activeRefreshPromise = doRefreshToken().finally(() => {
+            activeRefreshPromise = null;
+          });
+        }
+        const newToken = await activeRefreshPromise;
+        if (newToken) {
+          const retryHeaders = {
+            ...headers,
+            Authorization: `Bearer ${newToken}`,
+          };
+          const retryResponse = await fetch(`${API_BASE}${endpoint}`, {
+            ...options,
+            cache: 'no-store',
+            credentials: 'include',
+            headers: retryHeaders,
+          });
+          if (retryResponse.ok) {
+            const contentLength = retryResponse.headers.get('content-length');
+            if (retryResponse.status === 204 || contentLength === '0') {
+              return undefined as T;
+            }
+            return await retryResponse.json();
+          }
+        }
+      }
+
       const invalidTokenMessages = [
         'Could not validate credentials',
         'Token has expired',
         'User not found or inactive',
         'Invalid API key',
         'API key has expired',
+        'Token expired beyond auto-renewal window',
       ];
       if (invalidTokenMessages.some(m => message.includes(m))) {
         setAuthToken(null);
@@ -4401,12 +4502,27 @@ export const api = {
     request<{ message: string }>('/auth/logout', {
       method: 'POST',
     }),
-  refreshToken: async (): Promise<LoginResponse> => {
+  refreshToken: async (explicitToken?: string): Promise<LoginResponse> => {
+    const tokenToUse =
+      explicitToken ??
+      authToken ??
+      (typeof window !== 'undefined'
+        ? (sessionStorage.getItem('auth_token') ?? localStorage.getItem('auth_token') ?? getNativeAuthToken())
+        : null);
+
+    const headers: Record<string, string> = {};
+    if (tokenToUse) {
+      headers['Authorization'] = `Bearer ${tokenToUse}`;
+    }
+
     const res = await request<LoginResponse>('/auth/refresh', {
       method: 'POST',
+      headers,
     });
     if (res.access_token) {
-      const isPersistent = !!localStorage.getItem('auth_token');
+      const isPersistent =
+        typeof window !== 'undefined' &&
+        (!!localStorage.getItem('auth_token') || !!getNativeAuthToken());
       setAuthToken(res.access_token, isPersistent ? 'persistent' : 'session');
     }
     return res;

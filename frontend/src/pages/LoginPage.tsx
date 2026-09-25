@@ -10,6 +10,7 @@ import { api, type LoginResponse, type OIDCProvider, type TokenPersistence } fro
 import { Card, CardHeader, CardContent } from '../components/Card';
 import { Button } from '../components/Button';
 import { PrintHiveLogo } from '../components/PrintHiveLogo';
+import { isAndroidWebclient } from '../utils/androidBridge';
 
 type LoginStep = 'credentials' | '2fa' | 'reset-password';
 
@@ -147,7 +148,7 @@ export function LoginPage() {
   const [emailOTPSent, setEmailOTPSent] = useState(false);
   const twoFAInputRef = useRef<HTMLInputElement>(null);
 
-  const [rememberMe, setRememberMe] = useState(true);
+  const [rememberMe, setRememberMe] = useState(() => isAndroidWebclient());
 
   // H-6: Password reset step state
   const [resetToken, setResetToken] = useState('');

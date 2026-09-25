@@ -245,6 +245,58 @@ describe('API Client Auth Header', () => {
     expect(listener).not.toHaveBeenCalled();
     window.removeEventListener('auth:expired', listener);
   });
+
+  it('transparently refreshes token on 401 "Token has expired" and retries request', async () => {
+    let spoolmanAttempts = 0;
+    let refreshAttempts = 0;
+
+    server.use(
+      http.post('/api/v1/auth/refresh', () => {
+        refreshAttempts++;
+        return HttpResponse.json({
+          access_token: 'fresh-renewed-token',
+          token_type: 'bearer',
+          user: { id: 1, username: 'admin' },
+        });
+      }),
+      http.get('/api/v1/settings/spoolman', ({ request }) => {
+        spoolmanAttempts++;
+        const auth = request.headers.get('Authorization');
+        if (auth === 'Bearer expired-token') {
+          return HttpResponse.json({ detail: 'Token has expired' }, { status: 401 });
+        }
+        return HttpResponse.json({
+          spoolman_enabled: 'true',
+          spoolman_url: 'http://spoolman.local',
+          spoolman_sync_mode: 'auto',
+        });
+      })
+    );
+
+    setAuthToken('expired-token', 'persistent');
+    const result = await api.getSpoolmanSettings();
+
+    expect(result.spoolman_enabled).toBe('true');
+    expect(spoolmanAttempts).toBe(2);
+    expect(refreshAttempts).toBe(1);
+    expect(getAuthToken()).toBe('fresh-renewed-token');
+  });
+
+  it('synchronizes setAuthToken with window.PrintHiveNative', () => {
+    const mockSetAuthToken = vi.fn();
+    (window as any).PrintHiveNative = {
+      setAuthToken: mockSetAuthToken,
+      getAuthToken: () => '',
+    };
+
+    setAuthToken('native-test-token');
+    expect(mockSetAuthToken).toHaveBeenCalledWith('native-test-token');
+
+    setAuthToken(null);
+    expect(mockSetAuthToken).toHaveBeenCalledWith(null);
+
+    delete (window as any).PrintHiveNative;
+  });
 });
 
 describe('Slicer download URLs', () => {
