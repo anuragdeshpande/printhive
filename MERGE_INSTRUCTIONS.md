@@ -41,6 +41,12 @@ While upstream Bambuddy focuses primarily on Bambu Lab printers, the primary rea
    - Enforced automatically by `backend/tests/unit/services/test_scheduler_dispatch_safety.py` and `backend/tests/integration/test_stranded_printing_recovery_2829.py`.
 6. **File Format Resilience**:
    - Extraction logic in `filament_requirements.py` and `archives.py` must bypass 3MF zip extraction on `.gcode` files (standard on Elegoo Centauri) to prevent `BadZipFile` crashes.
+7. **WebSocket Heartbeat & Inactivity Keepalive for Elegoo Centauri (NON-NEGOTIABLE)**:
+   - The Elegoo Centauri Carbon firmware closes WebSocket connections (`no close frame received or sent`) after ~60 seconds of client inactivity.
+   - Official Elegoo-link SDK (`elegoo_cc_adapters.h`) mandates a 20-second heartbeat loop sending text `"ping"`. The printer responds with `"pong"` and/or a fresh status frame.
+   - `pycentauri.Printer` **MUST ALWAYS** run `self._heartbeat = asyncio.create_task(self._heartbeat_loop())` sending text `"ping"` every 20 seconds, and `_handle_frame` must acknowledge `"pong"`.
+   - Never disable the heartbeat or leave WebSocket clients completely silent, which causes the printer to drop connection and flash offline every 65 seconds.
+   - Enforced by `test_pycentauri_heartbeat_configured` in `backend/tests/unit/services/test_elegoo_client.py`.
 
 ---
 

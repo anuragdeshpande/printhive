@@ -82,6 +82,7 @@ class Printer:
 
         self._ws: ClientConnection | None = None
         self._reader: asyncio.Task[None] | None = None
+        self._heartbeat: asyncio.Task[None] | None = None
         self._mainboard_id: str | None = mainboard_id or None
 
         self._mainboard_event = asyncio.Event()
@@ -136,6 +137,7 @@ class Printer:
             timeout=connect_timeout,
         )
         self._reader = asyncio.create_task(self._read_loop(), name=f"pycentauri-reader-{host}")
+        self._heartbeat = asyncio.create_task(self._heartbeat_loop(), name=f"pycentauri-heartbeat-{host}")
         if not self._mainboard_id:
             try:
                 await self._request(sdcp.Cmd.GET_PRINTER_STATUS, None, None, timeout=min(connect_timeout, 3.0))
@@ -696,6 +698,10 @@ class Printer:
             self._reader.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._reader
+        if self._heartbeat is not None and not self._heartbeat.done():
+            self._heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._heartbeat
         if self._ws is not None:
             with contextlib.suppress(Exception):
                 await self._ws.close()
@@ -743,6 +749,25 @@ class Printer:
         finally:
             self._pending.pop(request_id, None)
 
+    async def _heartbeat_loop(self) -> None:
+        """Send periodic text 'ping' heartbeat to keep the WebSocket connection alive.
+
+        The Elegoo Centauri Carbon firmware closes WebSocket connections after ~60 seconds
+        of client inactivity. The official Elegoo SDK (elegoo_cc_adapters.h) sends text "ping"
+        every 20 seconds. The printer acknowledges with "pong" and/or an updated status frame.
+        """
+        while not self._closed:
+            try:
+                await asyncio.sleep(20.0)
+                if self._ws is not None and not self._closed:
+                    await self._ws.send("ping")
+                    log.debug("sent heartbeat ping to %s", self.host)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.debug("heartbeat ping failed on %s: %s", self.host, e)
+                break
+
     async def _read_loop(self) -> None:
         assert self._ws is not None
         try:
@@ -762,6 +787,12 @@ class Printer:
                     fut.set_exception(PrinterError("connection closed"))
 
     def _handle_frame(self, raw: str | bytes) -> None:
+        if isinstance(raw, (str, bytes)):
+            text = raw.decode("utf-8", "ignore") if isinstance(raw, bytes) else raw
+            if text.strip().lower() == "pong":
+                log.debug("received heartbeat pong from %s", self.host)
+                return
+
         msg = sdcp.parse_message(raw)
 
         if msg.mainboard_id and self._mainboard_id is None:

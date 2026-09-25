@@ -225,7 +225,7 @@ class ElegooCentauriClient:
                 break
             except Exception as e:
                 logger.warning(
-                    "Connection lost or failed to connect to Elegoo printer at %s: %s. Retrying in 5s...",
+                    "Connection lost or failed to connect to Elegoo printer at %s: %s. Reconnecting in 2s...",
                     self.ip_address,
                     e,
                 )
@@ -240,7 +240,7 @@ class ElegooCentauriClient:
                         pass
                     self._printer = None
 
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(2.0)
                 continue
 
             if self._printer:
@@ -254,7 +254,7 @@ class ElegooCentauriClient:
                 self.state.connected = False
                 if self.on_state_change:
                     self.on_state_change(self.state)
-            await asyncio.sleep(5.0)
+            await asyncio.sleep(2.0)
 
 
 

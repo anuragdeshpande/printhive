@@ -261,3 +261,13 @@ class TestElegooCentauriClient:
         )
         assert success is True
         mock_printer.start_print.assert_called_once()
+
+    def test_pycentauri_heartbeat_configured(self):
+        """Regression test: pycentauri Printer must have _heartbeat_loop defined to prevent 60s firmware drop."""
+        from pycentauri.client import Printer
+        assert hasattr(Printer, "_heartbeat_loop"), "pycentauri.Printer must have _heartbeat_loop method"
+
+        p = Printer("127.0.0.1")
+        # Ensure pong handling does not crash or raise JSONDecodeError
+        p._handle_frame("pong")
+        p._handle_frame(b"PONG")

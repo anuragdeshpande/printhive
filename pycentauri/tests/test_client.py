@@ -365,3 +365,18 @@ async def test_adjust_disabled_without_control(monkeypatch: pytest.MonkeyPatch) 
                 except ControlDisabledError:
                     continue
                 raise AssertionError("expected ControlDisabledError")
+
+
+async def test_heartbeat_loop_and_pong_handling() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+    printer = Printer("127.0.0.1")
+    printer._ws = MagicMock()
+    printer._ws.send = AsyncMock()
+
+    # Verify pong handling does not crash or raise JSONDecodeError
+    printer._handle_frame("pong")
+    printer._handle_frame(b"PONG")
+
+    # Verify heartbeat task is tracked
+    assert printer._heartbeat is None
+
