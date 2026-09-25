@@ -698,7 +698,7 @@ async def refresh_token(
         )
 
     jti = payload.get("jti")
-    if jti and await is_jti_revoked(db, jti):
+    if jti and await is_jti_revoked(jti, db):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has been revoked",
