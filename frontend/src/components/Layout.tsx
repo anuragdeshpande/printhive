@@ -108,15 +108,35 @@ export function Layout() {
   const [sheetDragY, setSheetDragY] = useState(0);
   const [isSheetDragging, setIsSheetDragging] = useState(false);
   const dragStartYRef = useRef(0);
+  const dragStartXRef = useRef(0);
+  const sheetScrollRef = useRef<HTMLDivElement>(null);
 
   const handleTouchStart = (e: React.TouchEvent) => {
     dragStartYRef.current = e.touches[0].clientY;
-    setIsSheetDragging(true);
+    dragStartXRef.current = e.touches[0].clientX;
+    const target = e.target as HTMLElement;
+    const isHeader = Boolean(target.closest('.cursor-grab') || target.closest('.border-b') || target.closest('[class*="w-12"]'));
+    if (isHeader) {
+      setIsSheetDragging(true);
+    }
   };
 
   const handleTouchMove = (e: React.TouchEvent) => {
-    if (!isSheetDragging) return;
-    const deltaY = e.touches[0].clientY - dragStartYRef.current;
+    const y = e.touches[0].clientY;
+    const x = e.touches[0].clientX;
+    const deltaY = y - dragStartYRef.current;
+    const deltaX = Math.abs(x - dragStartXRef.current);
+
+    if (!isSheetDragging) {
+      const isAtTop = sheetScrollRef.current ? sheetScrollRef.current.scrollTop <= 0 : true;
+      if (deltaY > 8 && deltaY > deltaX && isAtTop) {
+        setIsSheetDragging(true);
+        dragStartYRef.current = y;
+      } else {
+        return;
+      }
+    }
+
     if (deltaY > 0) {
       setSheetDragY(deltaY);
     } else {
@@ -569,13 +589,13 @@ export function Layout() {
             paddingBottom: 'max(1.25rem, var(--safe-area-bottom, env(safe-area-inset-bottom, 0px)))',
             transform: sheetDragY > 0 ? `translateY(${sheetDragY}px)` : undefined,
           }}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
         >
           {/* Header & Drag Handle */}
           <div 
             className="flex flex-col items-center pt-3 pb-3 px-5 border-b border-bambu-dark-tertiary flex-shrink-0 cursor-grab active:cursor-grabbing touch-none select-none"
-            onTouchStart={handleTouchStart}
-            onTouchMove={handleTouchMove}
-            onTouchEnd={handleTouchEnd}
           >
             <div
               className="w-12 h-1.5 bg-bambu-gray/40 rounded-full mb-3 cursor-pointer hover:bg-bambu-gray/60 transition-colors"
@@ -594,7 +614,7 @@ export function Layout() {
           </div>
 
           {/* Scrollable Navigation List */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          <div ref={sheetScrollRef} className="flex-1 overflow-y-auto p-4 space-y-4">
             <ul className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {orderedSidebarIds.map((id) => {
                 const isExternal = isExternalSidebarItemId(id);
