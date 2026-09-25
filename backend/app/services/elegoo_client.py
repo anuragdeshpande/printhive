@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -119,11 +120,20 @@ class ElegooCentauriClient:
         self._last_layer_num = 0
         self._last_bed_temp = 0.0
         self._drying_targets = {}
-
+        self._last_message_time: float | None = time.time()
+        self.last_connect_error: str | None = None
 
     @property
     def connected(self) -> bool:
         return self.state.connected
+
+    def force_reconnect_stale_session(self, reason: str = ""):
+        """Force reconnection when connection watchdog detects a stalled session."""
+        logger.info("Forcing reconnect of Elegoo client (%s)", reason)
+        if self._connect_task and not self._connect_task.done():
+            self._connect_task.cancel()
+        if self._loop and self._loop.is_running():
+            self._connect_task = self._loop.create_task(self._async_connect())
 
     @property
     def logging_enabled(self) -> bool:
@@ -249,6 +259,7 @@ class ElegooCentauriClient:
 
 
     def _update_state(self, status: Status):
+        self._last_message_time = time.time()
         self.state.connected = True
         self.state.temperatures = {
             "nozzle": status.temp_nozzle or 0.0,

@@ -8784,7 +8784,7 @@ async def _recover_dead_printer_sessions() -> int:
             # clock is_stale() reads. 0 means this client has never had one:
             # that is the initial-connect path, where paho retrying is the
             # correct and only behaviour, so leave it be.
-            last_msg = client._last_message_time
+            last_msg = getattr(client, "_last_message_time", None)
             if not last_msg:
                 continue
             offline_for = time.time() - last_msg
@@ -8795,14 +8795,19 @@ async def _recover_dead_printer_sessions() -> int:
             if last_attempt is not None and now - last_attempt < CONNECTION_WATCHDOG_RETRY_INTERVAL:
                 continue
 
-            if not await check_port(client.ip_address, PORT_MQTT):
+            from backend.app.services.elegoo_client import is_elegoo_model
+            printer_model = getattr(client, "model", None)
+            check_target_port = 3030 if is_elegoo_model(printer_model) else PORT_MQTT
+
+            if not await check_port(client.ip_address, check_target_port):
                 # Switched off, unplugged, or off the network. Paho's retry is
                 # the right handler; say so at debug level and move on.
                 logger.debug(
-                    "[#2732] Printer %s offline for %.0fs and its MQTT port is not answering "
-                    "— leaving the reconnect to paho",
+                    "[#2732] Printer %s offline for %.0fs and port %d is not answering "
+                    "— leaving the reconnect to client loop",
                     printer_id,
                     offline_for,
+                    check_target_port,
                 )
                 _connection_watchdog_last_attempt[printer_id] = now
                 continue
@@ -8810,18 +8815,19 @@ async def _recover_dead_printer_sessions() -> int:
             _connection_watchdog_last_attempt[printer_id] = now
             recovered += 1
             logger.warning(
-                "[#2732] Printer %s has been offline for %.0fs but answers on MQTT port %d — "
+                "[#2732] Printer %s has been offline for %.0fs but answers on port %d — "
                 "rebuilding the client with a fresh session (last connect error: %s)",
                 printer_id,
                 offline_for,
-                PORT_MQTT,
-                client.last_connect_error or "none recorded",
+                check_target_port,
+                getattr(client, "last_connect_error", None) or "none recorded",
             )
             # Async context, so this takes the hard-reset path: fresh client_id,
             # paho's QoS 1 queue dropped. That matters — a project_file left
             # unacked on the dead session would otherwise replay into the new
             # one and trip 0500_4003 on the printer (#1136).
-            client.force_reconnect_stale_session(f"offline for {offline_for:.0f}s, port still answering")
+            if hasattr(client, "force_reconnect_stale_session"):
+                client.force_reconnect_stale_session(f"offline for {offline_for:.0f}s, port still answering")
         except Exception as e:
             logger.warning("[#2732] Connection watchdog failed for printer %s: %s", printer_id, e)
 

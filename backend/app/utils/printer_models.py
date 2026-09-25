@@ -26,12 +26,22 @@ PRINTER_MODEL_MAP = {
     "Bambu Lab A2L": "A2L",
     "Flashforge Creator 5": "Creator 5",
     "Flashforge Creator 5 Pro": "Creator 5",
+    "Elegoo Centauri Carbon": "CC1",
+    "Elegoo Centauri Carbon 2": "CC2",
+    "Elegoo CC1": "CC1",
+    "Elegoo CC2": "CC2",
+    "Centauri Carbon": "CC1",
+    "Centauri Carbon 2": "CC2",
 }
 
 # Map from printer_model_id (internal codes in slice_info.config) to short names
 # These are the codes Bambu Studio uses internally
 PRINTER_MODEL_ID_MAP = {
     "FF-C5": "Creator 5",
+    "EG-CC1": "CC1",
+    "EG-CC2": "CC2",
+    "CC1": "CC1",
+    "CC2": "CC2",
 
     # X1 series
     "C11": "X1C",

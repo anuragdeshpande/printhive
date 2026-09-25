@@ -7689,6 +7689,10 @@ export function AddPrinterModal({
 
   const handleAddSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isElegooModel(form.model)) {
+      onAdd(form);
+      return;
+    }
     setCheckingSave(true);
     try {
       const result = await api.diagnoseConnection({
@@ -7998,14 +8002,16 @@ export function AddPrinterModal({
               />
             </div>
             <div>
-              <label className="block text-sm text-bambu-gray mb-1">{t('printers.accessCode')}</label>
+              <label className="block text-sm text-bambu-gray mb-1">
+                {t('printers.accessCode')} {isElegooModel(form.model) && `(${t('common.optional', 'Optional')})`}
+              </label>
               <input
                 type="password"
-                required
+                required={!isElegooModel(form.model)}
                 className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                 value={form.access_code}
                 onChange={(e) => setForm({ ...form, access_code: e.target.value })}
-                placeholder={t('printers.modal.fromPrinterSettings')}
+                placeholder={isElegooModel(form.model) ? t('common.optional', 'Optional for Elegoo') : t('printers.modal.fromPrinterSettings')}
               />
             </div>
             <div>
@@ -8016,31 +8022,38 @@ export function AddPrinterModal({
                 onChange={(e) => setForm({ ...form, model: e.target.value })}
               >
                 <option value="">{t('printers.modal.selectModel')}</option>
-                <optgroup label="A1 Series">
+                <optgroup label="Bambu Lab — A1 Series">
                   <option value="A1">A1</option>
                   <option value="A1 Mini">A1 Mini</option>
                 </optgroup>
-                <optgroup label="A2 Series">
+                <optgroup label="Bambu Lab — A2 Series">
                   <option value="A2L">A2L</option>
                 </optgroup>
-                <optgroup label="H2 Series">
+                <optgroup label="Bambu Lab — H2 Series">
                   <option value="H2C">H2C</option>
                   <option value="H2D">H2D</option>
                   <option value="H2D Pro">H2D Pro</option>
                   <option value="H2S">H2S</option>
                 </optgroup>
-                <optgroup label="P Series">
+                <optgroup label="Bambu Lab — P Series">
                   <option value="P1P">P1P</option>
                   <option value="P1S">P1S</option>
                   <option value="P2S">P2S</option>
                 </optgroup>
-                <optgroup label="X1 Series">
+                <optgroup label="Bambu Lab — X1 Series">
                   <option value="X1">X1</option>
                   <option value="X1C">X1 Carbon</option>
                   <option value="X1E">X1E</option>
                 </optgroup>
-                <optgroup label="X2 Series">
+                <optgroup label="Bambu Lab — X2 Series">
                   <option value="X2D">X2D</option>
+                </optgroup>
+                <optgroup label="Elegoo — Centauri Series">
+                  <option value="CC1">Centauri Carbon (CC1)</option>
+                  <option value="CC2">Centauri Carbon 2 (CC2)</option>
+                </optgroup>
+                <optgroup label="Flashforge Series">
+                  <option value="Creator 5">Creator 5</option>
                 </optgroup>
               </select>
             </div>
@@ -8424,6 +8437,12 @@ function EditPrinterModal({
     location: printer.location || '',
     auto_archive: printer.auto_archive,
     is_active: printer.is_active,
+    external_camera_enabled: printer.external_camera_enabled ?? false,
+    external_camera_type: printer.external_camera_type || 'mjpeg',
+    external_camera_url: printer.external_camera_url || '',
+    external_camera_snapshot_url: printer.external_camera_snapshot_url || '',
+    camera_rotation: printer.camera_rotation ?? 0,
+    plate_detection_enabled: printer.plate_detection_enabled ?? false,
   });
 
   // Setup-time pre-flight — same warn-on-save as the Add-Printer dialog, so an
@@ -8458,6 +8477,12 @@ function EditPrinterModal({
       location: form.location || undefined,
       auto_archive: form.auto_archive,
       is_active: form.is_active,
+      external_camera_enabled: form.external_camera_enabled,
+      external_camera_type: form.external_camera_type || null,
+      external_camera_url: form.external_camera_url || null,
+      external_camera_snapshot_url: form.external_camera_snapshot_url || null,
+      camera_rotation: form.camera_rotation,
+      plate_detection_enabled: form.plate_detection_enabled,
     };
     // Only include access_code if it was changed
     if (form.access_code) {
@@ -8468,6 +8493,10 @@ function EditPrinterModal({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isElegooModel(form.model || printer.model)) {
+      doSave();
+      return;
+    }
     setCheckingSave(true);
     try {
       const result = await api.diagnoseConnection({
@@ -8536,7 +8565,7 @@ function EditPrinterModal({
                 className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                 value={form.access_code}
                 onChange={(e) => setForm({ ...form, access_code: e.target.value })}
-                placeholder={t('printers.accessCodePlaceholder')}
+                placeholder={isElegooModel(form.model || printer.model) ? t('common.optional', 'Optional for Elegoo') : t('printers.accessCodePlaceholder')}
               />
             </div>
             <div>
@@ -8547,31 +8576,38 @@ function EditPrinterModal({
                 onChange={(e) => setForm({ ...form, model: e.target.value })}
               >
                 <option value="">{t('printers.modal.selectModel')}</option>
-                <optgroup label="A1 Series">
+                <optgroup label="Bambu Lab — A1 Series">
                   <option value="A1">A1</option>
                   <option value="A1 Mini">A1 Mini</option>
                 </optgroup>
-                <optgroup label="A2 Series">
+                <optgroup label="Bambu Lab — A2 Series">
                   <option value="A2L">A2L</option>
                 </optgroup>
-                <optgroup label="H2 Series">
+                <optgroup label="Bambu Lab — H2 Series">
                   <option value="H2C">H2C</option>
                   <option value="H2D">H2D</option>
                   <option value="H2D Pro">H2D Pro</option>
                   <option value="H2S">H2S</option>
                 </optgroup>
-                <optgroup label="P Series">
+                <optgroup label="Bambu Lab — P Series">
                   <option value="P1P">P1P</option>
                   <option value="P1S">P1S</option>
                   <option value="P2S">P2S</option>
                 </optgroup>
-                <optgroup label="X1 Series">
+                <optgroup label="Bambu Lab — X1 Series">
                   <option value="X1">X1</option>
                   <option value="X1C">X1 Carbon</option>
                   <option value="X1E">X1E</option>
                 </optgroup>
-                <optgroup label="X2 Series">
+                <optgroup label="Bambu Lab — X2 Series">
                   <option value="X2D">X2D</option>
+                </optgroup>
+                <optgroup label="Elegoo — Centauri Series">
+                  <option value="CC1">Centauri Carbon (CC1)</option>
+                  <option value="CC2">Centauri Carbon 2 (CC2)</option>
+                </optgroup>
+                <optgroup label="Flashforge Series">
+                  <option value="Creator 5">Creator 5</option>
                 </optgroup>
               </select>
             </div>
@@ -8618,6 +8654,107 @@ function EditPrinterModal({
               <p className="text-xs text-bambu-gray/70 mt-1 ml-6">
                 {t('printers.maintenance.editFieldHelp')}
               </p>
+            </div>
+
+            {/* Camera & Hardware Settings */}
+            <div className="pt-3 border-t border-bambu-dark-tertiary space-y-3">
+              <h3 className="text-sm font-semibold text-white flex items-center gap-1.5">
+                <Video className="w-4 h-4 text-bambu-green" />
+                {t('settings.camera', 'Camera Settings')}
+              </h3>
+              
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  id="edit_external_camera_enabled"
+                  checked={form.external_camera_enabled}
+                  onChange={(e) => setForm({ ...form, external_camera_enabled: e.target.checked })}
+                  className="rounded border-bambu-dark-tertiary bg-bambu-dark text-bambu-green focus:ring-bambu-green"
+                />
+                <label htmlFor="edit_external_camera_enabled" className="text-sm text-bambu-gray">
+                  {t('settings.enableExternalCamera', 'Enable External / Custom Camera')}
+                </label>
+              </div>
+
+              {form.external_camera_enabled && (
+                <div className="space-y-3 pl-3 border-l-2 border-bambu-dark-tertiary">
+                  <div>
+                    <label className="block text-xs text-bambu-gray mb-1">
+                      {t('settings.cameraType', 'Camera Protocol')}
+                    </label>
+                    <select
+                      className="w-full px-3 py-1.5 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:border-bambu-green focus:outline-none"
+                      value={form.external_camera_type}
+                      onChange={(e) => setForm({ ...form, external_camera_type: e.target.value })}
+                    >
+                      <option value="mjpeg">MJPEG Stream (HTTP)</option>
+                      <option value="rtsp">RTSP Stream</option>
+                      <option value="snapshot">Snapshot Polling</option>
+                      <option value="usb">USB Camera / Device</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs text-bambu-gray mb-1">
+                      {t('settings.streamUrl', 'Stream URL / Device Path')}
+                    </label>
+                    <input
+                      type="text"
+                      className="w-full px-3 py-1.5 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:border-bambu-green focus:outline-none"
+                      value={form.external_camera_url}
+                      onChange={(e) => setForm({ ...form, external_camera_url: e.target.value })}
+                      placeholder={form.external_camera_type === 'rtsp' ? 'rtsp://192.168.1.x:554/stream' : 'http://192.168.1.x:8080/?action=stream'}
+                    />
+                  </div>
+
+                  {(form.external_camera_type === 'mjpeg' || form.external_camera_type === 'rtsp' || form.external_camera_type === 'usb') && (
+                    <div>
+                      <label className="block text-xs text-bambu-gray mb-1">
+                        {t('settings.snapshotUrl', 'Snapshot URL (Optional)')}
+                      </label>
+                      <input
+                        type="text"
+                        className="w-full px-3 py-1.5 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:border-bambu-green focus:outline-none"
+                        value={form.external_camera_snapshot_url}
+                        onChange={(e) => setForm({ ...form, external_camera_snapshot_url: e.target.value })}
+                        placeholder="http://192.168.1.x:8080/?action=snapshot"
+                      />
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block text-xs text-bambu-gray mb-1">
+                      {t('settings.rotation', 'Camera Rotation')}
+                    </label>
+                    <select
+                      className="w-full px-3 py-1.5 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:border-bambu-green focus:outline-none"
+                      value={form.camera_rotation}
+                      onChange={(e) => setForm({ ...form, camera_rotation: parseInt(e.target.value, 10) })}
+                    >
+                      <option value={0}>0°</option>
+                      <option value={90}>90°</option>
+                      <option value={180}>180°</option>
+                      <option value={270}>270°</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Print Gating / Hardware Settings */}
+            <div className="pt-3 border-t border-bambu-dark-tertiary space-y-2">
+              <div className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  id="edit_plate_detection"
+                  checked={form.plate_detection_enabled}
+                  onChange={(e) => setForm({ ...form, plate_detection_enabled: e.target.checked })}
+                  className="rounded border-bambu-dark-tertiary bg-bambu-dark text-bambu-green focus:ring-bambu-green"
+                />
+                <label htmlFor="edit_plate_detection" className="text-sm text-bambu-gray">
+                  {t('printers.plateDetection.requireVerification', 'Require plate cleared verification before dispatching prints')}
+                </label>
+              </div>
             </div>
             {saveWarning ? (
               <div className="rounded-lg bg-amber-50 dark:bg-amber-500/10 border border-amber-300 dark:border-amber-500/30 p-3 space-y-3">

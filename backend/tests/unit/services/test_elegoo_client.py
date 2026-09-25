@@ -155,11 +155,11 @@ class TestElegooCentauriClient:
         client.state.subtask_name = "finished_job.gcode"
         client.state.gcode_file = "finished_job.gcode"
 
-        raw = {"PrintInfo": {"Status": 9, "Filename": "", "Progress": 100}}  # Status 9 = FINISH
+        raw = {"PrintInfo": {"Status": 0, "Filename": "", "Progress": 0}}  # Status 0 = IDLE
         status = Status.from_payload(raw)
         client._update_state(status)
 
-        assert client.state.state == "FINISH"
+        assert client.state.state == "IDLE"
         assert client.state.current_print == ""
         assert client.state.subtask_name == ""
         assert client.state.gcode_file == ""
