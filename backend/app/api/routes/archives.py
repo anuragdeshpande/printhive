@@ -4008,6 +4008,30 @@ async def get_archive_plates(
     file_path = settings.base_dir / archive.file_path
     if not file_path.is_file():
         raise HTTPException(404, "Archive file not found")
+    if file_path.suffix.lower() == ".gcode":
+        return {
+            "archive_id": archive_id,
+            "filename": archive.filename,
+            "plates": [
+                {
+                    "index": 1,
+                    "name": archive.filename,
+                    "objects": [],
+                    "object_count": 0,
+                    "has_thumbnail": bool(archive.thumbnail_path),
+                    "thumbnail_url": f"/api/v1/archives/{archive_id}/thumbnail" if archive.thumbnail_path else None,
+                    "print_time_seconds": archive.print_time_seconds,
+                    "filament_used_grams": archive.filament_used_grams,
+                    "filaments": [],
+                    "bed_type": None,
+                }
+            ],
+            "is_multi_plate": False,
+            "has_gcode": True,
+            "embedded_printer": None,
+            "embedded_process": None,
+            "design_overrides": [],
+        }
 
     plates = []
     # Initialize so the `has_gcode = bool(gcode_files)` after the try/except

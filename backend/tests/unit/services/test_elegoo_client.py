@@ -245,3 +245,19 @@ class TestElegooCentauriClient:
 
         client.resume_telemetry()
         mock_printer.resume_watch.assert_called_once()
+
+    def test_start_print_with_extra_kwargs(self, client):
+        mock_printer = MagicMock()
+        mock_printer.start_print = AsyncMock()
+        client._printer = mock_printer
+        client._loop = MagicMock()
+
+        # Should accept upstream parameters like nozzle_slot_extruders and nozzle_mapping without raising TypeError
+        success = client.start_print(
+            "test.gcode",
+            nozzle_slot_extruders=[0, 1],
+            nozzle_mapping="{}",
+            extra_param="value",
+        )
+        assert success is True
+        mock_printer.start_print.assert_called_once()

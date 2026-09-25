@@ -43,7 +43,7 @@ def extract_filament_requirements(file_path: Path, plate_id: int | None = None) 
         requirements" rather than an error so a malformed 3MF doesn't break
         the upload path.
     """
-    if not file_path.exists():
+    if not file_path.exists() or file_path.suffix.lower() == ".gcode":
         return []
 
     filaments: list[dict] = []

@@ -490,6 +490,7 @@ class ElegooCentauriClient:
         nozzle_offset_cali: bool | str = False,
         nozzle_mapping: str | None = None,
         bed_type: str | int | None = None,
+        **kwargs,
     ) -> bool:
         if not self._printer:
             logger.error("ElegooCentauriClient: cannot start_print on %s — printer client not connected", self.ip_address)
@@ -520,44 +521,44 @@ class ElegooCentauriClient:
         )
 
 
-    def stop_print(self) -> bool:
+    def stop_print(self, *args, **kwargs) -> bool:
         if not self._printer:
             return False
         return self._run_async(self._printer.stop(), action_name="stop_print")
 
-    def pause_print(self) -> bool:
+    def pause_print(self, *args, **kwargs) -> bool:
         if not self._printer:
             return False
         return self._run_async(self._printer.pause(), action_name="pause_print")
 
-    def resume_print(self) -> bool:
+    def resume_print(self, *args, **kwargs) -> bool:
         if not self._printer:
             return False
         return self._run_async(self._printer.resume())
 
-    def set_print_speed(self, mode: int) -> bool:
+    def set_print_speed(self, mode: int, *args, **kwargs) -> bool:
         if not self._printer:
             return False
         level_map = {1: "silent", 2: "balanced", 3: "sport", 4: "ludicrous"}
         speed_mode = level_map.get(mode, "balanced")
         return self._run_async(self._printer.set_print_speed(speed_mode))
 
-    def set_nozzle_temperature(self, target: float, nozzle: int = 0) -> bool:
+    def set_nozzle_temperature(self, target: float, nozzle: int = 0, *args, **kwargs) -> bool:
         if not self._printer:
             return False
         return self._run_async(self._printer.set_temperatures(nozzle=target))
 
-    def set_bed_temperature(self, target: float) -> bool:
+    def set_bed_temperature(self, target: float, *args, **kwargs) -> bool:
         if not self._printer:
             return False
         return self._run_async(self._printer.set_temperatures(bed=target))
 
-    def set_chamber_temperature(self, target: float) -> bool:
+    def set_chamber_temperature(self, target: float, *args, **kwargs) -> bool:
         if not self._printer:
             return False
         return self._run_async(self._printer.set_temperatures(chamber=target))
 
-    def set_fan_speed(self, fan_id: int, pwm_speed: int) -> bool:
+    def set_fan_speed(self, fan_id: int, pwm_speed: int, *args, **kwargs) -> bool:
         if not self._printer:
             return False
         speed_pct = round(pwm_speed * 100 / 255)

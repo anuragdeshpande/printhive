@@ -1178,6 +1178,14 @@ class PrintScheduler:
                 for item in items:
                     printer_id = item.printer_id
                     seen_printers.add(printer_id)
+
+                    # An item that was started very recently is never stranded,
+                    # even if the printer reports terminal/idle before transitioning.
+                    if item.started_at:
+                        started_utc = item.started_at if item.started_at.tzinfo is not None else item.started_at.replace(tzinfo=timezone.utc)
+                        if (datetime.now(timezone.utc) - started_utc).total_seconds() < _STRANDED_PRINTING_GRACE_SECONDS:
+                            continue
+
                     state = printer_manager.get_status(printer_id)
                     status = _terminal_queue_status(state)
                     if status is None:
@@ -7298,25 +7306,30 @@ class PrintScheduler:
         # nozzle_mapping rides through verbatim — JSON string captured from
         # Bambu Studio's project_file on VP intake (#1780); the MQTT layer
         # parses + injects it only for dual-nozzle models so a null on every
-        # other model is a transparent pass-through. The rack fallback is
-        # resolved down there too, where the live rack position is known.
-        started = printer_manager.start_print(
-            item.printer_id,
-            remote_filename,
-            plate_id=item.plate_id or 1,
-            ams_mapping=ams_mapping,
-            bed_levelling=effective_bed_levelling,
-            flow_cali=item.flow_cali,
-            vibration_cali=item.vibration_cali,
-            layer_inspect=item.layer_inspect,
-            timelapse=effective_timelapse,
-            use_ams=effective_use_ams,
-            nozzle_offset_cali=item.nozzle_offset_cali,
-            nozzle_mapping=item.nozzle_mapping
-            or (json.dumps(resolved_nozzle_mapping) if resolved_nozzle_mapping else None),
-            nozzle_slot_extruders=nozzle_slot_extruders,
-            bed_type=effective_bed_type,
-        )
+        # Reset any idle/terminal timer for this printer since a new print is being dispatched
+        self._terminal_since.pop(item.printer_id, None)
+
+        try:
+            started = printer_manager.start_print(
+                item.printer_id,
+                remote_filename,
+                plate_id=item.plate_id or 1,
+                ams_mapping=ams_mapping,
+                bed_levelling=effective_bed_levelling,
+                flow_cali=item.flow_cali,
+                vibration_cali=item.vibration_cali,
+                layer_inspect=item.layer_inspect,
+                timelapse=effective_timelapse,
+                use_ams=effective_use_ams,
+                nozzle_offset_cali=item.nozzle_offset_cali,
+                nozzle_mapping=item.nozzle_mapping
+                or (json.dumps(resolved_nozzle_mapping) if resolved_nozzle_mapping else None),
+                nozzle_slot_extruders=nozzle_slot_extruders,
+                bed_type=effective_bed_type,
+            )
+        except Exception as exc:
+            logger.exception("Queue item %s: printer_manager.start_print raised: %s", item.id, exc)
+            started = False
 
         if started:
             # The command is away, so the expectation is now legitimate and must
