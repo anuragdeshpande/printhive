@@ -1,6 +1,6 @@
-# AGENTS.md
+# PrintHive Upstream Merge Instructions & Multi-Vendor Protocol
 
-Instructions, architecture rules, and upstream merge protocols for AI coding assistants working in the PrintHive codebase.
+Guidelines, architecture rules, and upstream merge protocols for developers and AI coding assistants working in the PrintHive codebase.
 
 ---
 
@@ -35,7 +35,7 @@ While upstream Bambuddy focuses primarily on Bambu Lab printers, the primary rea
 
 ## 3. Upstream Merge Protocol (MUST FOLLOW ON EVERY MERGE)
 
-When merging upstream updates (e.g., from `https://github.com/maziggy/bambuddy.git` `main`), upstream code will often overwrite or omit fork-specific customizations during 3-way merge resolution. 
+When merging upstream updates (e.g., from `https://github.com/maziggy/bambuddy.git` `main`), upstream code will often overwrite or omit fork-specific customizations during 3-way merge resolution.
 
 ### Mandatory Pre-Merge & Post-Merge Reconnaissance Check
 Before merging, record the pre-merge commit hash (e.g. `PRE_MERGE_HASH`). After resolving conflicts, execute an automated check to verify that custom multi-vendor references have **not** been reduced:
