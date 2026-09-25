@@ -431,6 +431,7 @@ async def _upsert_settings(db: AsyncSession, values: dict[str, str | None]) -> N
 async def _build_authenticated_service(
     db: AsyncSession,
     user: User | None,
+    clear_on_auth_failure: bool = True,
 ) -> OrcaCloudService:
     """Construct an :class:`OrcaCloudService` pre-populated with stored
     credentials. If the access token is within the refresh-leeway of expiry,
@@ -440,32 +441,70 @@ async def _build_authenticated_service(
     We don't lock around the refresh: Orca tolerates concurrent refreshes for
     ~60s (each racer gets its own valid pair on the same connection rather than
     a revoke), so a lost race here is harmless — last-write-wins on the stored
-    pair, and whichever pair we keep is valid."""
+    pair, and whichever pair we keep is valid.
+
+    ``clear_on_auth_failure`` controls what happens when the refresh is
+    rejected. Routes leave it on: the caller is a person looking at the UI, and
+    wiping the dead credentials flips the page to disconnected in front of them
+    so they can pair again. Background jobs pass ``False`` — see the caveat
+    below.
+
+    Why background callers must not clear: Orca reports every rejection with
+    one composite reason (``unknown, expired, revoked, or already used``), so
+    a genuine revocation is indistinguishable from a lost refresh-rotation
+    race. Acting destructively on a signal that can't be disambiguated is the
+    #2562 mistake in a different cloud. It also gains nothing — a route call
+    hits the same failure and clears then, at a moment the user can respond to.
+    A successful refresh is still persisted either way: by that point the old
+    refresh token is consumed, so dropping the new pair would break a working
+    pairing for real.
+    """
     creds = await _load_credentials(db, user)
     if not creds.token:
         raise HTTPException(status_code=401, detail="Orca Cloud is not connected — sign in first.")
 
     svc = OrcaCloudService()
-    svc.set_tokens(creds.token, creds.refresh_token, creds.expires_at)
-    if not svc.is_authenticated:
-        if not svc.refresh_token:
-            raise HTTPException(
-                status_code=401,
-                detail="Orca Cloud session expired and no refresh token is stored — sign in again.",
-            )
+    # The service owns an httpx client from construction, and every path below
+    # this point can raise. On success the caller closes it; on failure nobody
+    # ever holds it, so it has to be closed here or the connection pool leaks
+    # one client per failed build. That went unnoticed while the only callers
+    # were routes -- a person retrying a broken sign-in a few times -- and
+    # became worth fixing once spool assignment started building one too.
+    try:
+        svc.set_tokens(creds.token, creds.refresh_token, creds.expires_at)
+        if not svc.is_authenticated:
+            if not svc.refresh_token:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Orca Cloud session expired and no refresh token is stored — sign in again.",
+                )
+            try:
+                await svc.refresh()
+            except OrcaCloudAuthError as e:
+                # Refresh token was revoked or rotated out from under us. Clear
+                # the stale credentials so the UI flips to disconnected — unless
+                # the caller is a background job, which must not change sign-in
+                # state on its own.
+                if clear_on_auth_failure:
+                    await _clear_credentials(db, user)
+                raise HTTPException(status_code=401, detail=f"Orca Cloud session refresh failed: {e}") from e
+            except OrcaCloudError as e:
+                raise HTTPException(status_code=502, detail=f"Orca Cloud unreachable: {e}") from e
+            # Persist new pair BEFORE returning. A crash between here and the
+            # downstream API call would still leave the user with valid stored
+            # tokens for the next request.
+            await _persist_rotated_tokens(db, user, svc.access_token, svc.refresh_token, svc.token_expiry)
+    except BaseException:
+        # BaseException, not Exception: a cancelled request leaks the client
+        # just as surely as a failed refresh does. The close is guarded in turn
+        # because failing to clean up must not replace the error the caller
+        # needs to see -- least of all a CancelledError, which has to keep
+        # propagating for cancellation to work at all.
         try:
-            await svc.refresh()
-        except OrcaCloudAuthError as e:
-            # Refresh token was revoked or rotated out from under us. Clear
-            # the stale credentials so the UI flips to disconnected.
-            await _clear_credentials(db, user)
-            raise HTTPException(status_code=401, detail=f"Orca Cloud session refresh failed: {e}") from e
-        except OrcaCloudError as e:
-            raise HTTPException(status_code=502, detail=f"Orca Cloud unreachable: {e}") from e
-        # Persist new pair BEFORE returning. A crash between here and the
-        # downstream API call would still leave the user with valid stored
-        # tokens for the next request.
-        await _persist_rotated_tokens(db, user, svc.access_token, svc.refresh_token, svc.token_expiry)
+            await svc.close()
+        except Exception as close_err:  # noqa: BLE001 - cleanup is best-effort
+            logger.debug("Orca Cloud client close failed while unwinding a failed build: %s", close_err)
+        raise
     return svc
 
 

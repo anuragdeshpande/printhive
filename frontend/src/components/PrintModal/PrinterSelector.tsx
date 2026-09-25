@@ -17,6 +17,7 @@ import { isGcodeCompatible } from '../../utils/printer';
 import {
   normalizeColorForCompare,
   colorsAreSimilar,
+  filamentTypesCompatible,
   autoMatchFilament,
   filterFilamentsByNozzle,
   effectivePreferLowest,
@@ -122,7 +123,7 @@ function InlineMappingEditor({
     // Determine status
     let status: 'match' | 'type_only' | 'mismatch' = 'mismatch';
     if (loaded) {
-      const typeMatch = loaded.type?.toUpperCase() === req.type?.toUpperCase();
+      const typeMatch = filamentTypesCompatible(loaded.type, req.type);
       const colorMatch =
         normalizeColorForCompare(loaded.color) === normalizeColorForCompare(req.color) ||
         colorsAreSimilar(loaded.color, req.color);
@@ -161,8 +162,11 @@ function InlineMappingEditor({
           <span title={`Required: ${req.type} - ${getColorName(req.color)}`}>
             <Circle className="w-3 h-3" fill={req.color} stroke={req.color} />
           </span>
-          <span className="text-white truncate">
-            {req.type} <span className="text-bambu-gray">({req.used_grams}g)</span>
+          {/* Only the name truncates; the gram usage is pinned (shrink-0) so
+              it never clips on narrow/mobile widths (#2669). */}
+          <span className="text-white flex items-center gap-1 min-w-0">
+            <span className="truncate min-w-0" title={req.type}>{req.type}</span>
+            <span className="text-bambu-gray shrink-0 whitespace-nowrap">({req.used_grams}g)</span>
           </span>
           <span className="text-bambu-gray">→</span>
           <select

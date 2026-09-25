@@ -1,16 +1,28 @@
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
+
+from backend.app.utils.filename import clean_display_name
+
+# Free text, punctuation and all -- only control characters are taken out, and
+# only on the way in (#2832). Anything that turns a name into a path sanitises
+# it there instead, where the budget and the fallback are known.
+DisplayName = Annotated[str | None, BeforeValidator(clean_display_name)]
 
 
 class ArchiveBase(BaseModel):
-    print_name: str | None = None
+    print_name: DisplayName = None
     is_favorite: bool | None = None
     tags: str | None = None
     notes: str | None = None
     cost: float | None = None
     failure_reason: str | None = None
-    quantity: int | None = None  # Number of items printed
+    # Number of items printed. 0 is a legal answer -- a plate that jammed and
+    # came off ruined produced nothing, and the project's completed-items count
+    # sums this column (#3051). Bounded for the same reason as the grams below:
+    # it feeds project totals, and a negative would subtract from them.
+    quantity: Annotated[int | None, Field(ge=0, le=10_000)] = None
     # User-defined link (Printables, Thingiverse, etc.)
     external_url: str | None = None
 
@@ -20,6 +32,12 @@ class ArchiveUpdate(ArchiveBase):
     project_id: int | None = None
     # Allow changing status (e.g., clearing failed flag)
     status: str | None = None
+    # Editable because a print archived without its 3MF has no figure at all,
+    # and nothing else can supply one after the fact -- rescan needs a file
+    # this archive does not have (#1820). Bounded because it feeds the filament
+    # totals: 100 kg is far past any single print and well short of a value
+    # that would swamp a chart.
+    filament_used_grams: Annotated[float | None, Field(ge=0, le=100_000)] = None
 
 
 class ArchiveDuplicate(BaseModel):
@@ -137,6 +155,8 @@ class ArchiveSlim(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     cost: float | None
+    energy_kwh: float | None = None
+    energy_cost: float | None = None
     quantity: int = 1
     created_at: datetime | None
 
@@ -157,6 +177,10 @@ class ArchiveStats(BaseModel):
     total_cost: float
     prints_by_filament_type: dict
     prints_by_printer: dict
+    # Name each printer id was last recorded under in the print log. Lets the
+    # client keep labelling history that belongs to a deleted printer (#2873);
+    # a printer that still exists is named from the live record instead.
+    printer_names: dict[str, str] = {}
     # Time accuracy stats
     # Average across all prints with data
     average_time_accuracy: float | None = None

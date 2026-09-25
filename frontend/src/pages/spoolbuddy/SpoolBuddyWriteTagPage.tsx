@@ -14,7 +14,26 @@ import {
   type SpoolCatalogEntry,
 } from '../../api/client';
 import { getCurrencySymbol } from '../../utils/currency';
-import { getSwatchStyle } from '../../utils/colors';
+import { getSwatchStyle, resolveSpoolColorName } from '../../utils/colors';
+import { useColorCatalogVersion } from '../../hooks/useColorCatalogVersion';
+
+/**
+ * The colour name to show for a spool, which is not the one it stores.
+ *
+ * A Bambu tag often carries no colour name, or an internal code, and Spoolman
+ * has no field for one at all — so `color_name` is regularly empty or the
+ * subtype standing in for it, and the catalog resolves the swatch's hex
+ * instead (#3090, #857). The edit form below deliberately does NOT go through
+ * here: what it offers for editing has to be what is stored, or the user saves
+ * a name we made up as though they had typed it.
+ */
+function displayColorName(spool: {
+  color_name: string | null;
+  rgba: string | null;
+  color_name_is_synthesized?: boolean;
+}): string | null {
+  return resolveSpoolColorName(spool.color_name, spool.rgba, spool.color_name_is_synthesized);
+}
 import { FilamentSection } from '../../components/spool-form/FilamentSection';
 import { ColorSection } from '../../components/spool-form/ColorSection';
 import { AdditionalSection } from '../../components/spool-form/AdditionalSection';
@@ -24,10 +43,13 @@ import { defaultFormData, validateForm } from '../../components/spool-form/types
 import {
   buildFilamentOptions,
   extractBrandsFromPresets,
+  fetchPrinterCalibrations,
   findPresetOption,
   loadRecentColors,
+  pairedOptions,
   parsePresetName,
   saveRecentColor,
+  withCurrentValue,
 } from '../../components/spool-form/utils';
 import { MATERIALS } from '../../components/spool-form/constants';
 
@@ -37,6 +59,9 @@ const SIMPLE_COMMON_MATERIALS = ['PLA', 'PETG', 'ABS', 'ASA', 'TPU', 'PA', 'PC',
 
 export function SpoolBuddyWriteTagPage() {
   const { t } = useTranslation();
+  // The search below resolves colour names through the catalog, so its memo
+  // has to recompute when the catalog finishes loading (#3090).
+  const colorCatalogVersion = useColorCatalogVersion();
   const { showToast } = useToast();
   const { sbState } = useOutletContext<SpoolBuddyOutletContext>();
 
@@ -92,6 +117,11 @@ export function SpoolBuddyWriteTagPage() {
 
   // Filter spools based on tab
   const filteredSpools = useMemo(() => {
+    // Named here so the memo actually depends on it: the search below resolves
+    // colour names through the catalog, which `displayColorName` reads from
+    // module state the linter cannot follow. Without this the list keeps the
+    // names it resolved before the catalog finished loading (#3090).
+    void colorCatalogVersion;
     let list: InventorySpool[];
     if (activeTab === 'existing') {
       list = spools.filter(s => !s.tag_uid && !s.archived_at);
@@ -105,6 +135,9 @@ export function SpoolBuddyWriteTagPage() {
       const q = searchQuery.toLowerCase();
       list = list.filter(s =>
         (s.material?.toLowerCase().includes(q)) ||
+        // Both: the resolved name is what the list shows, the stored one is
+        // what a user who knows Bambu's internal codes might type (#3090).
+        (displayColorName(s)?.toLowerCase().includes(q)) ||
         (s.color_name?.toLowerCase().includes(q)) ||
         (s.brand?.toLowerCase().includes(q)) ||
         (s.subtype?.toLowerCase().includes(q))
@@ -112,7 +145,7 @@ export function SpoolBuddyWriteTagPage() {
     }
 
     return list;
-  }, [spools, activeTab, searchQuery]);
+  }, [spools, activeTab, searchQuery, colorCatalogVersion]);
 
   // Listen for tag events
   const handleUnknownTag = useCallback((e: Event) => {
@@ -391,7 +424,7 @@ function SpoolListItem({ spool, selected, showTag, onClick }: {
           <span className="text-[10px] font-mono text-zinc-500 shrink-0">#{spool.id}</span>
         </div>
         <div className="flex items-center gap-2 text-xs text-zinc-400">
-          {spool.color_name && <span>{spool.color_name}</span>}
+          {displayColorName(spool) && <span>{displayColorName(spool)}</span>}
           <span>{remaining}g / {spool.label_weight}g ({pct}%)</span>
         </div>
         {showTag && spool.tag_uid && (
@@ -521,21 +554,9 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
           const connected = status?.connected ?? false;
           let calibrations: PrinterWithCalibrations['calibrations'] = [];
           if (connected) {
-            try {
-              const kRes = await api.getKProfiles(printer.id);
-              calibrations = kRes.profiles.map(p => ({
-                cali_idx: p.slot_id,
-                filament_id: p.filament_id,
-                setting_id: p.setting_id || '',
-                name: p.name,
-                k_value: parseFloat(p.k_value) || 0,
-                n_coef: parseFloat(p.n_coef) || 0,
-                extruder_id: p.extruder_id,
-                nozzle_diameter: p.nozzle_diameter,
-              }));
-            } catch {
-              // ignore per-printer unsupported profile endpoints
-            }
+            // Fetch across every installed nozzle so dual-nozzle printers
+            // surface both the 0.4mm and 0.6mm K-profiles, not just 0.4 (#2618).
+            calibrations = await fetchPrinterCalibrations(printer.id, status);
           }
           results.push({ printer: { ...printer, connected }, calibrations });
         }
@@ -624,21 +645,28 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
     return map;
   }, [brandMaterialPairs]);
 
-  const availableBrands = useMemo(() => {
-    if (!formData.material) return baseAvailableBrands;
-    const materialKey = formData.material.toLowerCase();
-    const brandKeys = materialToBrands.get(materialKey);
-    if (!brandKeys || brandKeys.size === 0) return baseAvailableBrands;
-    return baseAvailableBrands.filter(brand => brandKeys.has(brand.toLowerCase()));
-  }, [baseAvailableBrands, formData.material, materialToBrands]);
+  // #1905: offer every known brand/material and rank the catalog-paired ones
+  // first, rather than filtering the others out — same behaviour as the
+  // Inventory spool form, which this page mirrors field for field.
+  const availableBrands = useMemo(
+    () => withCurrentValue(baseAvailableBrands, formData.brand),
+    [baseAvailableBrands, formData.brand],
+  );
 
-  const availableMaterials = useMemo(() => {
-    if (!formData.brand) return baseAvailableMaterials;
-    const brandKey = formData.brand.toLowerCase();
-    const materialKeys = brandToMaterials.get(brandKey);
-    if (!materialKeys || materialKeys.size === 0) return baseAvailableMaterials;
-    return baseAvailableMaterials.filter(material => materialKeys.has(material.toLowerCase()));
-  }, [baseAvailableMaterials, formData.brand, brandToMaterials]);
+  const availableMaterials = useMemo(
+    () => withCurrentValue(baseAvailableMaterials, formData.material),
+    [baseAvailableMaterials, formData.material],
+  );
+
+  const suggestedBrands = useMemo(
+    () => pairedOptions(availableBrands, formData.material, materialToBrands),
+    [availableBrands, formData.material, materialToBrands],
+  );
+
+  const suggestedMaterials = useMemo(
+    () => pairedOptions(availableMaterials, formData.brand, brandToMaterials),
+    [availableMaterials, formData.brand, brandToMaterials],
+  );
 
   const updateField = <K extends keyof SpoolFormData>(key: K, value: SpoolFormData[K]) => {
     setFormData(prev => ({ ...prev, [key]: value }));
@@ -671,7 +699,13 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
 
       const pc = printersWithCalibrations.find(p => p.printer.id === printerId);
       if (pc) {
-        const cal = pc.calibrations.find(c => c.cali_idx === caliIdx);
+        // Match the extruder too, not cali_idx alone: the printer numbers its
+        // calibration table PER NOZZLE, so on a dual-nozzle machine the same
+        // cali_idx exists on both hotends and means different things. Resolving
+        // by index alone could persist the other hotend's K value and diameter.
+        const cal = pc.calibrations.find(
+          c => c.cali_idx === caliIdx && (c.extruder_id ?? 0) === extruder,
+        );
         if (cal) {
           profiles.push({
             printer_id: printerId,
@@ -801,7 +835,9 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
             <p className="text-white font-medium">
               {selectedSpool.brand ? `${selectedSpool.brand} ` : ''}{selectedSpool.material}
             </p>
-            {selectedSpool.color_name && <p className="text-zinc-400 text-sm">{selectedSpool.color_name}</p>}
+            {displayColorName(selectedSpool) && (
+              <p className="text-zinc-400 text-sm">{displayColorName(selectedSpool)}</p>
+            )}
             <p className="text-zinc-500 text-xs mt-1">{selectedSpool.label_weight}g</p>
             <p className="text-bambu-green text-sm mt-4">{t('spoolbuddy.writeTag.spoolCreated', 'Spool created! Ready to write.')}</p>
           </div>
@@ -924,7 +960,10 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
               filamentOptions={filamentOptions}
               availableBrands={availableBrands}
               availableMaterials={availableMaterials}
+              suggestedBrands={suggestedBrands}
+              suggestedMaterials={suggestedMaterials}
               quickAdd={quickAdd}
+              detailsRequired={!quickAdd}
               quantity={quantity}
               onQuantityChange={setQuantity}
               errors={errors}
@@ -989,7 +1028,9 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
           <p className="text-white font-medium">
             {selectedSpool.brand ? `${selectedSpool.brand} ` : ''}{selectedSpool.material}
           </p>
-          {selectedSpool.color_name && <p className="text-zinc-400 text-sm">{selectedSpool.color_name}</p>}
+          {displayColorName(selectedSpool) && (
+            <p className="text-zinc-400 text-sm">{displayColorName(selectedSpool)}</p>
+          )}
           <p className="text-zinc-500 text-xs mt-1">{selectedSpool.label_weight}g</p>
           <p className="text-bambu-green text-sm mt-4">{t('spoolbuddy.writeTag.spoolCreated', 'Spool created! Ready to write.')}</p>
         </div>
@@ -1029,7 +1070,8 @@ function NfcStatusPanel({ writeStatus, writeMessage, selectedSpool, tagOnReader,
         {selectedSpool && (
           <p className="text-zinc-400 text-sm">
             {selectedSpool.brand ? `${selectedSpool.brand} ` : ''}{selectedSpool.material}
-            {selectedSpool.color_name ? ` - ${selectedSpool.color_name}` : ''}
+            {selectedSpool.subtype ? ` ${selectedSpool.subtype}` : ''}
+            {displayColorName(selectedSpool) ? ` - ${displayColorName(selectedSpool)}` : ''}
           </p>
         )}
       </div>
@@ -1142,7 +1184,9 @@ function NfcStatusPanel({ writeStatus, writeMessage, selectedSpool, tagOnReader,
             <p className="text-white text-sm font-medium truncate">
               {selectedSpool.brand ? `${selectedSpool.brand} ` : ''}{selectedSpool.material}
             </p>
-            {selectedSpool.color_name && <p className="text-zinc-400 text-xs">{selectedSpool.color_name}</p>}
+            {displayColorName(selectedSpool) && (
+              <p className="text-zinc-400 text-xs">{displayColorName(selectedSpool)}</p>
+            )}
           </div>
         </div>
         <div className="text-xs text-zinc-500">{selectedSpool.label_weight}g</div>

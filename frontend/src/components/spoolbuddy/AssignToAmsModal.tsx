@@ -7,7 +7,7 @@ import { ConfirmModal } from '../ConfirmModal';
 import { AmsUnitCard, NozzleBadge } from './AmsUnitCard';
 import type { AmsThresholds } from './AmsUnitCard';
 import { getFillBarColor } from '../../utils/amsHelpers';
-import { getSwatchStyle } from '../../utils/colors';
+import { getSwatchStyle, resolveSpoolColorName } from '../../utils/colors';
 
 function getAmsName(id: number): string {
   if (id <= 3) return `AMS ${String.fromCharCode(65 + id)}`;
@@ -176,13 +176,21 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
     ? status.ams_extruder_map
     : cachedAmsExtruderMap.current;
 
+  const ftsInstalled = status?.fila_switch?.installed === true;
+
   const getNozzleSide = useCallback((amsId: number): 'L' | 'R' | null => {
     if (!isDualNozzle) return null;
     const mappedExtruderId = amsExtruderMap[String(amsId)];
+    if (mappedExtruderId !== undefined) return mappedExtruderId === 1 ? 'L' : 'R';
+    // With a Filament Track Switch every AMS reports extruder 0xE and reaches
+    // both nozzles through the switch, so there is no side to show. The unit-id
+    // guess below would label them all "R" — it exists only for dual-nozzle
+    // printers that never sent a map at all. See PrintersPage.amsSideBadge,
+    // which shows the switch inlet in place of L/R on the printer card.
+    if (ftsInstalled) return null;
     const normalizedId = amsId >= 128 ? amsId - 128 : amsId;
-    const extruderId = mappedExtruderId !== undefined ? mappedExtruderId : normalizedId;
-    return extruderId === 1 ? 'L' : 'R';
-  }, [isDualNozzle, amsExtruderMap]);
+    return normalizedId === 1 ? 'L' : 'R';
+  }, [isDualNozzle, amsExtruderMap, ftsInstalled]);
 
   // Assign spool to AMS slot — single API call, backend handles both DB record
   // AND MQTT auto-configuration. When the target slot is currently empty, the
@@ -371,7 +379,9 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
             <h2 className="text-sm font-semibold text-zinc-100 truncate">
               {t('spoolbuddy.modal.assignToAmsTitle', 'Assign to AMS')}
               <span className="font-normal text-zinc-500 ml-2">
-                {spool.color_name || 'Unknown'} &bull; {spool.brand} {spool.material}{spool.subtype && ` ${spool.subtype}`}
+                {resolveSpoolColorName(spool.color_name, spool.rgba, spool.color_name_is_synthesized) ||
+                  t('spoolbuddy.spool.unknownColor')}{' '}
+                &bull; {spool.brand} {spool.material}{spool.subtype && ` ${spool.subtype}`}
               </span>
               <span className="text-[10px] font-mono text-zinc-500 ml-2 shrink-0">#{spool.id}</span>
             </h2>

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, Bell, Download, Smartphone, type LucideIcon } from 'lucide-react';
+import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, Bell, Receipt, Download, Smartphone, type LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../contexts/ThemeContext';
 import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
@@ -50,6 +50,9 @@ export const defaultNavItems: NavItem[] = [
   { id: 'profiles', to: '/profiles', icon: Cloud, labelKey: 'nav.profiles' },
   { id: 'maintenance', to: '/maintenance', icon: Wrench, labelKey: 'nav.maintenance' },
   { id: 'stats', to: '/stats', icon: BarChart3, labelKey: 'nav.stats' },
+  // Opt-in feature: gated in isHidden() on the billing_enabled setting, so the
+  // entry stays out of the sidebar entirely until an admin turns billing on.
+  { id: 'finance', to: '/finance', icon: Receipt, labelKey: 'nav.finance' },
   // User-account feature: gated in isHidden() on advanced auth + user_notifications
   // + the notifications:user_email permission. Kept adjacent to Settings
   // intentionally. Do not drop this entry — without it the /notifications page
@@ -74,6 +77,12 @@ export function Layout() {
   const { mode, toggleMode } = useTheme();
   const { t } = useTranslation();
   const isSidebarCompact = useIsSidebarCompact();
+
+  // Bug-report panel state lives here because the trigger moves (#2750,
+  // reporter @goodjaltman). Below the sidebar-compact breakpoint the floating
+  // disc is replaced by a button in the compact header: the bottom-right corner
+  // is the most contended region in the app — the Profiles scroll-to-top FAB,
+
 
   // Theme toggle: mode → icon and tooltip
   const ThemeIcon = { dark: Sun, light: Monitor, system: Moon }[mode];
@@ -179,14 +188,21 @@ export function Layout() {
     staleTime: Infinity,
   });
 
-  const { data: settings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: api.getSettings,
+  // GET /settings requires settings:read, so for every non-admin this query
+  // 403'd and each of the four gates below silently took its fallback: Finance
+  // vanished from the sidebar for the users cost_centers:read_own exists for,
+  // a disabled user_notifications setting stopped applying to them, the sponsor
+  // prompt showed EUR whatever the install uses, and the update check ran where
+  // it had been switched off. Two of those were invisible to an administrator
+  // testing it, because an administrator can read /settings (#3023).
+  const { data: uiFlags } = useQuery({
+    queryKey: ['ui-flags'],
+    queryFn: api.getUiFlags,
     staleTime: 5 * 60 * 1000, // 5 minutes
   });
 
   // Sponsor-prompt toast — fires once per session post-auth if a milestone is eligible.
-  useSponsorPrompt(settings?.currency ?? 'EUR');
+  useSponsorPrompt(uiFlags?.currency ?? 'USD');
 
   // Unknown-spool prompt — surfaces a confirmation modal when the AMS reports a
   // tag with no inventory match (only when `auto_add_unknown_rfid` is off).
@@ -243,7 +259,7 @@ export function Layout() {
   const { data: updateCheck } = useQuery({
     queryKey: ['updateCheck'],
     queryFn: api.checkForUpdates,
-    enabled: settings?.check_updates !== false,
+    enabled: uiFlags?.check_updates !== false,
     staleTime: 60 * 60 * 1000, // 1 hour
     refetchInterval: 60 * 60 * 1000, // Check every hour
   });
@@ -363,6 +379,7 @@ export function Layout() {
       maintenance: 'maintenance:read',
       projects: 'projects:read',
       inventory: 'inventory:read',
+      finance: 'cost_centers:read_own',
       files: ['library:read', 'library:read_own', 'library:read_all'],
       makerworld: 'makerworld:view',
       settings: 'settings:read',
@@ -387,7 +404,15 @@ export function Layout() {
         if (!granted) return true;
       }
       // notifications nav item also requires advanced auth to be enabled and user_notifications_enabled setting
-      if (id === 'notifications' && (!authEnabled || !advancedAuthStatus?.advanced_auth_enabled || (settings?.user_notifications_enabled === false))) return true;
+      if (id === 'notifications' && (!authEnabled || !advancedAuthStatus?.advanced_auth_enabled || (uiFlags?.user_notifications_enabled === false))) return true;
+      // Finance is off by default and the page is meaningless without it, so it
+      // stays hidden until billing is explicitly on. Tested for `true` rather
+      // than `!== false` on purpose: the flags are undefined on the first
+      // render, and a nav entry that appears and then vanishes reads as a
+      // glitch. That polarity is also why reading this from /settings hid the
+      // entry outright for anyone without settings:read, rather than failing
+      // open the way the notifications gate two lines up did (#3023).
+      if (id === 'finance' && uiFlags?.billing_enabled !== true) return true;
       return false;
     };
 
@@ -1149,6 +1174,7 @@ export function Layout() {
                   </span>
                 )}
               </span>
+
               <button
                 onClick={() => navigate('/system')}
                 className="text-amber-700 dark:text-amber-400 hover:text-amber-900 dark:hover:text-amber-300 font-medium underline ml-2"

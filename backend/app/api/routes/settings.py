@@ -8,11 +8,16 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.auth import RequirePermissionIfAuthEnabled, caller_is_api_key, require_energy_cost_update
-from backend.app.core.config import settings as app_settings
+from backend.app.core.auth import (
+    RequirePermissionIfAuthEnabled,
+    caller_is_api_key,
+    require_auth_if_enabled,
+    require_energy_cost_update,
+)
+from backend.app.core.config import APP_VERSION, settings as app_settings
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
 from backend.app.models.settings import Settings
@@ -40,6 +45,88 @@ async def get_setting(db: AsyncSession, key: str) -> str | None:
     result = await db.execute(select(Settings).where(Settings.key == key))
     setting = result.scalar_one_or_none()
     return setting.value if setting else None
+
+
+# Accepted spellings for a boolean settings value. Settings live in a VARCHAR
+# column and every reader compares them as strings, so these are normalised to
+# "true"/"false" on the way in. The sets are deliberately generous: these
+# endpoints are part of the documented REST surface, reached by scripts and by
+# Home Assistant rest_command, where "True", "1" and "on" are all natural.
+_TRUTHY_SETTING_VALUES = frozenset({"true", "1", "yes", "on"})
+_FALSY_SETTING_VALUES = frozenset({"false", "0", "no", "off"})
+
+
+def setting_is_true(value: object) -> bool:
+    """Return True if a *stored* settings value means "on".
+
+    Deliberately narrower than the spellings ``normalize_bool_setting`` accepts:
+    it matches only what every other reader in the codebase treats as on
+    (``value.lower() == "true"``). Submitted values are canonicalised on write,
+    so a stored value is always "true"/"false"/""; accepting "1" or "on" here
+    would make this function disagree with the rest of the app about any legacy
+    row containing them.
+
+    A bool is tolerated for the case of a row written before values were
+    normalised, where SQLite coerced a raw bool into the VARCHAR column.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() == "true"
+
+
+def normalize_bool_setting(key: str, value: object) -> str:
+    """Coerce a boolean-ish settings value to the canonical "true"/"false".
+
+    Raises HTTPException(400) for values with no sensible interpretation, so an
+    API client gets a message naming the field instead of a 500.
+
+    A JSON boolean is the natural thing for an API client to send, and before
+    this normalisation it caused two distinct failures on
+    ``PUT /settings/spoolman``: ``bool.lower()`` raised AttributeError, and the
+    raw bool was written into a VARCHAR column, which SQLite silently coerces
+    to 1/0 while asyncpg rejects outright. Both surfaced as an opaque 500.
+    """
+    if isinstance(value, bool):  # must precede the int branch — bool is an int
+        return "true" if value else "false"
+    if isinstance(value, int):
+        if value in (0, 1):
+            return "true" if value else "false"
+        raise HTTPException(400, f"{key} must be a boolean; got the number {value}")
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if not candidate:
+            # Empty is stored verbatim rather than normalised to "false".
+            # get_spoolman_settings reads these with ``or "<default>"``, so an
+            # empty stored value means "use the default" — and two of them
+            # (spoolman_report_partial_usage, auto_add_unknown_rfid) default to
+            # ON. Rewriting "" to "false" would silently switch them off for any
+            # client that submits a blank value.
+            return ""
+        if candidate in _TRUTHY_SETTING_VALUES:
+            return "true"
+        if candidate in _FALSY_SETTING_VALUES:
+            return "false"
+        raise HTTPException(400, f"{key} must be a boolean; got {value!r}")
+    raise HTTPException(400, f"{key} must be a boolean; got {type(value).__name__}")
+
+
+def normalize_str_setting(key: str, value: object) -> str:
+    """Return a string settings value, rejecting types that would store garbage.
+
+    ``str()`` on a dict or list would persist its repr, so those are refused
+    rather than silently written. Numbers are accepted and stringified: a port
+    or a bare host submitted unquoted is a plausible client mistake, not a
+    reason to fail the request.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, bool | int | float):
+        return str(value)
+    raise HTTPException(400, f"{key} must be a string; got {type(value).__name__}")
 
 
 async def get_external_login_url(db: AsyncSession) -> str:
@@ -82,6 +169,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "auto_archive",
             "save_thumbnails",
             "capture_finish_photo",
+            "finish_photo_restore_plate",
             "spoolman_enabled",
             "spoolman_disable_weight_sync",
             "spoolman_report_partial_usage",
@@ -111,10 +199,13 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "default_vibration_cali",
             "default_layer_inspect",
             "default_timelapse",
+            "billing_enabled",
+            "printer_kill_switch_enabled",
             "ldap_enabled",
             "ldap_auto_provision",
             "local_login_enabled",
             "preheat_enabled",
+            "queue_keep_bed_warm",
         ]:
             settings_dict[setting.key] = setting.value.lower() == "true"
         elif setting.key in [
@@ -127,6 +218,16 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
         ]:
             settings_dict[setting.key] = float(setting.value)
         elif setting.key in [
+            # Nullable floats. Settings storage stringifies None to the literal
+            # "None", so these cannot go in the list above -- float("None")
+            # raises and would take the whole settings response with it (#2905).
+            "ams_temp_alarm",
+        ]:
+            try:
+                settings_dict[setting.key] = float(setting.value)
+            except (TypeError, ValueError):
+                settings_dict[setting.key] = None
+        elif setting.key in [
             "ams_humidity_good",
             "ams_humidity_fair",
             "ams_history_retention_days",
@@ -138,10 +239,14 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "stagger_group_size",
             "stagger_interval_minutes",
             "forecast_global_lead_time_days",
+            "location_sensor_poll_interval",
+            "finance_budget_reset_day",
             "session_max_hours",
             "pipeline_max_copies",
             "preheat_max_wait_seconds",
             "preheat_soak_seconds",
+            "queue_keep_warm_bed_temp",
+            "queue_keep_warm_max_minutes",
             "queue_max_concurrent_uploads",
         ]:
             settings_dict[setting.key] = int(setting.value)
@@ -357,6 +462,11 @@ _UI_PREFERENCE_FIELDS: tuple[str, ...] = (
     "ams_humidity_fair",
     "ams_temp_good",
     "ams_temp_fair",
+    # ams_temp_alarm is deliberately NOT here. This endpoint is unauthenticated
+    # and exists so the UI can colour readings without SETTINGS_READ; the good /
+    # fair bands are what the printer card colours by. The alarm threshold
+    # changes no rendering anywhere -- only SettingsPage reads it, and that is
+    # behind the settings permissions already (#2905).
     "bed_cooled_threshold",
     # Temperature / fan-speed presets for the printer-card popovers. Numbers
     # only; no PII / credentials.
@@ -383,6 +493,57 @@ async def get_ui_preferences(db: AsyncSession = Depends(get_db)):
     full = await _build_settings_response(db, is_api_key=False)
     dumped = full.model_dump()
     return {key: dumped[key] for key in _UI_PREFERENCE_FIELDS if key in dumped}
+
+
+# Install configuration the app shell reads before it can render correctly.
+#
+# Deliberately a second list rather than more entries in _UI_PREFERENCE_FIELDS.
+# That one is served to anyone at all, on the recorded grounds that its contents
+# are "public defaults that ship with the app" (test_route_auth_coverage.py), and
+# its field set is pinned by a test written to make anyone adding to it stop and
+# think. These fields are not defaults -- they are facts about how this
+# particular deployment is configured -- so they get their own endpoint at their
+# own trust level instead of stretching that charter to fit them.
+_UI_FLAG_FIELDS: tuple[str, ...] = (
+    # The sidebar hides Finance unless billing is on. Layout read this from
+    # GET /settings, which requires SETTINGS_READ, so for a non-admin the query
+    # 403'd, the value arrived undefined, `undefined !== true` held, and the
+    # entry was hidden from exactly the users cost_centers:read_own exists to
+    # serve. The page itself was reachable by URL the whole time (#3023).
+    "billing_enabled",
+    # Same 403, opposite outcome. That gate tests `=== false`, which undefined
+    # never satisfies, so an administrator who turned user notifications off
+    # still left the entry showing -- to precisely the non-admins it governs.
+    "user_notifications_enabled",
+    # Not gates, but read by the shell and equally undefined for a non-admin:
+    # the sponsor prompt fell back to EUR whatever the install uses, and the
+    # update check ran even where it had been switched off.
+    "currency",
+    "check_updates",
+)
+
+
+@router.get("/ui-flags")
+async def get_ui_flags(
+    db: AsyncSession = Depends(get_db),
+    _: User | None = Depends(require_auth_if_enabled),
+):
+    """Install configuration the app shell needs, for any signed-in user.
+
+    Gated on being authenticated rather than on ``SETTINGS_READ``. The sidebar
+    has to know whether billing is enabled before it can decide whether to offer
+    Finance, and ``SETTINGS_READ`` cannot be the price of knowing that -- it also
+    grants sight of the SMTP, LDAP and MQTT credentials.
+
+    ``require_auth_if_enabled`` returns ``None`` when auth is switched off
+    entirely, which is the case /ui-preferences was left ungated for. That is the
+    distinction the two endpoints draw: "works when there is no auth" is not the
+    same statement as "readable by anyone", and conflating them is what put a
+    settings read in front of a permission that was never meant to require one.
+    """
+    full = await _build_settings_response(db, is_api_key=False)
+    dumped = full.model_dump()
+    return {key: dumped[key] for key in _UI_FLAG_FIELDS if key in dumped}
 
 
 @router.get("/check-ffmpeg")
@@ -435,38 +596,45 @@ async def update_spoolman_settings(
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_UPDATE),
 ):
-    """Update Spoolman integration settings."""
+    """Update Spoolman integration settings.
+
+    The body is a free-form dict rather than a schema, so each value is
+    normalised before it is persisted — see ``normalize_bool_setting`` for why
+    a JSON boolean used to produce a 500 here.
+    """
     if "spoolman_enabled" in settings:
-        old_val = await get_setting(db, "spoolman_enabled") or "false"
-        new_val = settings["spoolman_enabled"]
+        was_enabled = setting_is_true(await get_setting(db, "spoolman_enabled"))
+        new_val = normalize_bool_setting("spoolman_enabled", settings["spoolman_enabled"])
+        now_enabled = new_val == "true"
         await set_setting(db, "spoolman_enabled", new_val)
 
-        # Switching to Spoolman: clear built-in inventory slot assignments
-        if old_val.lower() != "true" and new_val.lower() == "true":
-            from backend.app.models.spool_assignment import SpoolAssignment
-
-            result = await db.execute(delete(SpoolAssignment))
-            logger.info("Cleared %d spool assignments on switch to Spoolman mode", result.rowcount)
-        # Switching back to internal mode: clear Spoolman slot assignments — the
-        # symmetric counterpart of the clear above. Without this, stale
-        # spoolman_slot_assignments rows linger and would wrongly count as
-        # "assigned" in any mode-agnostic check (e.g. the missing-spool-
-        # assignment notification, which unions both tables — #1473).
-        elif old_val.lower() == "true" and new_val.lower() != "true":
-            from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
-
-            result = await db.execute(delete(SpoolmanSlotAssignment))
-            logger.info("Cleared %d Spoolman slot assignments on switch to internal mode", result.rowcount)
+        # Nothing is deleted on a mode change (#2812). Each mode keeps its slot
+        # assignments in its own table, so both can hold rows at once and the
+        # toggle is reversible: switching to Spoolman to see what it does, then
+        # switching back, returns you to the assignments you had.
+        #
+        # This used to empty the other mode's table on every toggle. The reason
+        # was real -- checks that read both tables would let a row in the mode
+        # you are not using answer for the mode you are -- but the cost was that
+        # inspecting a mode destroyed your configuration, with no confirmation
+        # and no way back, and the deletion was unfiltered across every printer.
+        # The readers that could be confused now ask which mode is active
+        # (``spoolman_owns_assignments``), which is where that decision belongs:
+        # the mode is a property of the install, not of the rows.
+        if was_enabled != now_enabled:
+            logger.info(
+                "Inventory mode switched to %s; slot assignments in both tables kept",
+                "Spoolman" if now_enabled else "built-in",
+            )
     if "spoolman_url" in settings:
-        await set_setting(db, "spoolman_url", settings["spoolman_url"])
+        await set_setting(db, "spoolman_url", normalize_str_setting("spoolman_url", settings["spoolman_url"]))
     if "spoolman_sync_mode" in settings:
-        await set_setting(db, "spoolman_sync_mode", settings["spoolman_sync_mode"])
-    if "spoolman_disable_weight_sync" in settings:
-        await set_setting(db, "spoolman_disable_weight_sync", settings["spoolman_disable_weight_sync"])
-    if "spoolman_report_partial_usage" in settings:
-        await set_setting(db, "spoolman_report_partial_usage", settings["spoolman_report_partial_usage"])
-    if "auto_add_unknown_rfid" in settings:
-        await set_setting(db, "auto_add_unknown_rfid", settings["auto_add_unknown_rfid"])
+        await set_setting(
+            db, "spoolman_sync_mode", normalize_str_setting("spoolman_sync_mode", settings["spoolman_sync_mode"])
+        )
+    for bool_key in ("spoolman_disable_weight_sync", "spoolman_report_partial_usage", "auto_add_unknown_rfid"):
+        if bool_key in settings:
+            await set_setting(db, bool_key, normalize_bool_setting(bool_key, settings[bool_key]))
 
     spoolman_changed = "spoolman_enabled" in settings or "spoolman_url" in settings
 
@@ -624,6 +792,20 @@ async def create_backup_zip(output_path: Path | None = None) -> tuple[Path, str]
                 except PermissionError as e:
                     logger.warning("Permission denied copying %s: %s", name, e)
 
+        # Say which version made this, so a restore that cannot import it can
+        # name the versions rather than a list of columns. Backups from before
+        # this existed simply have no manifest, and restore treats the version
+        # as unknown.
+        import json as _json
+
+        manifest = {
+            "format": 1,
+            "app_version": APP_VERSION,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "database": "sqlite" if is_sqlite() else "postgresql",
+        }
+        (temp_path / "manifest.json").write_text(_json.dumps(manifest, indent=2) + "\n")
+
         # Include the MFA encryption key as a ZIP top-level entry alongside
         # bambuddy.db. Without it, encrypted client_secret / TOTP secret rows
         # would be unrecoverable after restore on a host without MFA_ENCRYPTION_KEY set.
@@ -685,6 +867,119 @@ async def create_backup(
         )
 
 
+class BackupSchemaIncompatible(Exception):
+    """The backup has no value for a column this version requires.
+
+    A backup carries the schema of the install that made it. Restoring it into
+    a different version means the destination can have NOT NULL columns the
+    backup never heard of -- either because that version is older and still has
+    a column since removed (``user_wallets.currency``, dropped in #3123), or
+    because it is newer and has added one. Most such columns have a default and
+    can simply be filled. The ones that cannot are what this reports, and it has
+    to be reported BEFORE the restore drops anything: the Postgres import wipes
+    every table in the first transaction, so a failure halfway leaves the
+    install with an empty schema and the previous data gone.
+    """
+
+
+def _missing_required_columns(pg_table, src_columns: set[str]):
+    """Split the destination's NOT NULL columns that the backup lacks.
+
+    Returns ``(injectable, db_filled, unfillable)``:
+
+    * ``injectable`` -- ``{name: value}`` from the model's Python-side default.
+      These are invisible to the import's raw SQL: SQLAlchemy applies a
+      ``default=`` on ORM and Core inserts, never on ``text()``, and
+      ``create_all`` emits no DDL default for one. So a column like
+      ``currency VARCHAR(3) NOT NULL`` with ``default="EUR"`` arrives with
+      nothing to put in it unless we put it there.
+    * ``db_filled`` -- has a server default or is the autoincrement key; the
+      database fills it when the column is left out of the INSERT.
+    * ``unfillable`` -- nothing can supply a value. The backup is incompatible.
+    """
+    injectable: dict = {}
+    db_filled: list[str] = []
+    unfillable: list[str] = []
+
+    for col in pg_table.columns:
+        if col.nullable or col.name in src_columns:
+            continue
+        if col.default is not None:
+            arg = col.default.arg
+            injectable[col.name] = arg(None) if callable(arg) else arg
+        elif col.server_default is not None or col.primary_key:
+            db_filled.append(col.name)
+        else:
+            unfillable.append(col.name)
+
+    return injectable, db_filled, unfillable
+
+
+def check_backup_schema_compatible(sqlite_path: Path, backup_version: str | None = None) -> None:
+    """Raise if this version cannot import that backup. Touches nothing.
+
+    Only the cross-engine path needs this. A SQLite install restores by copying
+    the backup's pages, schema included, and `init_db()` migrates it forward
+    afterwards; the Postgres import instead recreates the schema from THIS
+    process's ORM and then inserts the backup's columns into it.
+    """
+    import sqlite3
+
+    from backend.app.core.database import Base
+
+    src = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    try:
+        src_tables = {
+            row[0]
+            for row in src.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'archive_fts%'"
+            )
+        }
+        problems: list[str] = []
+        # metadata.tables, not sorted_tables: the latter warns about the
+        # library_files/library_folders/print_archives cycle, and nothing here
+        # depends on the order.
+        for name, pg_table in Base.metadata.tables.items():
+            if name not in src_tables:
+                continue
+            # An empty table inserts nothing, so a column it cannot supply
+            # cannot fail. Refusing a restore over one would be a false alarm.
+            if src.execute(f'SELECT 1 FROM "{name}" LIMIT 1').fetchone() is None:  # noqa: S608  # nosec B608 — name comes from ORM metadata
+                continue
+            src_columns = {row[1] for row in src.execute(f'PRAGMA table_info("{name}")')}
+            _, _, unfillable = _missing_required_columns(pg_table, src_columns)
+            problems.extend(f"{name}.{col}" for col in unfillable)
+    finally:
+        src.close()
+
+    if not problems:
+        return
+
+    made_by = f"The backup was made by Bambuddy {backup_version}, " if backup_version else "The backup "
+    raise BackupSchemaIncompatible(
+        "This backup cannot be restored by this version of Bambuddy. It carries no value for "
+        f"{len(problems)} column(s) this version requires and cannot default: {', '.join(sorted(problems))}. "
+        f"{made_by}and this install runs {APP_VERSION}. Restore it on the version that made it, or "
+        "upgrade this install to that version. Nothing has been changed."
+    )
+
+
+def _read_backup_manifest(temp_path: Path) -> dict:
+    """The backup's manifest.json, or {} for a backup made before it existed."""
+    import json
+
+    path = temp_path / "manifest.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        logger.warning("Ignoring unreadable backup manifest: %s", exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
     """Import data from a SQLite database file into the current PostgreSQL database.
 
@@ -696,6 +991,11 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
     from sqlalchemy import text
 
     from backend.app.core.database import Base, _create_engine
+
+    # Before anything is dropped. The route checks this too, earlier and with
+    # the backup's version in the message; this call is what makes the guarantee
+    # a property of the import itself rather than of one caller.
+    check_backup_schema_compatible(sqlite_path)
 
     # Create a temporary engine for the import (current engine was disposed)
     pg_engine = _create_engine()
@@ -721,15 +1021,8 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
         sorted_tables = [t.name for t in metadata.sorted_tables if t.name in tables_to_import]
 
         # Phase 1: Drop all tables and recreate WITHOUT foreign keys.
-        # This avoids all FK ordering/orphan issues during import.
-        saved_fks = {}
-        for table in metadata.sorted_tables:
-            fks = list(table.foreign_key_constraints)
-            if fks:
-                saved_fks[table.name] = fks
-                for fk in fks:
-                    table.constraints.discard(fk)
-
+        # This avoids all FK ordering/orphan issues during import; the
+        # constraints go back on at the end, once every row has landed.
         async with pg_engine.begin() as conn:
             # Cap how long DROP TABLE will wait for AccessExclusiveLock so
             # any residual concurrent writer (per-printer MQTT clients
@@ -762,11 +1055,38 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
             )
             await conn.run_sync(metadata.create_all)
 
-        # Restore FK definitions in metadata (needed for re-adding later)
-        for table_name, fks in saved_fks.items():
-            table_obj = metadata.tables[table_name]
-            for fk in fks:
-                table_obj.constraints.add(fk)
+            # Now strip the foreign keys, at the database level.
+            #
+            # This used to be done by discarding each ForeignKeyConstraint
+            # from `table.constraints` before `create_all`. That only
+            # suppresses the inline REFERENCES clause inside CREATE TABLE:
+            # `Table.foreign_key_constraints` is derived from the *columns'*
+            # ForeignKey objects, which the discard never touched. When
+            # `create_all` meets a dependency cycle it can't sort -- and
+            # library_files / library_folders / print_archives are exactly
+            # such a cycle -- it falls back to emitting those tables' keys
+            # as separate ALTER TABLE ... ADD FOREIGN KEY statements read
+            # straight from that property. Twelve constraints survived,
+            # including library_files.folder_id, and because the same cycle
+            # also drops the ordering edge from `sorted_tables` the child
+            # table was imported before its parent and the restore died on
+            # a ForeignKeyViolationError.
+            #
+            # Dropping them from pg_constraint instead is indifferent to how
+            # create_all chose to emit them, so a future model cycle cannot
+            # reintroduce this. It also keeps the app's global Base.metadata
+            # untouched: the old code only put the constraints back *after*
+            # the transaction, so a failure in here left the running process
+            # with an FK-less metadata until restart.
+            await conn.execute(
+                text(
+                    "DO $$ DECLARE r RECORD; BEGIN "
+                    "FOR r IN (SELECT conrelid::regclass AS tbl, conname FROM pg_constraint "
+                    "WHERE contype = 'f' AND connamespace = 'public'::regnamespace) LOOP "
+                    "EXECUTE 'ALTER TABLE ' || r.tbl || ' DROP CONSTRAINT ' || quote_ident(r.conname); "
+                    "END LOOP; END $$;"
+                )
+            )
 
         # Phase 2: Import data (no FKs to worry about)
         async with pg_engine.begin() as conn:
@@ -785,8 +1105,24 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
                 if not columns:
                     continue
 
-                col_list = ", ".join(columns)
-                param_list = ", ".join(f":{c}" for c in columns)
+                # Columns this schema requires that the backup does not have at
+                # all. The block below handles a column PRESENT in the backup
+                # with a NULL in it; one the backup never had is not in
+                # `columns` and so never reached it -- which is how a backup
+                # from an install without `user_wallets.currency` died on
+                # NotNullViolationError against a version that still had it.
+                injected, _db_filled, _unfillable = _missing_required_columns(pg_table, set(src_columns))
+                if injected:
+                    logger.info(
+                        "Filling %s column(s) absent from the backup in %s: %s",
+                        len(injected),
+                        table_name,
+                        ", ".join(sorted(injected)),
+                    )
+
+                insert_columns = columns + list(injected)
+                col_list = ", ".join(insert_columns)
+                param_list = ", ".join(f":{c}" for c in insert_columns)
                 # ON CONFLICT DO NOTHING handles duplicate rows from SQLite (which doesn't enforce unique constraints)
                 insert_sql = text(f"INSERT INTO {table_name} ({col_list}) VALUES ({param_list}) ON CONFLICT DO NOTHING")  # noqa: S608  # nosec B608
 
@@ -827,9 +1163,15 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
                 now = dt.now()
 
                 def _convert_row(
-                    row, cols=columns, bools=bool_columns, dts=datetime_columns, nn_defaults=not_null_defaults, _now=now
+                    row,
+                    cols=columns,
+                    bools=bool_columns,
+                    dts=datetime_columns,
+                    nn_defaults=not_null_defaults,
+                    _now=now,
+                    inject=injected,
                 ):
-                    result = {}
+                    result = dict(inject)
                     for c in cols:
                         val = row[c]
                         if val is None and c in nn_defaults:
@@ -864,7 +1206,7 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
         src.close()
         logger.info("Cross-database import complete: %d tables imported", len(tables_to_import))
 
-        # Recreate FK constraints from ORM metadata (not from saved definitions).
+        # Recreate FK constraints from ORM metadata, which Phase 1 left intact.
         # Use individual transactions so orphaned SQLite data doesn't block valid FKs.
         from sqlalchemy.schema import AddConstraint
 
@@ -874,11 +1216,28 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
                 try:
                     async with pg_engine.begin() as fk_conn:
                         await fk_conn.execute(AddConstraint(fk))
-                except Exception:
-                    failed_fks.append(f"{table.name}.{fk.name}")
+                except Exception as e:
+                    # Name the constraint by what it links, not by `fk.name`:
+                    # these are unnamed in the ORM, so that field is None and
+                    # the warning used to read "print_archives.None" for every
+                    # one of the five keys on that table -- unusable for
+                    # working out which rows to go and look at.
+                    cols = ", ".join(c.name for c in fk.columns)
+                    target = fk.elements[0].target_fullname if fk.elements else "unknown"
+                    failed_fks.append(f"{table.name}({cols}) -> {target}")
+                    # Postgres puts the offending key in a DETAIL line; it
+                    # names the exact orphan value, which is the one thing
+                    # that turns this into an actionable report.
+                    detail = next(
+                        (ln.strip() for ln in str(e).splitlines() if ln.startswith("DETAIL:")),
+                        str(e).splitlines()[0] if str(e) else e.__class__.__name__,
+                    )
+                    logger.info("FK %s(%s) -> %s not restored: %s", table.name, cols, target, detail)
         if failed_fks:
             logger.warning(
-                "Could not restore %d FK constraints (orphaned data in SQLite): %s",
+                "Could not restore %d FK constraints (orphaned data in the backup): %s. "
+                "The data is restored and usable; those columns are simply no longer "
+                "enforced. See the INFO lines above for the offending key in each case.",
                 len(failed_fks),
                 ", ".join(failed_fks),
             )
@@ -943,6 +1302,30 @@ async def restore_backup(
         backup_db = temp_path / "bambuddy.db"
         if not backup_db.exists():
             raise HTTPException(400, "Invalid backup: missing bambuddy.db")
+
+        # 2b. Can this version import this backup at all?
+        #
+        # Deliberately here: everything below has a side effect. The virtual
+        # printer stops, background services stop, the MFA key file is
+        # overwritten with the backup's -- and then the Postgres import drops
+        # every table in its first transaction. A backup rejected at the INSERT
+        # took the install's data with it and left the encrypted secrets under a
+        # key that no longer matches. Nothing above this line has touched
+        # anything.
+        import sqlite3
+
+        manifest = _read_backup_manifest(temp_path)
+        backup_version = manifest.get("app_version")
+        if backup_version:
+            logger.info("Backup was created by Bambuddy %s; this install runs %s", backup_version, APP_VERSION)
+        if not is_sqlite():
+            try:
+                check_backup_schema_compatible(backup_db, backup_version)
+            except BackupSchemaIncompatible as exc:
+                logger.error("Refusing backup: %s", exc)
+                raise HTTPException(400, str(exc)) from exc
+            except sqlite3.DatabaseError as exc:
+                raise HTTPException(400, f"Invalid backup: bambuddy.db is not readable ({exc})") from exc
 
         try:
             import asyncio

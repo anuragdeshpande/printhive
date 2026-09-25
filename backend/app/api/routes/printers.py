@@ -1,20 +1,24 @@
 import asyncio
 import logging
 import re
+import secrets
 import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.background import BackgroundTask
 
 from backend.app.core import database
 from backend.app.core.auth import (
-    RequireCameraStreamTokenIfAuthEnabled,
     RequireOverlayTokenIfAuthEnabled,
     RequirePermissionIfAuthEnabled,
+    RequirePrinterPermissionIfAuthEnabled,
     is_auth_enabled,
+    require_media_token_permission,
+    require_media_token_printer_permission,
 )
 from backend.app.core.config import settings
 from backend.app.core.database import get_db
@@ -29,6 +33,7 @@ from backend.app.schemas.printer import (
     AMSTray,
     AMSUnit,
     DiagnosticRequest,
+    ExtruderSlotResponse,
     FilaSwitchResponse,
     HmsActionBody,
     HMSErrorResponse,
@@ -36,23 +41,29 @@ from backend.app.schemas.printer import (
     NozzleRackSlot,
     PrinterCreate,
     PrinterDiagnosticResult,
+    PrinterFilesDownloadRequest,
+    PrinterFilesJobRequest,
     PrinterResponse,
     PrinterResponseWithSecret,
     PrinterStatus,
     PrinterUpdate,
     PrintOptionsResponse,
 )
+from backend.app.services import drying_preflight
 from backend.app.services.bambu_ftp import (
     cache_3mf_download,
     delete_file_async,
     download_file_bytes_async,
     download_file_try_paths_async,
+    ftps_handshake_blocked,
     get_cached_3mf,
     get_storage_info_async,
-    list_files_async,
+    list_files_result_async,
 )
+from backend.app.services.print_storage import ftp_probe_paths, print_file_reachable_over_ftp
 from backend.app.services.printer_diagnostic import run_connection_diagnostic
 from backend.app.services.printer_manager import (
+    display_temperatures,
     drying_screen_only,
     get_derived_status_name,
     printer_manager,
@@ -62,9 +73,30 @@ from backend.app.services.printer_manager import (
     supports_chamber_temp,
     supports_drying,
     supports_drying_while_printing,
+    uniform_tray_filament_hint,
 )
+from backend.app.services.printer_media import (
+    MAX_PRINTER_ZIP_PREPARE_SECONDS,
+    PrinterFilesZipInsufficientSpaceError,
+    PrinterFilesZipTooLargeError,
+    build_printer_file,
+    build_printer_files_zip,
+    cancel_printer_files_job,
+    get_printer_files_job,
+    printer_file_path,
+    printer_files_zip_path,
+    remove_printer_files_zip,
+    start_printer_files_job,
+)
+from backend.app.services.slicer_filament_resolver import _ORCA_PROFILE_ID
+from backend.app.services.slot_nozzle import resolve_slot_nozzle
+from backend.app.utils.ams_humidity import ams_humidity_percent
 from backend.app.utils.filament_ids import filament_id_to_setting_id
-from backend.app.utils.http import build_content_disposition
+from backend.app.utils.filament_types import is_material_name, printer_filament_type
+from backend.app.utils.fts_routing import slot_extruder
+from backend.app.utils.http import build_content_disposition, download_error_response, safe_download_filename
+from backend.app.utils.kprofile_lookup import build_slot_k_resolver
+from backend.app.utils.printer_models import MAX_CHAMBER_TEMP_C, uses_exhaust_fan_label
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/printers", tags=["printers"])
@@ -401,6 +433,7 @@ async def delete_printer(
 
     from backend.app.models.archive import PrintArchive
     from backend.app.models.maintenance import MaintenanceHistory, PrinterMaintenance
+    from backend.app.models.scheduled_drying import ScheduledDrying
     from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
@@ -421,6 +454,9 @@ async def delete_printer(
 
     # Delete slot assignments for this printer (SQLite doesn't enforce FK cascades)
     await db.execute(sql_delete(SpoolmanSlotAssignment).where(SpoolmanSlotAssignment.printer_id == printer_id))
+
+    # Delete scheduled drying runs for this printer (SQLite doesn't enforce FK cascades)
+    await db.execute(sql_delete(ScheduledDrying).where(ScheduledDrying.printer_id == printer_id))
 
     # Delete maintenance history and items for this printer
     # (SQLite doesn't enforce FK cascades, so do it explicitly)
@@ -455,10 +491,16 @@ async def get_printer_status(
 
     state = printer_manager.get_status(printer_id)
     if not state:
+        # No MQTT client state — the printer was never connected this run, or it
+        # was disconnected manually. The plate-clear gate is Bambuddy-side and
+        # persisted, so it still has a truthful value here (#2864); reporting the
+        # schema default instead told clients the plate was clean and hid the
+        # only control that can release the gate.
         return PrinterStatus(
             id=printer_id,
             name=printer.name,
             connected=False,
+            awaiting_plate_clear=printer_manager.is_awaiting_plate_clear(printer_id),
         )
 
     # Determine cover URL if there's an active print or finished print awaiting plate clear
@@ -477,6 +519,7 @@ async def get_printer_status(
             actions=e.actions,
             job_id=e.job_id,
             full_code=e.full_code,
+            description=e.description,
         )
         for e in (state.hms_errors or [])
     ]
@@ -487,15 +530,15 @@ async def get_printer_status(
     ams_exists = False
     raw_data = state.raw_data or {}
 
-    # Build K-profile lookup map: cali_idx -> k_value
-    # This allows looking up the calibrated K value for each AMS slot
-    kprofile_map: dict[int, float] = {}
-    for kp in state.kprofiles or []:
-        if kp.slot_id is not None and kp.k_value:
-            try:
-                kprofile_map[kp.slot_id] = float(kp.k_value)
-            except (ValueError, TypeError):
-                pass  # Skip K-profile entries with unparseable values
+    # K value for a slot's bound profile, preferring the slot's own nozzle.
+    #
+    # cali_idx alone is not enough: two profiles can share an index and differ
+    # by extruder, and a cali_idx-only map let whichever the printer listed
+    # last overwrite the other — on the maintainer's H2C, 0.018 and 0.020 for
+    # the same spool. Nor is the extruder a requirement: one profile can be
+    # what both extruders' slots point at, and demanding a match blanked every
+    # slot on a second AMS (#3044). The resolver does both in order.
+    _kprofile_k = build_slot_k_resolver(state)
 
     # Cached active-cycle drying params (filament + target temp) we sent
     # last; Bambu doesn't echo them on the per-tick AMS push, so the badge
@@ -521,8 +564,8 @@ async def get_printer_status(
                 # Get K value: first try tray's k field, then lookup from K-profiles
                 k_value = tray_data.get("k")
                 cali_idx = tray_data.get("cali_idx")
-                if k_value is None and cali_idx is not None and cali_idx in kprofile_map:
-                    k_value = kprofile_map[cali_idx]
+                if k_value is None:
+                    k_value = _kprofile_k(cali_idx, int(ams_data.get("id", 0)), int(tray_data.get("id", 0)))
 
                 trays.append(
                     AMSTray(
@@ -545,22 +588,11 @@ async def get_printer_status(
                         exists=tray_data.get("exists"),
                     )
                 )
-            # Prefer humidity_raw (percentage) over humidity (index 1-5)
-            # humidity_raw is the actual percentage value from the sensor
-            humidity_raw = ams_data.get("humidity_raw")
-            humidity_idx = ams_data.get("humidity")
-            humidity_value = None
-
-            if humidity_raw is not None:
-                try:
-                    humidity_value = int(humidity_raw)
-                except (ValueError, TypeError):
-                    pass  # Skip unparseable humidity; will try index fallback
-            if humidity_value is None and humidity_idx is not None:
-                try:
-                    humidity_value = int(humidity_idx)
-                except (ValueError, TypeError):
-                    pass  # Skip unparseable humidity index; humidity remains None
+            # Percentage only. The 1-5 ``humidity`` index is never substituted
+            # for one -- it is inverted, so it would read as the opposite of
+            # what it means (#3140). See utils/ams_humidity.
+            humidity_pct = ams_humidity_percent(ams_data)
+            humidity_value = int(round(humidity_pct)) if humidity_pct is not None else None
             # AMS-HT has 1 tray, regular AMS has 4 trays
             is_ams_ht = len(trays) == 1
 
@@ -577,20 +609,12 @@ async def get_printer_status(
                     dry_target_temp = None
             if target_fil_val:
                 dry_filament = str(target_fil_val)
-            # Fallback: derive from first loaded tray when no cached target
-            # (drying started in a previous backend session, or cache wasn't
-            # seeded). Mirrors the popover seed heuristic.
-            if dry_target_temp is None or not dry_filament:
-                for tray in trays:
-                    if tray.tray_type:
-                        if not dry_filament:
-                            dry_filament = str(tray.tray_type)
-                        if dry_target_temp is None and tray.drying_temp:
-                            try:
-                                dry_target_temp = int(tray.drying_temp)
-                            except (TypeError, ValueError):
-                                pass
-                        break
+            # Fallback: name the filament from the loaded trays when there is no
+            # cached target (drying started in a previous backend session, or
+            # the cache wasn't seeded), and only when they agree. The
+            # temperature has no fallback — see uniform_tray_filament_hint.
+            if not dry_filament:
+                dry_filament = uniform_tray_filament_hint([tray.tray_type or "" for tray in trays])
 
             ams_units.append(
                 AMSUnit(
@@ -625,8 +649,11 @@ async def get_printer_status(
             # Get K value: first try tray's k field, then lookup from K-profiles
             vt_k_value = vt_data.get("k")
             vt_cali_idx = vt_data.get("cali_idx")
-            if vt_k_value is None and vt_cali_idx is not None and vt_cali_idx in kprofile_map:
-                vt_k_value = kprofile_map[vt_cali_idx]
+            if vt_k_value is None:
+                # External holder: id 254 is Ext-L, 255 is Ext-R. slot_extruder
+                # takes the 0/1 tray index, so normalise before asking.
+                vt_id = int(vt_data.get("id", 254))
+                vt_k_value = _kprofile_k(vt_cali_idx, 255, vt_id - 254 if vt_id >= 254 else vt_id)
 
             tray_id = int(vt_data.get("id", 254))
             vt_tray.append(
@@ -813,6 +840,21 @@ async def get_printer_status(
         active_extruder=state.active_extruder,
         ams_mapping=ams_mapping,
         ams_extruder_map=ams_extruder_map,
+        # Only meaningful alongside an installed switch; without one the map is
+        # empty anyway, but gating it keeps a stale binding from outliving the
+        # accessory being unplugged.
+        ams_switch_inlet=(dict(state.ams_switch_inlet) if state.fila_switch and state.fila_switch.installed else {}),
+        # Which hotend holds which slot. Same first-load reasoning as
+        # fila_switch.ready below — the AMS slot menu reads it to decide which
+        # hotend it may offer, and an empty default would offer both.
+        extruder_slots={
+            str(ext_id): ExtruderSlotResponse(
+                ams_id=slot.ams_id,
+                slot_id=slot.slot_id,
+                has_filament=slot.has_filament,
+            )
+            for ext_id, slot in state.extruder_slots.items()
+        },
         tray_now=tray_now,
         # Runout guidance (#2587): resolve the firmware's target/previous slot to a
         # global tray ID, but only while PAUSED — the moment the operator needs it.
@@ -843,6 +885,8 @@ async def get_printer_status(
         big_fan1_speed=state.big_fan1_speed,
         big_fan2_speed=state.big_fan2_speed,
         heatbreak_fan_speed=state.heatbreak_fan_speed,
+        left_aux_fan_speed=state.left_aux_fan_speed,
+        exhaust_fan_present=state.exhaust_fan_present,
         firmware_version=state.firmware_version,
         developer_mode=state.developer_mode if state else None,
         ams_filament_backup=state.ams_filament_backup if state else None,
@@ -860,6 +904,12 @@ async def get_printer_status(
                 out_extruders=list(state.fila_switch.out_extruders),
                 stat=state.fila_switch.stat,
                 info=state.fila_switch.info,
+                # Must be computed here as well as in printer_state_to_dict: this
+                # is what the page gets on its first load, and the WebSocket only
+                # corrects it on the next push. Defaulting it to False instead
+                # would tell every correctly set-up machine that its switch is
+                # not set up, until a push happened to arrive.
+                ready=all(str(u.id) in state.ams_switch_inlet for u in ams_units),
             )
             if state.fila_switch and state.fila_switch.installed
             else None
@@ -911,6 +961,7 @@ async def get_overlay_status(
             "layer_num": None,
             "total_layers": None,
             "stg_cur_name": None,
+            "temperatures": {},
             "time_format": time_format,
         }
 
@@ -927,6 +978,9 @@ async def get_overlay_status(
         "layer_num": state.layer_num,
         "total_layers": state.total_layers,
         "stg_cur_name": get_derived_status_name(state, printer.model),
+        # Nozzle / bed / chamber readings for the overlay's temperature fields
+        # (#1422). Filtered rather than passed through: see display_temperatures.
+        "temperatures": display_temperatures(state.temperatures, printer.model),
         "time_format": time_format,
     }
 
@@ -1127,15 +1181,56 @@ def extract_gcode_thumbnail(gcode_bytes: bytes) -> bytes | None:
     return None
 
 
+async def _running_print_archive_file(printer_id: int, state) -> Path | None:
+    """Path to the 3MF of the print this printer is running, if we have it.
+
+    Bambuddy archives the sliced file when the print starts, so the copy the
+    printer is executing is usually already on disk. Anchored on ``subtask_id``,
+    which the firmware mints per print: a leftover ``status="printing"`` row from
+    a completion that was never seen must not lend its file to another job.
+
+    Opens its own short-lived session, like the caller does, so the pooled
+    connection is not held across the FTP work that follows.
+    """
+    subtask_id = str(getattr(state, "subtask_id", "") or "").strip()
+    if subtask_id in ("", "0"):
+        return None
+
+    from backend.app.models.archive import PrintArchive
+
+    async with database.async_session() as db:
+        archive = await db.scalar(
+            select(PrintArchive)
+            .where(
+                PrintArchive.printer_id == printer_id,
+                PrintArchive.status == "printing",
+                PrintArchive.subtask_id == subtask_id,
+            )
+            .order_by(PrintArchive.created_at.desc())
+            .limit(1)
+        )
+    if archive is None or not archive.file_path:
+        return None
+
+    path = settings.base_dir / archive.file_path
+    return path if path.is_file() and str(path).endswith(".3mf") else None
+
+
 @router.get("/{printer_id}/cover")
 async def get_printer_cover(
     printer_id: int,
     view: str | None = None,
     archive: int | None = None,
     job: str | None = None,
-    _: None = RequireCameraStreamTokenIfAuthEnabled,
+    _: User | None = Depends(require_media_token_permission(Permission.PRINTERS_READ)),
 ):
     """Get the cover image for the current print job.
+
+    Requires a media token query param (?token=xxx) when auth is enabled, plus
+    ``printers:read`` -- the permission that governs every other read of this
+    printer. It used to require ``camera:view`` by way of the camera-stream
+    token, which is a different question from "may this user see what is on the
+    plate" (#3025).
 
     Args:
         view: Optional view type. Use "top" for the top-down build plate view or
@@ -1353,7 +1448,16 @@ async def get_printer_cover(
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
     _cover_inflight[inflight_key] = fut
     try:
-        image_data = await _produce_cover_image(printer, printer_id, subtask_name, view, view_key, plate_num, cache_key)
+        image_data = await _produce_cover_image(
+            printer,
+            printer_id,
+            subtask_name,
+            view,
+            view_key,
+            plate_num,
+            cache_key,
+            archive_path=await _running_print_archive_file(printer_id, state),
+        )
         return Response(content=image_data, media_type="image/png")
     finally:
         if not fut.done():
@@ -1369,6 +1473,7 @@ async def _produce_cover_image(
     view_key: str,
     plate_num: int | None,
     cache_key: tuple[str, str],
+    archive_path: Path | None = None,
 ) -> bytes:
     """Download the active-print 3MF and extract its cover thumbnail (#2572).
 
@@ -1376,7 +1481,9 @@ async def _produce_cover_image(
     can single-flight through it (see ``_cover_inflight``). Returns the PNG bytes
     on success (also filling ``_cover_cache``) and raises ``HTTPException`` on
     failure (filling ``_cover_404_cache`` for the definitive 404s). Does no DB
-    work — the caller already released the pooled connection before this runs.
+    work — the caller already released the pooled connection before this runs,
+    which is also why ``archive_path`` arrives resolved rather than looked up
+    here.
     """
     # Build possible 3MF filenames from subtask_name
     # Bambu printers may store files as "name.gcode.3mf" (sliced via Bambu Studio)
@@ -1415,31 +1522,118 @@ async def _produce_cover_image(
     temp_path = settings.archive_dir / "temp" / f"cover_{printer_id}_{temp_filename}"
     temp_path.parent.mkdir(parents=True, exist_ok=True)
 
+    storage = print_file_reachable_over_ftp(printer_manager.get_status(printer_id))
+
     # Cache check (#972): the archive-metadata flow in main.py may have already
     # downloaded this 3MF during the print-start handler. Reusing that file
     # avoids a second 36MB transfer competing with the printer's single FTP
     # socket (which produces the 425 errors that feed the retry storm).
+    #
+    # The dispatch's own filename is a candidate too: it is what the archive
+    # flow's probe cached the file under, and it does not always survive the
+    # trip through subtask_name (#2856).
     downloaded = False
     using_cached = False
-    for candidate_name in possible_filenames:
-        cached = get_cached_3mf(printer_id, candidate_name)
-        if cached:
-            logger.info("Cover using cached 3MF from %s (avoided duplicate FTP)", cached)
-            temp_path = cached
-            downloaded = True
-            using_cached = True
-            break
+
+    def _cached_source() -> Path | None:
+        """The 3MF another flow has already published for this print, if any."""
+        for candidate_name in (*possible_filenames, storage.probe_filename):
+            if not candidate_name:
+                continue
+            cached = get_cached_3mf(printer_id, candidate_name)
+            if cached:
+                return cached
+        return None
+
+    cached = _cached_source()
+    if cached:
+        logger.info("Cover using cached 3MF from %s (avoided duplicate FTP)", cached)
+        temp_path = cached
+        downloaded = True
+        using_cached = True
 
     if not downloaded:
+        # Same idea, one step further back: that in-memory cache dies with the
+        # process, but the archive of the print that is still running holds the
+        # very 3MF on disk. Without this, reopening a card or the skip-objects
+        # plate after a restart pulls the whole file back off a printer that is
+        # mid-print — measured at three concurrent fan-outs, thirteen seconds
+        # and a 0-byte read on the maintainer's H2C, which is exactly the
+        # single-socket contention #972 was about.
+        if archive_path is not None:
+            logger.info("Cover using the running print's archived 3MF at %s (no FTP)", archive_path)
+            temp_path = archive_path
+            downloaded = True
+            using_cached = True
+
+    if not downloaded:
+        # The cover lives inside the 3MF, so it is only reachable if the 3MF is.
+        # When the printer kept the print on internal storage there is nothing
+        # at any of these paths, and walking all sixteen of them just to end on
+        # a 404 that reads as "this print has no cover" helps nobody (#2780).
+        #
+        # Unless the printer is wrong about that, which an H2D with a card in
+        # routinely is (#2856). The dispatch names the file, so when it does,
+        # trade the immediate 404 for a five-path probe of that one name — same
+        # single connection, and it is the only way this endpoint ever recovers
+        # a cover for a print the archive flow did not see start.
+        max_retries = 2
+        if not storage.reachable:
+            if not storage.probe_filename:
+                _cover_404_cache.setdefault(printer_id, set()).add(cache_key)
+                raise HTTPException(
+                    404,
+                    f"The print file for '{subtask_name}' is not on storage Bambuddy can read over FTPS "
+                    f"({storage.reason}), so it has no cover to extract.",
+                )
+            remote_paths = ftp_probe_paths(storage.probe_filename)
+            # The dispatch's name is the authoritative one — a print whose
+            # subtask_name has been normalized or truncated would otherwise be
+            # cached under a key the archive flow never looks up.
+            temp_filename = storage.probe_filename
+            temp_path = settings.archive_dir / "temp" / f"cover_{printer_id}_{temp_filename}"
+            # One look, not three: the printer has already said this file is not
+            # here, so a retry storm on top of a hunch is exactly what #2780 was.
+            max_retries = 0
+
         logger.info(
             f"Trying to download cover for '{subtask_name}' from {printer.ip_address} (trying {len(remote_paths)} paths)"
         )
 
         # Retry logic for transient FTP failures
-        max_retries = 2
         last_error = None
 
         for attempt in range(max_retries + 1):
+            if attempt:
+                # Look again before spending another transfer. The entry check
+                # above only settles the race when the two flows do not
+                # overlap, and on a P1S at print start they overlap for
+                # minutes: a reported run had the archive flow publish the file
+                # 42 seconds into this endpoint's 2.5-minute retry sequence,
+                # and the third attempt still pulled its own 5 MB copy of it
+                # over the same socket the printer was serving the print from
+                # (#2957).
+                cached = _cached_source()
+                if cached:
+                    logger.info(
+                        "Cover picked up the 3MF another flow finished downloading (%s) — skipping retry %s",
+                        cached,
+                        attempt + 1,
+                    )
+                    temp_path = cached
+                    downloaded = True
+                    using_cached = True
+                    break
+            if ftps_handshake_blocked(printer.ip_address):
+                # Nothing to retry: the printer is not completing a TLS
+                # handshake on port 990, so no path and no attempt reaches it
+                # (#2780). Report the real cause instead of the 404 below,
+                # which would read as "this print has no cover".
+                raise HTTPException(
+                    503,
+                    f"Printer {printer.ip_address} is not answering its file service over TLS. "
+                    "Bambuddy will try again shortly.",
+                )
             try:
                 downloaded = await download_file_try_paths_async(
                     printer.ip_address,
@@ -1465,13 +1659,25 @@ async def _produce_cover_image(
             # Remember this failure so subsequent requests for the same print
             # skip the 8-path FTP fan-out (#1420).
             _cover_404_cache.setdefault(printer_id, set()).add(cache_key)
+            if not storage.reachable:
+                # The probe looked and found nothing, so the printer's own
+                # account of where the file went is the answer after all —
+                # keep saying so rather than reporting a generic miss (#2780).
+                raise HTTPException(
+                    404,
+                    f"The print file for '{subtask_name}' is not on storage Bambuddy can read over FTPS "
+                    f"({storage.reason}), so it has no cover to extract.",
+                )
             raise HTTPException(
                 404,
                 f"Could not download 3MF file for '{subtask_name}' from printer {printer.ip_address}. Tried: {possible_filenames}",
             )
 
-        # Share the fresh download with the archive flow.
-        cache_3mf_download(printer_id, temp_filename, temp_path)
+        # Share the fresh download with the archive flow — unless the file is
+        # already theirs, in which case re-registering it under this endpoint's
+        # own name would only add a second key pointing at the same bytes.
+        if not using_cached:
+            cache_3mf_download(printer_id, temp_filename, temp_path)
 
     # Verify file actually exists and has content
     if not temp_path.exists():
@@ -1484,6 +1690,17 @@ async def _produce_cover_image(
         if not using_cached:
             temp_path.unlink()
         raise HTTPException(500, f"Downloaded file is empty for '{subtask_name}'")
+
+    # Offer the file to the archive flow before extracting the thumbnail. When
+    # the print started inside the printer's FTPS cool-off, the archive flow
+    # gave up without a single connection and this endpoint holds the very file
+    # it wanted — which used to be read for a thumbnail and then deleted at
+    # print completion, leaving a permanently empty archive (#2957). Covers the
+    # cached branch as well as a fresh download: whoever fetched it, the running
+    # print's archive should have it. A no-op unless that archive is a fallback.
+    from backend.app.main import try_recover_fallback_archive
+
+    await try_recover_fallback_archive(printer_id, temp_filename, temp_path)
 
     try:
         # Extract thumbnail from 3MF (which is a ZIP file)
@@ -1613,7 +1830,7 @@ async def _load_printer_or_404(printer_id: int) -> Printer:
 async def list_printer_files(
     printer_id: int,
     path: str = "/",
-    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+    _=RequirePrinterPermissionIfAuthEnabled(Permission.PRINTERS_FILES),
 ):
     """List files on the printer at the specified path."""
     printer = await _load_printer_or_404(printer_id)
@@ -1638,8 +1855,15 @@ async def list_printer_files(
         return {
             "path": path,
             "files": files,
+            "warnings": [],
         }
-    files = await list_files_async(printer.ip_address, printer.access_code, path, printer_model=printer.model)
+    listing = await list_files_result_async(
+        printer.ip_address,
+        printer.access_code,
+        path,
+        printer_model=printer.model,
+    )
+    files = listing.files
 
     # Add full path to each file
     for f in files:
@@ -1648,6 +1872,7 @@ async def list_printer_files(
     return {
         "path": path,
         "files": files,
+        "warnings": [] if listing.available else ["printer_unavailable"],
     }
 
 
@@ -1655,7 +1880,7 @@ async def list_printer_files(
 async def download_printer_file(
     printer_id: int,
     path: str,
-    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+    _=RequirePrinterPermissionIfAuthEnabled(Permission.PRINTERS_FILES),
 ):
     """Download a file from the printer."""
     printer = await _load_printer_or_404(printer_id)
@@ -1664,11 +1889,44 @@ async def download_printer_file(
     adapter = printer_manager.get_adapter(printer_id)
     if adapter and adapter.capabilities.has(PrinterCapability.FILE_DOWNLOAD):
         data = adapter.download_file(path)
-    else:
-        data = await download_file_bytes_async(printer.ip_address, printer.access_code, path, printer_model=printer.model)
-        
-    if data is None:
+        if data is None:
+            raise HTTPException(404, f"File not found: {path}")
+        filename = path.split("/")[-1]
+        ext = filename.lower().split(".")[-1] if "." in filename else ""
+        content_types = {
+            "3mf": "application/vnd.ms-package.3dmanufacturing-3dmodel+xml",
+            "gcode": "text/plain",
+            "mp4": "video/mp4",
+            "avi": "video/x-msvideo",
+            "png": "image/png",
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "json": "application/json",
+            "txt": "text/plain",
+        }
+        content_type = content_types.get(ext, "application/octet-stream")
+        return Response(
+            content=data,
+            media_type=content_type,
+            headers={"Content-Disposition": build_content_disposition(filename)},
+        )
+
+    try:
+        async with asyncio.timeout(MAX_PRINTER_ZIP_PREPARE_SECONDS):
+            result = await build_printer_file(
+                printer,
+                path,
+                None,
+                bundle_key=f"single-{secrets.token_urlsafe(18)}",
+            )
+    except PrinterFilesZipTooLargeError as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except PrinterFilesZipInsufficientSpaceError as exc:
+        raise HTTPException(507, str(exc)) from exc
+    except FileNotFoundError:
         raise HTTPException(404, f"File not found: {path}")
+    except TimeoutError as exc:
+        raise HTTPException(504, "Printer download exceeded the 30-minute limit") from exc
 
     # Determine content type based on extension
     filename = path.split("/")[-1]
@@ -1687,10 +1945,12 @@ async def download_printer_file(
     }
     content_type = content_types.get(ext, "application/octet-stream")
 
-    return Response(
-        content=data,
+    return FileResponse(
+        path=result.path,
+        filename=filename,
         media_type=content_type,
         headers={"Content-Disposition": build_content_disposition(filename)},
+        background=BackgroundTask(remove_printer_files_zip, result.path),
     )
 
 
@@ -1698,7 +1958,7 @@ async def download_printer_file(
 async def get_printer_file_gcode(
     printer_id: int,
     path: str,
-    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+    _=RequirePrinterPermissionIfAuthEnabled(Permission.PRINTERS_FILES),
 ):
     """Get gcode for a file stored on a printer (for preview)."""
     import io
@@ -1732,7 +1992,7 @@ async def get_printer_file_gcode(
 async def get_printer_file_plates(
     printer_id: int,
     path: str = Query(..., description="Full path to the 3MF file on the printer"),
-    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+    _=RequirePrinterPermissionIfAuthEnabled(Permission.PRINTERS_FILES),
 ):
     """Get available plates from a multi-plate 3MF file stored on a printer."""
     import io
@@ -1972,7 +2232,7 @@ async def get_printer_file_plate_thumbnail(
     printer_id: int,
     plate_index: int,
     path: str = Query(..., description="Full path to the 3MF file on the printer"),
-    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+    _=Depends(require_media_token_printer_permission(Permission.PRINTERS_FILES)),
 ):
     """Get a plate thumbnail image from a printer-stored 3MF file."""
     import io
@@ -1998,43 +2258,133 @@ async def get_printer_file_plate_thumbnail(
 @router.post("/{printer_id}/files/download-zip")
 async def download_printer_files_as_zip(
     printer_id: int,
-    request: dict,
-    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+    request: PrinterFilesDownloadRequest,
+    _=RequirePrinterPermissionIfAuthEnabled(Permission.PRINTERS_FILES),
 ):
-    """Download multiple files from the printer as a ZIP archive."""
-    import io
+    """Download multiple files using a disk-backed ZIP.
 
-    paths = request.get("paths", [])
-    if not paths:
+    Kept backward-compatible for API clients: relative paths are rooted,
+    duplicate paths receive collision-safe names, and an all-failed request
+    returns an empty ZIP as the historical endpoint did. The browser uses the
+    asynchronous preparation endpoints below.
+    """
+    if not request.paths:
         raise HTTPException(400, "No files specified")
-
     printer = await _load_printer_or_404(printer_id)
-
-    # Create ZIP in memory
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for path in paths:
-            try:
-                data = await download_file_bytes_async(
-                    printer.ip_address, printer.access_code, path, printer_model=printer.model
-                )
-                if data:
-                    filename = path.split("/")[-1]
-                    zf.writestr(filename, data)
-            except Exception as e:
-                logging.warning("Failed to add %s to ZIP: %s", path, e)
-                continue
-
-    zip_buffer.seek(0)
-    zip_data = zip_buffer.read()
-
-    if len(zip_data) == 0:
-        raise HTTPException(404, "No files could be downloaded")
-
-    return Response(
-        content=zip_data,
+    normalized_paths = [path if path.startswith("/") else f"/{path}" for path in request.paths]
+    normalized_sizes = {path if path.startswith("/") else f"/{path}": size for path, size in request.sizes.items()}
+    try:
+        async with asyncio.timeout(MAX_PRINTER_ZIP_PREPARE_SECONDS):
+            result = await build_printer_files_zip(
+                printer,
+                normalized_paths,
+                normalized_sizes,
+                preserve_paths=False,
+                allow_empty=True,
+            )
+    except PrinterFilesZipTooLargeError as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except PrinterFilesZipInsufficientSpaceError as exc:
+        raise HTTPException(507, str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(504, "Printer ZIP preparation exceeded the 30-minute limit") from exc
+    return FileResponse(
+        path=result.path,
+        filename="printer-files.zip",
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="printer-files.zip"'},
+        headers={
+            "X-Bambuddy-Files-Requested": str(result.requested),
+            "X-Bambuddy-Files-Downloaded": str(result.successful),
+            "X-Bambuddy-Files-Failed": str(len(result.failed_paths)),
+        },
+        background=BackgroundTask(remove_printer_files_zip, result.path),
+    )
+
+
+@router.post("/{printer_id}/files/download-job")
+async def create_printer_files_download_job(
+    printer_id: int,
+    request: PrinterFilesJobRequest,
+    _=RequirePrinterPermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+):
+    """Start a cancellable disk-backed preparation without holding the request."""
+
+    if not request.paths:
+        raise HTTPException(400, "No files specified")
+    if len(set(request.paths)) != len(request.paths):
+        raise HTTPException(400, "Selected printer paths must be unique")
+    if not request.as_zip and len(request.paths) != 1:
+        raise HTTPException(400, "Native downloads require exactly one file")
+    printer = await _load_printer_or_404(printer_id)
+    try:
+        status = await start_printer_files_job(
+            printer,
+            request.paths,
+            request.sizes,
+            request.filename,
+            as_zip=request.as_zip,
+        )
+    except PrinterFilesZipTooLargeError as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except PrinterFilesZipInsufficientSpaceError as exc:
+        raise HTTPException(507, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return status.__dict__
+
+
+@router.get("/{printer_id}/files/download-jobs/{job_id}")
+async def get_printer_files_download_job(
+    printer_id: int,
+    job_id: str,
+    _=RequirePrinterPermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+):
+    status = await get_printer_files_job(job_id, printer_id)
+    if status is None:
+        raise HTTPException(404, "Printer download job not found")
+    return status.__dict__
+
+
+@router.delete("/{printer_id}/files/download-jobs/{job_id}")
+async def cancel_printer_files_download_job(
+    printer_id: int,
+    job_id: str,
+    _=RequirePrinterPermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+):
+    if not await cancel_printer_files_job(job_id, printer_id):
+        raise HTTPException(404, "Printer download job not found")
+    return {"status": "cancelled"}
+
+
+@router.get("/{printer_id}/files/dl/{token}/{filename}")
+async def download_prepared_printer_files(
+    printer_id: int,
+    token: str,
+    filename: str,
+):
+    """Consume a resource-bound token and stream a prepared file natively."""
+
+    from backend.app.core.auth import verify_slicer_download_token
+
+    if not await verify_slicer_download_token(token, "printer-files", printer_id):
+        return download_error_response(403, "This download link has already been used or has expired.")
+    zip_path = printer_files_zip_path(printer_id, token)
+    raw_path = printer_file_path(printer_id, token)
+    if zip_path is not None and await asyncio.to_thread(zip_path.is_file):
+        prepared_path = zip_path
+        media_type = "application/zip"
+    elif raw_path is not None and await asyncio.to_thread(raw_path.is_file):
+        prepared_path = raw_path
+        media_type = "application/octet-stream"
+    else:
+        return download_error_response(404, "The prepared download is no longer on the server.")
+    safe_filename = safe_download_filename(filename, fallback="printer-download")
+    return FileResponse(
+        path=prepared_path,
+        filename=safe_filename,
+        media_type=media_type,
+        headers={"Content-Disposition": build_content_disposition(safe_filename)},
+        background=BackgroundTask(remove_printer_files_zip, prepared_path),
     )
 
 
@@ -2042,7 +2392,7 @@ async def download_printer_files_as_zip(
 async def delete_printer_file(
     printer_id: int,
     path: str,
-    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_FILES),
+    _=RequirePrinterPermissionIfAuthEnabled(Permission.PRINTERS_FILES),
 ):
     """Delete a file from the printer."""
     printer = await _load_printer_or_404(printer_id)
@@ -2182,7 +2532,7 @@ async def clear_mqtt_logs(
 # The P1 firmware acks `ams_filament_drying` with result: success and then ignores it
 # — Bambu's own P1 manual says drying "may only be controlled from the P1S screen"
 # (#2533). Refuse the command rather than let the caller believe it landed.
-_DRYING_SCREEN_ONLY_DETAIL = "This printer only supports AMS drying from its own screen"
+_DRYING_SCREEN_ONLY_DETAIL = drying_preflight.SCREEN_ONLY_DETAIL
 
 
 @router.post("/{printer_id}/drying/start")
@@ -2205,10 +2555,9 @@ async def start_drying(
     # Server-side guard: reject if this model/firmware doesn't support drying
     live_state = printer_manager.get_status(printer_id)
     firmware = live_state.firmware_version if live_state else None
-    if drying_screen_only(printer.model):
-        raise HTTPException(400, _DRYING_SCREEN_ONLY_DETAIL)
-    if not supports_drying(printer.model, firmware):
-        raise HTTPException(400, "Drying not supported for this printer model or firmware version")
+    unsupported = drying_preflight.check_drying_supported(printer.model, firmware)
+    if unsupported:
+        raise HTTPException(400, unsupported)
 
     if temp < 45 or temp > 85:
         raise HTTPException(400, "Temperature must be 45-85°C")
@@ -2219,44 +2568,16 @@ async def start_drying(
     # firmware silently ignores the command — #971) and backfill an empty
     # filament field from the first loaded tray so the printer doesn't reject
     # the payload.
-    target_ams: dict | None = None
-    for unit in (live_state.raw_data.get("ams") if live_state else None) or []:
-        try:
-            if int(unit.get("id", -1)) == ams_id:
-                target_ams = unit
-                break
-        except (TypeError, ValueError):
-            continue
-
-    if target_ams is not None:
-        reason_messages = {
-            0: "Printer is busy",
-            1: "Insufficient power — too many AMS drying or external PSU required",
-            2: "AMS is busy",
-            3: "Filament is at the AMS outlet — retract it first",
-            4: "AMS is already starting a drying cycle",
-            5: "Not supported in 2D mode",
-            6: "AMS is already drying",
-            7: "AMS firmware is upgrading",
-            8: "Plug in the external AMS power adapter to start drying",
-        }
-        for code in target_ams.get("dry_sf_reason") or []:
-            try:
-                code_int = int(code)
-            except (TypeError, ValueError):
-                continue
-            if code_int in reason_messages:
-                raise HTTPException(409, reason_messages[code_int])
-
-        if not filament:
-            for tray in target_ams.get("tray") or []:
-                tray_type = tray.get("tray_type")
-                if tray_type:
-                    filament = str(tray_type)
-                    break
-
-    if not filament:
-        filament = "PLA"
+    target_ams = drying_preflight.find_ams_unit(live_state, ams_id)
+    blocking = drying_preflight.blocking_reason_codes(target_ams)
+    if blocking:
+        # Same pick the scheduled path makes, so both describe one blocked AMS
+        # the same way rather than differing on which code the firmware listed
+        # first.
+        raise HTTPException(
+            409, drying_preflight.DRY_SF_REASON_MESSAGES[drying_preflight.primary_reason_code(blocking)]
+        )
+    filament = drying_preflight.resolve_filament(target_ams, filament)
 
     success = printer_manager.send_drying_command(
         printer_id, ams_id, temp, duration, mode=1, filament=filament, rotate_tray=rotate_tray
@@ -2287,6 +2608,15 @@ async def stop_drying(
     success = printer_manager.send_drying_command(printer_id, ams_id, temp=0, duration=0, mode=0)
     if not success:
         raise HTTPException(400, "Printer not connected")
+
+    # A cycle the user stopped by hand tells us nothing about whether drying can
+    # move the humidity reading, so it must not count towards the auto-drying
+    # suspension (#2770). Imported here rather than at module scope to keep the
+    # existing routes/scheduler import direction.
+    from backend.app.services.print_scheduler import scheduler as print_scheduler
+
+    print_scheduler.forget_auto_dry_cycle(printer_id, ams_id)
+
     return {"status": "drying_stopped", "ams_id": ams_id}
 
 
@@ -2399,17 +2729,31 @@ async def get_inventory_remain(
     the dispatcher uses (#1766). Works for both internal inventory and
     Spoolman; unbound slots are absent from the map (client falls back to the
     printer's MQTT `remain` for those).
+
+    `slot_materials` carries the same bindings with their material identity and
+    extruder side attached, which is what the modal's pre-flight filament check
+    needs to pool spools under AMS Filament Backup the way the dispatcher does.
+    It is deliberately server-computed: the identity rule lives in
+    `filament_deficit`, and a client-side reimplementation of it is exactly how
+    the modal came to block prints the dispatcher would have accepted. Unlike
+    `inventory_remain_g` it covers every binding, not just currently-loaded
+    slots — again matching what the dispatcher pools.
     """
+    from backend.app.services.filament_deficit import build_slot_materials
     from backend.app.services.print_scheduler import PrintScheduler
 
     state = printer_manager.get_status(printer_id)
     if not state:
-        return {"inventory_remain_g": {}}
+        return {"inventory_remain_g": {}, "slot_materials": []}
 
     scheduler = PrintScheduler()
     loaded = scheduler._build_loaded_filaments(state)
     overrides = await scheduler._build_inventory_remain_overrides(db, printer_id, loaded)
-    return {"inventory_remain_g": {str(k): v for k, v in overrides.items()}}
+    slot_materials = await build_slot_materials(db, printer_id)
+    return {
+        "inventory_remain_g": {str(k): v for k, v in overrides.items()},
+        "slot_materials": [s.to_dict() for s in slot_materials],
+    }
 
 
 # ============================================
@@ -2618,6 +2962,106 @@ async def delete_slot_preset(
     return {"success": True}
 
 
+@router.get("/{printer_id}/slots/{ams_id}/{tray_id}/spool-defaults")
+async def get_slot_spool_defaults(
+    printer_id: int,
+    ams_id: int,
+    tray_id: int,
+    db: AsyncSession = Depends(get_db),
+    _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_READ),
+):
+    """What the spool assigned to this slot is configured to use here.
+
+    The Configure AMS Slot dialog opens on a slot that usually already holds an
+    assigned spool, and that spool carries a filament preset per printer model
+    and a K profile per hotend. Without this the dialog offered defaults derived
+    from the slot's last manual configuration or from the tray's RFID data --
+    ignoring the very values the spool was configured with, on the one screen
+    that looks like it exists for them.
+
+    Everything is resolved for the nozzle THIS slot feeds, so a dual-nozzle
+    machine gets the answer for the correct hotend. Returns nulls rather than a
+    404 when the slot holds no known spool: "nothing configured" is an ordinary
+    answer here and the dialog falls back to what it did before.
+    """
+    from backend.app.models.spool import Spool
+    from backend.app.models.spool_assignment import SpoolAssignment
+    from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
+    from backend.app.services.inventory_mode import spoolman_owns_assignments
+    from backend.app.services.slot_kprofile import find_slot_kprofile_for_extruder
+    from backend.app.services.slot_nozzle import resolve_slot_nozzle
+    from backend.app.services.spool_filament_preset import resolve_spool_preset, resolve_spoolman_preset
+
+    state = printer_manager.get_status(printer_id)
+    model = printer_manager.get_model(printer_id)
+    slot_nozzle = resolve_slot_nozzle(state, ams_id, tray_id, model)
+
+    profile = await find_slot_kprofile_for_extruder(
+        db,
+        printer_id,
+        ams_id,
+        tray_id,
+        slot_nozzle.extruder_or_default,
+        slot_nozzle.diameter,
+        model,
+        slot_nozzle.flow,
+    )
+
+    slicer_filament: str | None = None
+    slicer_filament_name: str | None = None
+    spoolman_mode = await spoolman_owns_assignments(db)
+    if spoolman_mode:
+        sm_assignment = (
+            await db.execute(
+                select(SpoolmanSlotAssignment).where(
+                    SpoolmanSlotAssignment.printer_id == printer_id,
+                    SpoolmanSlotAssignment.ams_id == ams_id,
+                    SpoolmanSlotAssignment.tray_id == tray_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if sm_assignment is not None:
+            slicer_filament, slicer_filament_name = await resolve_spoolman_preset(
+                db,
+                spoolman_spool_id=sm_assignment.spoolman_spool_id,
+                printer_model=model,
+                nozzle_diameter=slot_nozzle.diameter,
+                fallback_filament=None,
+                fallback_name=None,
+            )
+    else:
+        assignment = (
+            await db.execute(
+                select(SpoolAssignment).where(
+                    SpoolAssignment.printer_id == printer_id,
+                    SpoolAssignment.ams_id == ams_id,
+                    SpoolAssignment.tray_id == tray_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if assignment is not None:
+            spool = (await db.execute(select(Spool).where(Spool.id == assignment.spool_id))).scalar_one_or_none()
+            if spool is not None:
+                slicer_filament, slicer_filament_name = await resolve_spool_preset(
+                    db,
+                    spool_id=spool.id,
+                    printer_model=model,
+                    nozzle_diameter=slot_nozzle.diameter,
+                    fallback_filament=spool.slicer_filament,
+                    fallback_name=spool.slicer_filament_name,
+                )
+
+    return {
+        "slicer_filament": slicer_filament,
+        "slicer_filament_name": slicer_filament_name,
+        "cali_idx": profile.cali_idx if profile else None,
+        "k_value": profile.k_value if profile else None,
+        "profile_name": profile.name if profile else None,
+        "extruder": slot_nozzle.extruder,
+        "nozzle_diameter": slot_nozzle.diameter,
+    }
+
+
 @router.post("/{printer_id}/slots/{ams_id}/{tray_id}/configure")
 async def configure_ams_slot(
     printer_id: int,
@@ -2669,15 +3113,65 @@ async def configure_ams_slot(
         f"[configure_ams_slot] setting_id={setting_id!r}, kprofile_filament_id={kprofile_filament_id!r}, kprofile_setting_id={kprofile_setting_id!r}"
     )
 
+    # The modal derives tray_type from a preset name or a spool's material, so
+    # it can be a product line rather than a type ("PLA+", "PolyTerra PLA").
+    # A slot carrying one of those satisfies nothing that asks for PLA, so the
+    # slot gets the type and tray_sub_brands -- untouched here -- keeps the
+    # name (issue #2902). The requested wording is kept for the id lookup
+    # below, which knows some product lines the type table does not.
+    requested_tray_type = tray_type
+    tray_type = printer_filament_type(tray_type)
+    if tray_type != requested_tray_type:
+        logger.info("[configure_ams_slot] tray_type %r → %r", requested_tray_type, tray_type)
+
     # Get MQTT client for this printer
     client = printer_manager.get_client(printer_id)
     if not client:
         raise HTTPException(status_code=400, detail="Printer not connected")
 
+    # Discard a tray_info_idx the printer cannot store (#3003).
+    #
+    # The field is 8 characters wide. A local preset id ("P" + 7 hex) is
+    # exactly 8, which is presumably why nobody noticed -- but a cloud
+    # *setting* id is 18, and the firmware keeps the first 8 and reports
+    # success. Measured on @marivo's A1 in the #3003 bundle:
+    #
+    #   sent      tray_info_idx=PFUS9ddc938fe3ab8f
+    #   printer   Assignment NOT confirmed: tray shows PFUS9DDC
+    #
+    # `PFUS9ddc` resolves to nothing anywhere, so the slot came out of the
+    # Configure modal as "Generic <material>" in the slicer -- strictly worse
+    # than the base filament it would have got from the fallback below, and it
+    # also breaks the calibration table, which is keyed by this field.
+    #
+    # Blanking it here is what hands the slot to the reuse / generic branch.
+    # The preset reference is not lost: it stays in setting_id, the field that
+    # does accept a PFUS. Same four rejected shapes, and the same reasoning, as
+    # `slicer_filament_resolver`'s closing guard -- which the assignment path
+    # has run since #1815 while Configure had none. The Orca profile UUID is on
+    # the list for the same reason as the rest: the modal no longer sends one,
+    # but this route is public API and 36 characters is the worst of the four
+    # against an 8-character field.
+    if tray_info_idx and (
+        tray_info_idx.startswith("PFUS")
+        or tray_info_idx.startswith("PFCN")
+        or _ORCA_PROFILE_ID.fullmatch(tray_info_idx)
+        or is_material_name(tray_info_idx)
+    ):
+        logger.info(
+            "[configure_ams_slot] tray_info_idx %r is not storable as a filament id — "
+            "falling back to slot reuse / generic (kept as setting_id %r)",
+            tray_info_idx,
+            setting_id or tray_info_idx,
+        )
+        if not setting_id and (tray_info_idx.startswith("PFUS") or tray_info_idx.startswith("PFCN")):
+            setting_id = tray_info_idx
+        tray_info_idx = ""
+
     # Resolve tray_info_idx for the MQTT command.
     # Priority:
-    #   1. Use the provided tray_info_idx if set (including cloud-synced
-    #      custom presets like PFUS* / P*).
+    #   1. Use the provided tray_info_idx if set, once the guard above has had
+    #      its say (so: a GF* official or P* local id, never a PFUS/PFCN one).
     #   2. Reuse the slot's existing tray_info_idx if it's a specific
     #      (non-generic) preset for the same material.
     #   3. Fall back to a generic Bambu filament ID.
@@ -2743,10 +3237,15 @@ async def configure_ams_slot(
             )
             effective_tray_info_idx = current_tray_info_idx
         elif tray_type:
-            material = tray_type.upper().strip()
+            # Requested wording first, reduced type only as a further fallback,
+            # so a material that already resolves keeps resolving to the same
+            # id: "PETG HF" has its own generic preset (GFG96) that reducing it
+            # to "PETG" would trade away for GFG99.
+            material = requested_tray_type.upper().strip()
             generic = (
                 _GENERIC_FILAMENT_IDS.get(material)
                 or _GENERIC_FILAMENT_IDS.get(material.split("-")[0].split(" ")[0])
+                or _GENERIC_FILAMENT_IDS.get(tray_type.upper())
                 or ""
             )
             if generic:
@@ -2871,27 +3370,44 @@ async def configure_ams_slot(
             from backend.app.models.spoolman_k_profile import SpoolmanKProfile
             from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 
-            # Resolve slot's extruder index for the K-profile match key. Same
-            # logic as _apply_pa_after_refresh: external slots invert tray→extruder,
-            # AMS slots come from ams_extruder_map. Falls back to 0 (single-nozzle).
+            # Resolve the slot's extruder for the K-profile match key. On a
+            # Filament Track Switch machine this comes from the AMS's inlet
+            # binding, because every unit reports extruder 0xE there — without
+            # that, the `else 0` below filed every profile under the right-hand
+            # nozzle and a left-nozzle calibration was stored as a right one.
             slot_state = printer_manager.get_status(printer_id)
-            slot_extruder: int | None = None
-            if slot_state and slot_state.ams_extruder_map:
-                if ams_id == 255:
-                    slot_extruder = 1 - tray_id
-                else:
-                    slot_extruder = slot_state.ams_extruder_map.get(str(ams_id))
-            kp_extruder = slot_extruder if slot_extruder is not None else 0
-
-            # Spoolman SlotAssignment first — has UniqueConstraint, idempotent.
-            sm_result = await db.execute(
-                select(SpoolmanSlotAssignment).where(
-                    SpoolmanSlotAssignment.printer_id == printer_id,
-                    SpoolmanSlotAssignment.ams_id == ams_id,
-                    SpoolmanSlotAssignment.tray_id == tray_id,
-                )
+            resolved_extruder = slot_extruder(
+                ams_id,
+                tray_id,
+                slot_state.ams_extruder_map if slot_state else None,
+                slot_state.ams_switch_inlet if slot_state else None,
             )
-            sm_assignment = sm_result.scalar_one_or_none()
+            # Still 0 when nothing is known, which is right for a single-nozzle
+            # printer — the resolver only returns None when it genuinely cannot
+            # tell, and on those machines extruder 0 is the only one there is.
+            kp_extruder = resolved_extruder if resolved_extruder is not None else 0
+
+            # Only the active mode's assignment table decides where this
+            # K-profile is stored. Reading Spoolman first and falling through
+            # was safe while the inactive table was emptied on every mode
+            # toggle; nothing is emptied since #2812, so a leftover Spoolman
+            # row in built-in mode would file the calibration against a spool
+            # the printer is not using and never write the local profile —
+            # the calibration would appear to succeed and then not apply.
+            from backend.app.services.inventory_mode import spoolman_owns_assignments
+
+            spoolman_mode = await spoolman_owns_assignments(db)
+            sm_assignment = None
+            if spoolman_mode:
+                # Spoolman SlotAssignment — has UniqueConstraint, idempotent.
+                sm_result = await db.execute(
+                    select(SpoolmanSlotAssignment).where(
+                        SpoolmanSlotAssignment.printer_id == printer_id,
+                        SpoolmanSlotAssignment.ams_id == ams_id,
+                        SpoolmanSlotAssignment.tray_id == tray_id,
+                    )
+                )
+                sm_assignment = sm_result.scalar_one_or_none()
             if sm_assignment:
                 existing = await db.execute(
                     select(SpoolmanKProfile).where(
@@ -2929,8 +3445,11 @@ async def configure_ams_slot(
                     tray_id,
                     cali_idx,
                 )
-            else:
-                # Local SpoolAssignment + SpoolKProfile (no UNIQUE — use .first())
+            elif not spoolman_mode:
+                # Local SpoolAssignment + SpoolKProfile (no UNIQUE — use .first()).
+                # Skipped in Spoolman mode even when a local row survives: the
+                # profile would be filed against a spool this printer is not
+                # drawing on, and the mode's own table has nothing to bind to.
                 local_result = await db.execute(
                     select(SpoolAssignment)
                     .options(selectinload(SpoolAssignment.spool))
@@ -3279,8 +3798,12 @@ async def clear_plate(
     if not printer:
         raise HTTPException(404, "Printer not found")
 
-    if not printer_manager.is_connected(printer_id):
-        raise HTTPException(400, "Printer not connected")
+    # Deliberately NOT gated on the printer being connected. Acknowledging the plate
+    # only mutates Bambuddy-side state — no MQTT command is sent — and with Auto Power
+    # Off the normal end-of-print state is exactly this: gate up, printer powered down.
+    # The guard this replaces was inherited from the sibling stop/pause/resume handlers,
+    # where reaching the printer IS required, and left farms with no way to release the
+    # gate short of powering each printer back on by hand (#2864).
 
     # Accept the acknowledgment whenever the printer is awaiting it — not only when the
     # reported state is FINISH/FAILED. After a power cycle the printer boots into IDLE
@@ -3421,7 +3944,12 @@ async def set_bed_temperature(
 @router.post("/{printer_id}/temperature/chamber")
 async def set_chamber_temperature(
     printer_id: int,
-    target: int = Query(..., ge=0, le=60, description="Target chamber temperature in Celsius; 0 turns heating off"),
+    target: int = Query(
+        ...,
+        ge=0,
+        le=MAX_CHAMBER_TEMP_C,
+        description="Target chamber temperature in Celsius; 0 turns heating off",
+    ),
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
 ):
@@ -3454,16 +3982,28 @@ async def set_chamber_temperature(
 @router.post("/{printer_id}/fan-speed")
 async def set_fan_speed(
     printer_id: int,
-    fan: str = Query(..., description="Fan to control: part, aux, or chamber"),
+    fan: str = Query(..., description="Fan to control: part, aux, aux2 (left aux), or chamber"),
     speed: int = Query(..., ge=0, le=100, description="Fan speed percentage"),
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
 ):
-    """Set a fan speed by percentage."""
-    fan_ids = {"part": 1, "aux": 2, "chamber": 3}
+    """Set a fan speed by percentage.
+
+    Fan index 10 ("aux2") is the optional left auxiliary part cooling fan on
+    P2S/X2D — driven with "M106 P10" exactly like Bambu's official machine
+    profile gcode does. It only exists when the printer reports airduct part 10,
+    so the request is rejected rather than sending M106 P10 into the void on a
+    machine that has no such fan.
+
+    That gate also rejects for the short window between connecting and the
+    first airduct push, when nothing is known about the fan yet. The card hides
+    the badge over the same window, so there is no control to click; a direct
+    API caller gets a 400 and should retry once the status reports the fan.
+    """
+    fan_ids = {"part": 1, "aux": 2, "chamber": 3, "aux2": 10}
     fan_id = fan_ids.get(fan)
     if fan_id is None:
-        raise HTTPException(400, "fan must be 'part', 'aux', or 'chamber'")
+        raise HTTPException(400, "fan must be 'part', 'aux', 'aux2', or 'chamber'")
 
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
     printer = result.scalar_one_or_none()
@@ -3474,12 +4014,31 @@ async def set_fan_speed(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
+    # Presence gate for the accessory fan. Without this, aux2 is accepted for
+    # every model and an A1 would be sent M106 P10 for a fan it does not have.
+    # The UI already hides the badge; this closes the same hole on the API.
+    if fan == "aux2" and getattr(client.state, "left_aux_fan_speed", None) is None:
+        raise HTTPException(
+            400,
+            "This printer does not report a left auxiliary fan "
+            "(no airduct part 10). The fan is an accessory kit on the P2S "
+            "and factory-fitted on the X2D.",
+        )
+
     pwm_speed = round(speed * 255 / 100)
     success = client.set_fan_speed(fan_id, pwm_speed)
     if not success:
         raise HTTPException(500, "Failed to set fan speed")
 
-    fan_names = {"part": "Part cooling fan", "aux": "Auxiliary fan", "chamber": "Chamber fan"}
+    # The enclosure fan is called "Exhaust" on P2S/X2D and "Chamber" elsewhere;
+    # match whatever the printer card badge shows so the toast agrees with the
+    # control the user just clicked.
+    fan_names = {
+        "part": "Part cooling fan",
+        "aux": "Auxiliary fan",
+        "aux2": "Left auxiliary fan",
+        "chamber": "Exhaust fan" if uses_exhaust_fan_label(printer.model) else "Chamber fan",
+    }
     return {"success": True, "message": f"{fan_names[fan]} set to {speed}%"}
 
 
@@ -3564,10 +4123,12 @@ async def bed_jog(
     distance: float = Query(
         ...,
         description=(
-            "Signed nozzle-bed gap adjustment in mm. Negative = decrease gap "
-            '("up" arrow in the UI: bed up on bed-on-Z models, toolhead down '
-            "on A1 bed-slingers). Positive = increase gap. The backend "
-            "translates this into the right G-code Z sign per printer model."
+            "Signed nozzle-bed gap adjustment in mm, identical on every model: "
+            "positive opens the gap (more clearance), negative closes it. Sent "
+            "to the printer as the G-code Z value unchanged — G-code Z is the "
+            "nozzle-to-bed distance whether the bed moves (X1 / P1 / H2) or the "
+            "toolhead does (A1 / A2L), so no per-model sign translation exists "
+            "or is needed."
         ),
     ),
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
@@ -3577,31 +4138,49 @@ async def bed_jog(
 
     Emits a short G-code sequence via MQTT.
 
-    Soft-endstop policy (#2579). The printer's software travel limits are the
-    only thing between a jog button and a bed crash — on Bambu machines the
-    physical endstops are homing-only (there is no runtime limit switch in the
-    travel path), so once they are disabled nothing stops the move. The old
-    code disabled them (``M211 S0``) around every forced jog, and the UI sent
-    ``force`` on every jog, so the limits were off on every bed move — that is
-    what let a jog drive the nozzle into the bed on all models (#2579). This
-    endpoint now emits a **bare relative move and never touches ``M211`` at
-    all** — byte-for-byte what the printer's own touchscreen jog sends, which
-    stops at the travel limit. Bambuddy no longer disables the firmware's soft
-    endstops, and it no longer sends ``M211 S1`` either: that was an unverified
-    attempt to re-enable a printer left disabled by an older build, and on real
-    hardware the jog moved past the limit *with* it. If a printer still jogs
-    past its limits, its endstops were disabled at the firmware level by the old
-    build — power-cycle it once to restore them; from then on Bambuddy leaves
-    them alone.
+    Soft-endstop policy (#2579). **Nothing clamps this move.** Bambu's firmware
+    does not enforce its soft endstops on G-code arriving over MQTT — measured
+    by logging the exact bytes to an H2D sitting at its Z limit: a clean
+    ``G91 / G1 Z-1.00 F600 / G90`` with no ``M211`` ran straight past, while the
+    printer's own touchscreen refuses the identical move, because the
+    touchscreen goes through the motion planner and ``gcode_line`` does not.
+    Push-status carries no axis position either, so there is nothing to clamp
+    against on this side. Treat every jog as unguarded; the jog popover says so
+    to the user, and a dead-reckoning clamp (track Z from a home, refuse
+    out-of-range moves) is the only real fix and is not built.
 
-    Direction handling: on bed-on-Z printers (X1 / P1 / H2 family) the bed
-    is the Z-axis, and Bambu's home convention puts Z=0 at the top with
-    Z+ moving the bed down — so a frontend "Up" (decrease gap) maps
-    naturally to ``G1 Z-``. On bed-slingers (A1 / A1 Mini) the Z-axis is
-    the *toolhead*, and ``G1 Z-`` instead drives the nozzle DOWN into the
-    bed (#1334 reported exactly that crash). For those models we invert
-    the sign before emitting the G-code, so the UI semantics stay the
-    same regardless of which part physically moves.
+    What Bambuddy stopped doing is making it worse. The old code wrapped every
+    move in ``M211 S0`` / ``M211 S1`` and the UI sent ``force`` on every jog, so
+    the limits came off on every bed move — and ``M211 S0`` disables them
+    *globally*, which broke the touchscreen's protection too until the printer
+    was power-cycled. That is the one genuine Bambuddy bug in #2579. This
+    endpoint now emits a bare relative move and never touches ``M211`` at all,
+    which leaves the touchscreen protected. It does not send ``M211 S1``
+    either: that was an unverified attempt to re-enable a printer an older
+    build had disabled, and on real hardware the jog moved past the limit
+    *with* it. A printer left in that state is recovered with one power cycle.
+
+    Direction (#1334, and the API half of it reported by @AQU4R1U5). ``Z``
+    is the nozzle-to-bed gap on every Bambu model, by definition of the
+    coordinate system rather than by convention: ``G1 Z+`` opens the gap
+    whether the bed drops away (X1 / P1 / H2, where Bambu's end G-code
+    parks with ``G1 Z{max_layer_z + 100}``) or the toolhead rises
+    (A1 / A1 Mini / A2L). The finish-photo plate restore relies on exactly
+    that and needs no model branch — see ``_restore_plate_for_finish_photo``.
+
+    So ``distance`` goes onto the wire unchanged, and one API call means one
+    physical thing on every printer: positive is always the safe direction.
+    This endpoint used to invert the sign on A1 models, which made a
+    documented model-independent parameter mean the opposite thing there —
+    ``distance=5``, asking for clearance, drove the toolhead at the plate.
+
+    What #1334 actually reported is a *label* problem, and it belongs to the
+    UI: the arrow says "move the plate up", and on a bed-slinger the plate
+    does not move in Z at all, so closing the gap shows up as the toolhead
+    diving. Which way an arrow points is a question about the machine in
+    front of the user, not about the G-code, so the printer card decides it
+    (``isBedSlinger`` in ``frontend/src/utils/bedSlinger.ts``) and sends the
+    gap it wants. Nothing here needs to know the model.
     """
     if distance == 0 or abs(distance) > 200:
         raise HTTPException(400, "Distance must be non-zero and ≤ 200 mm")
@@ -3615,14 +4194,10 @@ async def bed_jog(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    from backend.app.services.printer_manager import is_bed_slinger
-
-    gcode_distance = -distance if is_bed_slinger(printer.model) else distance
-
-    # Bare relative move — exactly what the touchscreen sends. Never touch M211
-    # (#2579): the firmware keeps its soft endstops on by default and clamps the
-    # move at the travel limit.
-    lines = ["G91", f"G1 Z{gcode_distance:.2f} F600", "G90"]
+    # Bare relative move, never M211 (#2579). Not because a bare move is safe —
+    # the firmware ignores soft endstops on MQTT G-code either way — but because
+    # M211 S0 disabled them globally, taking the touchscreen's limits with it.
+    lines = ["G91", f"G1 Z{distance:.2f} F600", "G90"]
 
     if not client.send_gcode("\n".join(lines)):
         raise HTTPException(500, "Failed to send bed-jog command")
@@ -3657,9 +4232,9 @@ async def xy_jog(
     if y:
         axes.append(f"Y{y:.2f}")
 
-    # Bare relative move — never touch M211 (#2579). The firmware keeps its soft
-    # endstops on by default and clamps the move at the travel limit; a printer
-    # left disabled by an older build is recovered with a power cycle.
+    # Bare relative move, never M211 (#2579) — see the bed-jog docstring. The
+    # firmware does not enforce soft endstops on MQTT G-code, so this move is
+    # unguarded; M211 S0 only widened that to the touchscreen as well.
     if not client.send_gcode("\n".join(["G91", f"G1 {' '.join(axes)} F6000", "G90"])):
         raise HTTPException(500, "Failed to send XY jog command")
 
@@ -3792,6 +4367,47 @@ async def get_printable_objects(
 
     # Reload objects from 3MF if requested or no objects loaded
     if reload or not client.state.printable_objects:
+        # The archive of a running print normally holds the very file the
+        # printer is executing, so ask the disk before asking the printer:
+        # the fan-out below pulls the whole 3MF over FTPS from a machine that
+        # is mid-print — 15 MB on the print this was written for — and on a
+        # printer that kept the file on internal storage it cannot succeed at
+        # all. skipped_objects is deliberately left alone: a reload is
+        # not a new print, and the list of what the user already skipped only
+        # lives here.
+        from backend.app.models.archive import PrintArchive
+        from backend.app.services.archive import extract_printable_objects_from_archive
+
+        subtask_id = str(getattr(client.state, "subtask_id", "") or "").strip()
+        if subtask_id not in ("", "0"):
+            archive = await db.scalar(
+                select(PrintArchive)
+                .where(
+                    PrintArchive.printer_id == printer_id,
+                    PrintArchive.status == "printing",
+                    PrintArchive.subtask_id == subtask_id,
+                )
+                .order_by(PrintArchive.created_at.desc())
+                .limit(1)
+            )
+            if archive is not None:
+                objects, bbox_all = extract_printable_objects_from_archive(
+                    settings.base_dir / archive.file_path,
+                    plate_number=resolve_plate_id(client.state),
+                )
+                if objects:
+                    client.state.printable_objects = objects
+                    client.state.printable_objects_bbox_all = bbox_all
+                    logger.info(
+                        "Reloaded %s objects for printer %s from archive %s",
+                        len(objects),
+                        printer_id,
+                        archive.id,
+                    )
+
+    # Only when the disk could not answer: a `reload=true` that the archive
+    # satisfied has already refreshed from the file the printer is running.
+    if not client.state.printable_objects:
         subtask_name = client.state.subtask_name
         if subtask_name:
             from backend.app.services.archive import extract_printable_objects_from_3mf
@@ -4019,19 +4635,12 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
             return
 
         # Compute nozzle/extruder once — used by both local and Spoolman lookup.
-        nozzle_diameter = "0.4"
-        if state.nozzles:
-            nd = state.nozzles[0].nozzle_diameter
-            if nd:
-                nozzle_diameter = nd
-
-        slot_extruder = None
-        if state.ams_extruder_map:
-            if ams_id == 255:
-                # External slots: ext-L (tray 0) → extruder 1, ext-R (tray 1) → extruder 0
-                slot_extruder = 1 - slot_id
-            else:
-                slot_extruder = state.ams_extruder_map.get(str(ams_id))
+        # Shared with every other slot-configuring path (services.slot_nozzle),
+        # so the diameter this cascade filters on is the one the slot's own
+        # hotend actually has.
+        slot_nozzle = resolve_slot_nozzle(state, ams_id, slot_id, printer_manager.get_model(printer_id))
+        nozzle_diameter = slot_nozzle.diameter
+        resolved_extruder = slot_nozzle.extruder
 
         # 3-stage K-profile cascade: local SpoolKProfile → Spoolman SpoolmanKProfile
         # → live tray.cali_idx fallback. Pre-Phase-13 only handled the local path
@@ -4070,7 +4679,7 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
                     tag_filters.append(Spool.tag_uid == norm_tag)
                 if tag_filters:
                     tag_lookup = await db.execute(
-                        sa_select(Spool).options(selectinload(Spool.k_profiles)).where(or_(*tag_filters)).limit(1)
+                        select(Spool).options(selectinload(Spool.k_profiles)).where(or_(*tag_filters)).limit(1)
                     )
                     spool = tag_lookup.scalar_one_or_none()
                     if spool is not None:
@@ -4092,9 +4701,11 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
                 exact_kp = None
                 fallback_kp = None
                 for kp in spool.k_profiles:
+                    if not slot_nozzle.flow_matches(kp.nozzle_type):
+                        continue
                     if kp.printer_id != printer_id or kp.nozzle_diameter != nozzle_diameter or kp.cali_idx is None:
                         continue
-                    if slot_extruder is not None and kp.extruder is not None and kp.extruder == slot_extruder:
+                    if resolved_extruder is not None and kp.extruder is not None and kp.extruder == resolved_extruder:
                         exact_kp = kp
                         break
                     if fallback_kp is None:
@@ -4112,7 +4723,7 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
             # including the tag-based fallback above)
             if matching_cali_idx is None and spool is None:
                 sm_result = await db.execute(
-                    sa_select(SpoolmanSlotAssignment).where(
+                    select(SpoolmanSlotAssignment).where(
                         SpoolmanSlotAssignment.printer_id == printer_id,
                         SpoolmanSlotAssignment.ams_id == ams_id,
                         SpoolmanSlotAssignment.tray_id == slot_id,
@@ -4128,7 +4739,11 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
                     )
                     for kp in kp_result.scalars().all():
                         if kp.nozzle_diameter == nozzle_diameter:
-                            if slot_extruder is not None and kp.extruder is not None and kp.extruder != slot_extruder:
+                            if (
+                                resolved_extruder is not None
+                                and kp.extruder is not None
+                                and kp.extruder != resolved_extruder
+                            ):
                                 continue
                             if kp.cali_idx is not None:
                                 matching_cali_idx = kp.cali_idx
@@ -4187,10 +4802,32 @@ async def _apply_pa_after_refresh(printer_id: int, ams_id: int, slot_id: int):
         logger.warning("Failed to apply PA profile after RFID re-read: %s", e)
 
 
+# 24-27 are the A2L AMS-Lite slots (normalised unit 6 = 6*4+slot); see
+# a2l-am-unit-16. They are valid global tray ids alongside the regular 0-15.
+_LOAD_TRAY_ID_ERROR = "tray_id must be 0..15 (AMS slot), 24..27 (A2L AMS-Lite), 254 (external / Ext-L), or 255 (Ext-R)"
+
+
+def _is_valid_load_tray_id(tray_id: int) -> bool:
+    """Whether ``tray_id`` names a slot the load/unload commands can address."""
+    return tray_id in range(16) or tray_id in range(24, 28) or tray_id in (254, 255)
+
+
 @router.post("/{printer_id}/ams/load")
 async def ams_load(
     printer_id: int,
     tray_id: int = Query(..., description="Tray ID: 0-15 for AMS slots (ams_id*4+slot_id), 254 for external spool"),
+    extruder_id: int | None = Query(
+        None,
+        ge=0,
+        le=1,
+        description=(
+            "Hotend to feed: 0 = right/main, 1 = left/deputy. Only meaningful "
+            "on a printer with a Filament Track Switch fitted, where the AMS is "
+            "bound to a switch inlet rather than a hotend and the firmware "
+            "cannot work the target out for itself. Omit on every other printer "
+            "— the field is absent from BambuStudio's own command there too."
+        ),
+    ),
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
 ):
@@ -4201,12 +4838,8 @@ async def ams_load(
     - 254: external spool (single-external printers, or Ext-L on dual-nozzle H2D)
     - 255: Ext-R on dual-nozzle H2D
     """
-    # 24-27 are the A2L AMS-Lite slots (normalised unit 6 = 6*4+slot); see
-    # a2l-am-unit-16. They are valid global tray ids alongside the regular 0-15.
-    if tray_id not in range(16) and tray_id not in range(24, 28) and tray_id not in (254, 255):
-        raise HTTPException(
-            400, "tray_id must be 0..15 (AMS slot), 24..27 (A2L AMS-Lite), 254 (external / Ext-L), or 255 (Ext-R)"
-        )
+    if not _is_valid_load_tray_id(tray_id):
+        raise HTTPException(400, _LOAD_TRAY_ID_ERROR)
 
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
     printer = result.scalar_one_or_none()
@@ -4217,7 +4850,7 @@ async def ams_load(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.ams_load_filament(tray_id)
+    success = client.ams_load_filament(tray_id, extruder_id=extruder_id)
     if not success:
         raise HTTPException(500, "Failed to send load command")
 
@@ -4233,10 +4866,23 @@ async def ams_load(
 @router.post("/{printer_id}/ams/unload")
 async def ams_unload(
     printer_id: int,
+    tray_id: int | None = Query(
+        None,
+        description=(
+            "Tray ID of the slot to unload, same encoding as the load endpoint. "
+            "Identifies which hotend to unload on a dual-nozzle printer, where "
+            "both can hold filament at once and the printer's single tray_now "
+            "field names only one of them. Omit to unload whatever tray_now "
+            "names, which is the only option a single-nozzle printer has."
+        ),
+    ),
     _=RequirePermissionIfAuthEnabled(Permission.PRINTERS_CONTROL),
     db: AsyncSession = Depends(get_db),
 ):
-    """Unload the currently loaded filament."""
+    """Unload the filament in a given slot, or the currently loaded one."""
+    if tray_id is not None and not _is_valid_load_tray_id(tray_id):
+        raise HTTPException(400, _LOAD_TRAY_ID_ERROR)
+
     result = await db.execute(select(Printer).where(Printer.id == printer_id))
     printer = result.scalar_one_or_none()
     if not printer:
@@ -4246,8 +4892,13 @@ async def ams_unload(
     if not client:
         raise HTTPException(400, "Printer not connected")
 
-    success = client.ams_unload_filament()
+    success = client.ams_unload_filament(tray_id)
     if not success:
+        # A named slot that no hotend is fed from is a no-op, not a fault: the
+        # menu is per-slot and the operator may well have clicked one that is
+        # not loaded. Say so instead of returning a 500 they cannot act on.
+        if tray_id is not None:
+            raise HTTPException(409, "No hotend is loaded from that slot")
         raise HTTPException(500, "Failed to send unload command")
 
     return {"success": True, "message": "Unloading filament"}

@@ -8,7 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type React from 'react';
-import { screen, waitFor, render as rtlRender } from '@testing-library/react';
+import { screen, waitFor, fireEvent, render as rtlRender } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { BrowserRouter } from 'react-router-dom';
@@ -148,6 +148,33 @@ describe('PrintModal', () => {
       // Get the submit button specifically (not printer selection buttons)
       const submitButton = screen.getByRole('button', { name: /^print$/i });
       expect(submitButton).toBeInTheDocument();
+    });
+
+    it('explains and blocks printing when billing has no printable cost center', async () => {
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json({
+          billing_enabled: true,
+          default_filament_cost: 25,
+          currency: 'USD',
+        })),
+        http.get('/api/v1/finance/cost-centers/mine', () => HttpResponse.json([])),
+      );
+
+      render(
+        <PrintModal
+          mode="create"
+          archiveId={1}
+          archiveName="Benchy"
+          initialSelectedPrinterIds={[1]}
+          onClose={mockOnClose}
+          onSuccess={mockOnSuccess}
+        />
+      );
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'No active cost center is available for printing. Ask an administrator to grant you print access.',
+      );
+      expect(screen.getByRole('button', { name: /^print$/i })).toBeDisabled();
     });
 
     it('has cancel button', () => {
@@ -1784,14 +1811,13 @@ describe('PrintModal — per-plate filament mapping (#2551 follow-up)', () => {
         if (plateId === '2') return HttpResponse.json({ filaments: [{ ...SLOT_2_RED, used_grams: 40 }] });
         return HttpResponse.json({ filaments: [SLOT_1_RED, SLOT_2_RED] });
       }),
-      http.get('/api/v1/inventory/assignments', () =>
-        HttpResponse.json([
-          {
-            id: 1, spool_id: 1, printer_id: 1, printer_name: 'X1 Carbon', ams_id: 0, tray_id: 0,
-            fingerprint_color: null, fingerprint_type: null, configured: true,
-            spool: { id: 1, label_weight: 1000, weight_used: 940 },
-          },
-        ]),
+      http.get('/api/v1/printers/:id/inventory-remain', () =>
+        HttpResponse.json({
+          inventory_remain_g: { '0': 60 },
+          slot_materials: [
+            { ams_id: 0, tray_id: 0, global_tray_id: 0, material_key: 'preset:GFA00|color:FF0000', remaining_g: 60, extruder: 0 },
+          ],
+        }),
       ),
     );
 
@@ -1805,6 +1831,103 @@ describe('PrintModal — per-plate filament mapping (#2551 follow-up)', () => {
 
     // 80 g needed from a spool with 60 g left → the acknowledgement dialog, not a
     // silent queue.
+    await waitFor(() => expect(screen.getByText(/Not enough filament/i)).toBeInTheDocument());
+    expect(screen.getByText(/needs 80g, remaining 60g/i)).toBeInTheDocument();
+  });
+
+  // Two red trays holding the same material, so AMS Filament Backup can switch
+  // between them mid-print. Both tests below map both plates onto tray 0.
+  const twoRedTrays = (backupOn: boolean) =>
+    http.get('/api/v1/printers/:id/status', () =>
+      HttpResponse.json({
+        connected: true,
+        state: 'IDLE',
+        ams_filament_backup: backupOn,
+        ams: [{ id: 0, tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000' },
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000' },
+        ] }],
+        vt_tray: [],
+      }),
+    );
+
+  const redPool = (trayZeroGrams: number, trayOneGrams: number) =>
+    http.get('/api/v1/printers/:id/inventory-remain', () =>
+      HttpResponse.json({
+        inventory_remain_g: { '0': trayZeroGrams, '1': trayOneGrams },
+        slot_materials: [
+          { ams_id: 0, tray_id: 0, global_tray_id: 0, material_key: 'preset:GFA00|color:FF0000', remaining_g: trayZeroGrams, extruder: 0 },
+          { ams_id: 0, tray_id: 1, global_tray_id: 1, material_key: 'preset:GFA00|color:FF0000', remaining_g: trayOneGrams, extruder: 0 },
+        ],
+      }),
+    );
+
+  const bothPlatesNeedForty = http.get('/api/v1/archives/:id/filament-requirements', ({ request }) => {
+    const plateId = new URL(request.url).searchParams.get('plate_id');
+    if (plateId === '1') return HttpResponse.json({ filaments: [{ ...SLOT_1_RED, used_grams: 40 }] });
+    if (plateId === '2') return HttpResponse.json({ filaments: [{ ...SLOT_2_RED, used_grams: 40 }] });
+    return HttpResponse.json({ filaments: [SLOT_1_RED, SLOT_2_RED] });
+  });
+
+  it('lets the print through when AMS Filament Backup covers it from a peer spool', async () => {
+    // The reported block: two plates draw 80 g from a tray holding 60 g, but the
+    // slot next to it holds the same material. The firmware switches between
+    // them, and the dispatcher has pooled them since #1762 — the modal used to
+    // weigh the mapped slot alone and refused a print the dispatcher would run.
+    const queued: unknown[] = [];
+    server.use(
+      bothPlatesNeedForty,
+      twoRedTrays(true),
+      redPool(60, 1000),
+      http.post('/api/v1/queue/', async ({ request }) => {
+        queued.push(await request.json());
+        return HttpResponse.json({ id: queued.length, status: 'pending' });
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<PrintModal mode="create" archiveId={1} archiveName="Two.gcode.3mf" onClose={mockOnClose} />);
+
+    await selectBothPlates(user);
+    await waitFor(() => expect(screen.getByText(/Filament Mapping — Plate 2/)).toBeInTheDocument());
+
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+
+    await waitFor(() => expect(queued.length).toBe(2));
+    expect(screen.queryByText(/Not enough filament/i)).not.toBeInTheDocument();
+  });
+
+  it('warns against the pooled total when AMS Filament Backup still cannot cover it', async () => {
+    // Backup is on but both spools together are short. The shortfall is real, so
+    // it still has to be raised — against the pool, not the one slot, or the
+    // numbers contradict the AMS the user is looking at.
+    server.use(bothPlatesNeedForty, twoRedTrays(true), redPool(60, 10));
+
+    const user = userEvent.setup();
+    render(<PrintModal mode="create" archiveId={1} archiveName="Two.gcode.3mf" onClose={mockOnClose} />);
+
+    await selectBothPlates(user);
+    await waitFor(() => expect(screen.getByText(/Filament Mapping — Plate 2/)).toBeInTheDocument());
+
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+
+    await waitFor(() => expect(screen.getByText(/Not enough filament/i)).toBeInTheDocument());
+    expect(screen.getByText(/needs 80g, 70g available across matching spools/i)).toBeInTheDocument();
+  });
+
+  it('keeps weighing the mapped slot alone when AMS Filament Backup is off', async () => {
+    // Same two spools, backup off: the firmware will not switch, so the peer's
+    // grams are not available to this print and the warning must still fire.
+    server.use(bothPlatesNeedForty, twoRedTrays(false), redPool(60, 1000));
+
+    const user = userEvent.setup();
+    render(<PrintModal mode="create" archiveId={1} archiveName="Two.gcode.3mf" onClose={mockOnClose} />);
+
+    await selectBothPlates(user);
+    await waitFor(() => expect(screen.getByText(/Filament Mapping — Plate 2/)).toBeInTheDocument());
+
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+
     await waitFor(() => expect(screen.getByText(/Not enough filament/i)).toBeInTheDocument());
     expect(screen.getByText(/needs 80g, remaining 60g/i)).toBeInTheDocument();
   });
@@ -1985,6 +2108,402 @@ describe('PrintModal — per-plate filament override in model mode (#2552)', () 
     expect(plate1?.filament_overrides ?? null).toBeNull();
     expect(plate2?.filament_overrides).toEqual([
       expect.objectContaining({ slot_id: 2, force_color_match: true }),
+    ]);
+  });
+});
+
+describe('PrintModal — per-plate quantity (#342)', () => {
+  const mockOnClose = vi.fn();
+
+  const PLATES = {
+    is_multi_plate: true,
+    plates: [
+      { index: 1, name: 'Plate 1', has_thumbnail: false, thumbnail_url: null, objects: ['A'], filaments: [{ type: 'PLA', color: '#FF0000' }], print_time_seconds: 1800, filament_used_grams: 50 },
+      { index: 2, name: 'Plate 2', has_thumbnail: false, thumbnail_url: null, objects: ['B'], filaments: [{ type: 'PLA', color: '#FF0000' }], print_time_seconds: 1800, filament_used_grams: 50 },
+      { index: 3, name: 'Plate 3', has_thumbnail: false, thumbnail_url: null, objects: ['C'], filaments: [{ type: 'PLA', color: '#FF0000' }], print_time_seconds: 1800, filament_used_grams: 50 },
+    ],
+  };
+
+  const renderModal = (ui: React.ReactElement) => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    queryClient.setQueryData(['archive-plates', 1], PLATES);
+    return rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <AuthProvider>
+            <ThemeProvider>
+              <ToastProvider>{ui}</ToastProvider>
+            </ThemeProvider>
+          </AuthProvider>
+        </BrowserRouter>
+      </QueryClientProvider>,
+    );
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(mockPrinters)),
+      http.get('/api/v1/archives/:id/plates', () => HttpResponse.json(PLATES)),
+      http.get('/api/v1/archives/:id/filament-requirements', () =>
+        HttpResponse.json({ filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', tray_info_idx: '', used_grams: 50 }] }),
+      ),
+      http.get('/api/v1/printers/available-filaments', () => HttpResponse.json([])),
+      http.post('/api/v1/queue/batches', () => HttpResponse.json({ id: 42, name: 'Order', status: 'active' })),
+      http.post('/api/v1/queue/', () => HttpResponse.json({ id: 1, status: 'pending' })),
+    );
+  });
+
+  const qtyInput = (plateName: string) =>
+    screen.getByRole('spinbutton', { name: new RegExp(plateName, 'i') });
+
+  it('replaces the single Quantity field with one control per selected plate', async () => {
+    const user = userEvent.setup();
+    renderModal(<PrintModal mode="create" archiveId={1} archiveName="Three.gcode.3mf" onClose={mockOnClose} />);
+
+    await waitFor(() => expect(screen.getByText('Plate 2')).toBeInTheDocument());
+    // Plate 1 is auto-selected and already carries its own quantity control.
+    expect(qtyInput('Plate 1')).toBeInTheDocument();
+    // The global field is gone — two controls for the same number would be ambiguous.
+    expect(screen.queryByLabelText(/^Quantity$/i)).not.toBeInTheDocument();
+    // Unselected plates have no control.
+    expect(screen.queryByRole('spinbutton', { name: /Plate 2/i })).not.toBeInTheDocument();
+
+    await user.click(screen.getByText('Plate 2'));
+    await waitFor(() => expect(qtyInput('Plate 2')).toBeInTheDocument());
+  });
+
+  it('keeps the single Quantity field for a single-plate file', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    queryClient.setQueryData(['archive-plates', 1], { is_multi_plate: false, plates: [] });
+    rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <AuthProvider>
+            <ThemeProvider>
+              <ToastProvider>
+                <PrintModal mode="create" archiveId={1} archiveName="One.gcode.3mf" onClose={mockOnClose} />
+              </ToastProvider>
+            </ThemeProvider>
+          </AuthProvider>
+        </BrowserRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText(/^Quantity$/i)).toBeInTheDocument());
+  });
+
+  it('queues the reporter\'s example: plate 1 once, plate 2 twice, plate 3 three times', async () => {
+    type Queued = { plate_id: number | null; quantity?: number; batch_id?: number };
+    type OrderBody = { plates?: Array<{ plate_id: number | null; quantity_target: number }> };
+    const queued: Queued[] = [];
+    let order: OrderBody | null = null;
+    server.use(
+      http.post('/api/v1/queue/batches', async ({ request }) => {
+        order = (await request.json()) as OrderBody;
+        return HttpResponse.json({ id: 42, name: 'Order', status: 'active' });
+      }),
+      http.post('/api/v1/queue/', async ({ request }) => {
+        queued.push((await request.json()) as Queued);
+        return HttpResponse.json({ id: queued.length, status: 'pending' });
+      }),
+    );
+
+    const user = userEvent.setup();
+    renderModal(<PrintModal mode="create" archiveId={1} archiveName="Three.gcode.3mf" onClose={mockOnClose} />);
+
+    await waitFor(() => expect(screen.getByText('Plate 2')).toBeInTheDocument());
+    await user.click(screen.getByText('Plate 2'));
+    await user.click(screen.getByText('Plate 3'));
+
+    fireEvent.change(qtyInput('Plate 2'), { target: { value: '2' } });
+    fireEvent.change(qtyInput('Plate 3'), { target: { value: '3' } });
+
+    await waitFor(() => expect(screen.getByText(/6 runs in total/i)).toBeInTheDocument());
+
+    await user.click(screen.getAllByRole('button', { name: /X1 Carbon/i })[0]);
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+
+    await waitFor(() => expect(queued.length).toBe(3));
+
+    // The order records the intent, so a failed run still reads as owed.
+    expect(order!.plates).toEqual([
+      expect.objectContaining({ plate_id: 1, quantity_target: 1 }),
+      expect.objectContaining({ plate_id: 2, quantity_target: 2 }),
+      expect.objectContaining({ plate_id: 3, quantity_target: 3 }),
+    ]);
+
+    // ...and the runs are dispatched immediately, one call per plate carrying
+    // that plate's own count. Quantity 1 is left off the payload as before.
+    const byPlate = Object.fromEntries(queued.map((q) => [q.plate_id, q]));
+    expect(byPlate[1].quantity).toBeUndefined();
+    expect(byPlate[2].quantity).toBe(2);
+    expect(byPlate[3].quantity).toBe(3);
+    expect(queued.every((q) => q.batch_id === 42)).toBe(true);
+  });
+
+  it('does not multiply per-plate counts across a multi-printer fan-out', async () => {
+    type Queued = { plate_id: number | null; quantity?: number; printer_id: number | null };
+    const queued: Queued[] = [];
+    server.use(
+      http.post('/api/v1/queue/', async ({ request }) => {
+        queued.push((await request.json()) as Queued);
+        return HttpResponse.json({ id: queued.length, status: 'pending' });
+      }),
+    );
+
+    const user = userEvent.setup();
+    renderModal(<PrintModal mode="create" archiveId={1} archiveName="Three.gcode.3mf" onClose={mockOnClose} />);
+
+    await waitFor(() => expect(screen.getByText('Plate 2')).toBeInTheDocument());
+    await user.click(screen.getByText('Plate 2'));
+    fireEvent.change(qtyInput('Plate 2'), { target: { value: '4' } });
+
+    // Two printers: the printer count already answers "how many".
+    await user.click(screen.getAllByRole('button', { name: /X1 Carbon/i })[0]);
+    await user.click(screen.getAllByRole('button', { name: /P1S/i })[0]);
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+
+    await waitFor(() => expect(queued.length).toBe(4)); // 2 plates × 2 printers
+    expect(queued.every((q) => q.quantity === undefined)).toBe(true);
+  });
+});
+
+describe('PrintModal — override survives "Any model" -> "Specific Printer" (#3133)', () => {
+  const mockOnClose = vi.fn();
+
+  const PRINTERS = [
+    { id: 1, name: 'Printer 01', model: 'P2S', ip_address: '192.168.1.101', enabled: true, is_active: true },
+    { id: 2, name: 'Printer 02', model: 'X1C', ip_address: '192.168.1.102', enabled: true, is_active: true },
+  ];
+  const BROWN = '#8B4513';
+  const BONE_WHITE = '#F5F5DC';
+  // The 3MF was sliced in brown; the user asked for Bone White.
+  const SLOT_1_BROWN = { slot_id: 1, type: 'PLA', color: BROWN, tray_info_idx: 'GFA00', used_grams: 50 };
+
+  type Patched = {
+    printer_id?: number | null;
+    target_model?: string | null;
+    ams_mapping?: number[] | null;
+    filament_overrides?: Array<{ slot_id: number; type: string; color: string }> | null;
+  };
+  let patched: Patched[];
+  let posted: Patched[];
+
+  const statusWith = (trays: Array<{ id: number; tray_type: string; tray_color: string }>) =>
+    HttpResponse.json({ connected: true, state: 'IDLE', ams: [{ id: 0, tray: trays }], vt_tray: [] });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    patched = [];
+    posted = [];
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(PRINTERS)),
+      http.get('/api/v1/archives/:id/plates', () => HttpResponse.json({ is_multi_plate: false, plates: [] })),
+      http.get('/api/v1/archives/:id/filament-requirements', () => HttpResponse.json({ filaments: [SLOT_1_BROWN] })),
+      http.get('/api/v1/printers/available-filaments', () =>
+        HttpResponse.json([
+          { type: 'PLA', color: BROWN, tray_info_idx: 'GFA00', tray_sub_brands: 'PLA Basic', extruder_id: null },
+          { type: 'PLA', color: BONE_WHITE, tray_info_idx: 'GFA00', tray_sub_brands: 'PLA Basic', extruder_id: null },
+        ]),
+      ),
+      // Printer 01 has both colours loaded; brown is first, so a match against
+      // the 3MF picks tray 0 and a match against the override picks tray 1.
+      http.get('/api/v1/printers/:id/status', () =>
+        statusWith([
+          { id: 0, tray_type: 'PLA', tray_color: '8B4513FF' },
+          { id: 1, tray_type: 'PLA', tray_color: 'F5F5DCFF' },
+        ]),
+      ),
+      http.get('/api/v1/printers/:id/assignments', () => HttpResponse.json([])),
+      http.patch('/api/v1/queue/:id', async ({ request }) => {
+        patched.push((await request.json()) as Patched);
+        return HttpResponse.json({ id: 1, status: 'pending' });
+      }),
+      http.post('/api/v1/queue/', async ({ request }) => {
+        posted.push((await request.json()) as Patched);
+        return HttpResponse.json({ id: 1, status: 'pending' });
+      }),
+    );
+  });
+
+  const anyP2SItem = () =>
+    createMockQueueItem({
+      printer_id: null,
+      target_model: 'P2S',
+      filament_overrides: [{ slot_id: 1, type: 'PLA', color: BONE_WHITE, force_color_match: false }],
+    } as Partial<PrintQueueItem>);
+
+  const moveToPrinter01 = async (user: ReturnType<typeof userEvent.setup>) => {
+    await user.click(await screen.findByRole('button', { name: /specific printer/i }));
+    await user.click(await screen.findByText('Printer 01'));
+  };
+
+  const submit = async (user: ReturnType<typeof userEvent.setup>) => {
+    await user.click(document.querySelector('button[type="submit"]') as HTMLElement);
+  };
+
+  it('matches the chosen printer against the override and keeps it on the item', async () => {
+    const user = userEvent.setup();
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={anyP2SItem()} onClose={mockOnClose} />);
+
+    await moveToPrinter01(user);
+    // Wait for the mapping to settle on the printer's trays before saving.
+    await waitFor(() => expect(screen.getByText(/filament mapping/i)).toBeInTheDocument());
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    expect(patched[0].printer_id).toBe(1);
+    expect(patched[0].target_model).toBeNull();
+    // Tray 1 is the Bone White spool. Matching the 3MF would have taken tray 0.
+    expect(patched[0].ams_mapping).toEqual([1]);
+    expect(patched[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, type: 'PLA', color: BONE_WHITE }),
+    ]);
+  });
+
+  it('keeps the requested colour when the printer has no such spool', async () => {
+    server.use(
+      http.get('/api/v1/printers/:id/status', () =>
+        statusWith([
+          { id: 0, tray_type: 'PLA', tray_color: '8B4513FF' },
+          { id: 1, tray_type: 'PLA', tray_color: '000000FF' },
+        ]),
+      ),
+    );
+    const user = userEvent.setup();
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={anyP2SItem()} onClose={mockOnClose} />);
+
+    await moveToPrinter01(user);
+    await waitFor(() => expect(screen.getByText(/filament mapping/i)).toBeInTheDocument());
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    // Still asked for, so the scheduler's recompute at dispatch looks for it too
+    // instead of settling on the brown the 3MF was sliced with.
+    expect(patched[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, color: BONE_WHITE }),
+    ]);
+  });
+
+  it('still drops the override when the job moves to a different model', async () => {
+    const user = userEvent.setup();
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={anyP2SItem()} onClose={mockOnClose} />);
+
+    const modelSelect = await waitFor(() => {
+      const select = screen
+        .getAllByRole('combobox')
+        .find((el) => (el as HTMLSelectElement).options[0]?.text === 'Select a model...');
+      if (!select) throw new Error('target model select not rendered');
+      return select as HTMLSelectElement;
+    });
+    // The override was picked from P2S's loaded filaments; X1C's are another list.
+    await user.selectOptions(modelSelect, 'X1C');
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    expect(patched[0].target_model).toBe('X1C');
+    expect(patched[0].filament_overrides ?? null).toBeNull();
+  });
+
+  it("keeps a virtual printer's variant pin when its specific-printer job is saved", async () => {
+    // A VP with force colour on writes the 3MF's own filament back as an
+    // override, tray_info_idx included, to tell PLA variants apart (#2650). Two
+    // brown trays differ only by variant; the job was sliced for Matte (GFA01).
+    server.use(
+      http.get('/api/v1/archives/:id/filament-requirements', () =>
+        HttpResponse.json({ filaments: [{ ...SLOT_1_BROWN, tray_info_idx: 'GFA01' }] }),
+      ),
+      http.get('/api/v1/printers/:id/status', () =>
+        HttpResponse.json({
+          connected: true,
+          state: 'IDLE',
+          ams: [{ id: 0, tray: [
+            { id: 0, tray_type: 'PLA', tray_color: '8B4513FF', tray_info_idx: 'GFA00' },
+            { id: 1, tray_type: 'PLA', tray_color: '8B4513FF', tray_info_idx: 'GFA01' },
+          ] }],
+          vt_tray: [],
+        }),
+      ),
+    );
+    const vpItem = createMockQueueItem({
+      printer_id: 1,
+      target_model: null,
+      filament_overrides: [
+        { slot_id: 1, type: 'PLA', color: BROWN, tray_info_idx: 'GFA01', force_color_match: true },
+      ],
+    } as Partial<PrintQueueItem>);
+    const user = userEvent.setup();
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={vpItem} onClose={mockOnClose} />);
+
+    await waitFor(() => expect(screen.getByText(/filament mapping/i)).toBeInTheDocument());
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    // Not treated as a swap: the matcher still pins the Matte tray...
+    expect(patched[0].ams_mapping).toEqual([1]);
+    // ...and the row keeps the pin rather than losing it on save.
+    expect(patched[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, color: BROWN, tray_info_idx: 'GFA01', force_color_match: true }),
+    ]);
+  });
+
+  it("keeps a virtual printer's variant pin when its any-model job is saved", async () => {
+    const vpItem = createMockQueueItem({
+      printer_id: null,
+      target_model: 'P2S',
+      filament_overrides: [
+        { slot_id: 1, type: 'PLA', color: BROWN, tray_info_idx: 'GFA01', force_color_match: true },
+      ],
+    } as Partial<PrintQueueItem>);
+    const user = userEvent.setup();
+    render(<PrintModal mode="edit-queue-item" archiveId={1} archiveName="Job" queueItem={vpItem} onClose={mockOnClose} />);
+
+    await waitFor(() => expect(screen.getByText('Filament Override')).toBeInTheDocument());
+    await submit(user);
+
+    await waitFor(() => expect(patched).toHaveLength(1));
+    expect(patched[0].target_model).toBe('P2S');
+    expect(patched[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, tray_info_idx: 'GFA01', force_color_match: true }),
+    ]);
+  });
+
+  it('carries an override picked in model mode into a specific-printer job when creating', async () => {
+    const user = userEvent.setup();
+    render(<PrintModal mode="create" archiveId={1} archiveName="Job" onClose={mockOnClose} />);
+
+    await user.click(await screen.findByRole('button', { name: /any model/i }));
+    const modelSelect = await waitFor(() => {
+      const select = screen
+        .getAllByRole('combobox')
+        .find((el) => (el as HTMLSelectElement).options[0]?.text === 'Select a model...');
+      if (!select) throw new Error('target model select not rendered');
+      return select as HTMLSelectElement;
+    });
+    await user.selectOptions(modelSelect, 'P2S');
+    const overrideSelect = await waitFor(() => {
+      const select = screen
+        .getAllByRole('combobox')
+        .find((el) => [...(el as HTMLSelectElement).options].some((o) => o.value === `PLA|${BONE_WHITE}`));
+      if (!select) throw new Error('override select not rendered');
+      return select as HTMLSelectElement;
+    });
+    await user.selectOptions(overrideSelect, `PLA|${BONE_WHITE}`);
+
+    await moveToPrinter01(user);
+    await waitFor(() => expect(screen.getByText(/filament mapping/i)).toBeInTheDocument());
+    await submit(user);
+
+    await waitFor(() => expect(posted).toHaveLength(1));
+    expect(posted[0].printer_id).toBe(1);
+    expect(posted[0].ams_mapping).toEqual([1]);
+    expect(posted[0].filament_overrides).toEqual([
+      expect.objectContaining({ slot_id: 1, type: 'PLA', color: BONE_WHITE }),
     ]);
   });
 });

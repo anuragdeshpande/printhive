@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
   Plus, Loader2, Trash2, Archive, RotateCcw, Edit2, Package,
@@ -12,9 +12,10 @@ import {
 import { isAndroidWebclient, triggerHaptic, requestNfcScan } from '../utils/androidBridge';
 import { ForecastPanel } from '../components/ForecastPanel';
 import { api, spoolbuddyApi, ApiError } from '../api/client';
-import type { InventorySpool, SpoolCatalogEntry } from '../api/client';
+import type { InventorySpool, SpoolCatalogEntry, LocationHASensorReading } from '../api/client';
 import { Button } from '../components/Button';
 import { FilamentSwatch } from '../components/FilamentSwatch';
+import { describeHASensorReading, iconForHASensor } from '../utils/haSensorDisplay';
 import { buildFilamentBackground } from '../components/filamentSwatchHelpers';
 import {SpoolFormModal, type SpoolFormMode} from '../components/SpoolFormModal';
 import { ConfirmModal } from '../components/ConfirmModal';
@@ -25,7 +26,8 @@ import { LocationsModal } from '../components/LocationsModal';
 import { BulkEditSpoolsModal } from '../components/BulkEditSpoolsModal';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
-import { resolveSpoolColorName } from '../utils/colors';
+import { colorSortKey, resolveSpoolColorName } from '../utils/colors';
+import { useColorCatalogVersion } from '../hooks/useColorCatalogVersion';
 import { getCurrencySymbol } from '../utils/currency';
 import { formatDateInput, parseUTCDate, type DateFormat } from '../utils/date';
 import { formatSlotLabel } from '../utils/amsHelpers';
@@ -35,6 +37,12 @@ import {
   invalidateSpoolAndLocationQueries,
 } from '../utils/inventoryQueries';
 import { aggregateGroupSpool } from '../utils/inventoryGrouping';
+import {
+  locationSensorReadingAlertStatus,
+  locationSensorValueColorClass,
+  useLocationSensorColorPrefs,
+  type LocationSensorAlertColor,
+} from '../utils/locationSensorDefaults';
 
 type ArchiveFilter = 'active' | 'archived';
 type UsageFilter = 'all' | 'used' | 'new' | 'lowstock';
@@ -80,6 +88,9 @@ const DEFAULT_COLUMNS: ColumnConfig[] = [
   { id: 'slicer_filament', label: 'Slicer Filament', visible: false },
   { id: 'location', label: 'Location', visible: true },
   { id: 'storage_location', label: 'Storage Location', visible: false },
+  { id: 'temperature', label: 'Temperature', visible: false },
+  { id: 'humidity', label: 'Humidity', visible: false },
+  { id: 'battery', label: 'Battery', visible: false },
   { id: 'label_weight', label: 'Label', visible: true },
   { id: 'net', label: 'Net', visible: true },
   { id: 'gross', label: 'Gross', visible: false },
@@ -108,9 +119,21 @@ function loadColumnConfig(): ColumnConfig[] {
       const storedIds = new Set(parsed.map((c) => c.id));
       // Keep stored columns that still exist in defaults
       const validStored = parsed.filter((c) => defaultIds.has(c.id));
-      // Add any new default columns not in stored config
-      const newColumns = DEFAULT_COLUMNS.filter((c) => !storedIds.has(c.id));
-      return [...validStored, ...newColumns];
+      const merged = [...validStored];
+      for (const col of DEFAULT_COLUMNS) {
+        if (storedIds.has(col.id)) continue;
+        const defaultIndex = DEFAULT_COLUMNS.indexOf(col);
+        let insertAt = merged.length;
+        for (let i = defaultIndex - 1; i >= 0; i--) {
+          const idx = merged.findIndex((c) => c.id === DEFAULT_COLUMNS[i].id);
+          if (idx !== -1) {
+            insertAt = idx + 1;
+            break;
+          }
+        }
+        merged.splice(insertAt, 0, col);
+      }
+      return merged;
     }
   } catch {
     // Ignore errors
@@ -169,10 +192,15 @@ type CellCtx = {
   pct: number;
   assignmentMap: Record<number, LocationDisplay>;
   catalogMap: Record<number, SpoolCatalogEntry>;
+  locationReadingsMap: Record<number, LocationHASensorReading[]>;
   currencySymbol: string;
   dateFormat: DateFormat;
   t: TFn;
   onSyncWeight?: (spool: InventorySpool) => void;
+  colorizeLocationSensors: boolean;
+  locationSensorAboveColor: LocationSensorAlertColor;
+  locationSensorBelowColor: LocationSensorAlertColor;
+  locationSensorOptimalColor: LocationSensorAlertColor;
 };
 
 // Column header labels (25 columns — matching SpoolBuddy exactly)
@@ -189,6 +217,9 @@ const columnHeaders: Record<string, (t: TFn) => string> = {
   slicer_filament: (t) => t('inventory.slicerFilament'),
   location: () => 'Location',
   storage_location: (t) => t('inventory.storageLocation'),
+  temperature: (t) => t('inventory.temperature'),
+  humidity: (t) => t('inventory.humidity'),
+  battery: (t) => t('inventory.battery'),
   label_weight: (t) => t('inventory.labelWeight'),
   net: (t) => t('inventory.net'),
   gross: () => 'Gross',
@@ -240,7 +271,7 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
     <span className="text-sm text-bambu-gray">{spool.subtype || '-'}</span>
   ),
   color_name: ({ spool }) => (
-    <span className="text-sm text-bambu-gray">{resolveSpoolColorName(spool.color_name, spool.rgba) || '-'}</span>
+    <span className="text-sm text-bambu-gray">{resolveSpoolColorName(spool.color_name, spool.rgba, spool.color_name_is_synthesized) || '-'}</span>
   ),
   brand: ({ spool }) => (
     <span className="text-sm text-bambu-gray">{spool.brand || '-'}</span>
@@ -268,6 +299,48 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
     return (
       <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400">
         {spool.storage_location}
+      </span>
+    );
+  },
+  temperature: ({ spool, locationReadingsMap, t, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor }) => {
+    const reading = spool.location_id
+      ? locationReadingsMap[spool.location_id]?.find((r) => r.device_class === 'temperature')
+      : undefined;
+    if (!reading) return <span className="text-sm text-bambu-gray/50">-</span>;
+    return (
+      <span
+        title={reading.name}
+        className={`text-sm ${locationSensorCellColor(reading, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor)}`}
+      >
+        {describeLocationSensor(reading, t)}
+      </span>
+    );
+  },
+  humidity: ({ spool, locationReadingsMap, t, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor }) => {
+    const reading = spool.location_id
+      ? locationReadingsMap[spool.location_id]?.find((r) => r.device_class === 'humidity')
+      : undefined;
+    if (!reading) return <span className="text-sm text-bambu-gray/50">-</span>;
+    return (
+      <span
+        title={reading.name}
+        className={`text-sm ${locationSensorCellColor(reading, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor)}`}
+      >
+        {describeLocationSensor(reading, t)}
+      </span>
+    );
+  },
+  battery: ({ spool, locationReadingsMap, t, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor }) => {
+    const reading = spool.location_id
+      ? locationReadingsMap[spool.location_id]?.find((r) => r.device_class === 'battery')
+      : undefined;
+    if (!reading) return <span className="text-sm text-bambu-gray/50">-</span>;
+    return (
+      <span
+        title={reading.name}
+        className={`text-sm ${locationSensorCellColor(reading, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor)}`}
+      >
+        {describeLocationSensor(reading, t)}
       </span>
     );
   },
@@ -405,7 +478,14 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
 };
 
 // Sort value extractors — return a comparable value for each sortable column
-const columnSortValues: Record<string, (spool: InventorySpool, assignmentMap: Record<number, LocationDisplay>) => string | number> = {
+const columnSortValues: Record<
+  string,
+  (
+    spool: InventorySpool,
+    assignmentMap: Record<number, LocationDisplay>,
+    locationReadingsMap: Record<number, LocationHASensorReading[]>
+  ) => string | number
+> = {
   id: (s) => s.id,
   added_time: (s) => s.created_at || '',
   encode_time: (s) => s.encode_time || '',
@@ -413,6 +493,10 @@ const columnSortValues: Record<string, (spool: InventorySpool, assignmentMap: Re
   material: (s) => (s.material || '').toLowerCase(),
   subtype: (s) => (s.subtype || '').toLowerCase(),
   color_name: (s) => (s.color_name || '').toLowerCase(),
+  // Sorts the swatch column itself (#2729). Multi-colour spools sort on their
+  // primary colour — extra_colors are gradient stops, and a spool has to sit in
+  // exactly one place in the list.
+  rgba: (s) => colorSortKey(s.rgba),
   brand: (s) => (s.brand || '').toLowerCase(),
   slicer_filament: (s) => (s.slicer_filament_name || s.slicer_filament || '').toLowerCase(),
   location: (s, am) => {
@@ -439,6 +523,18 @@ const columnSortValues: Record<string, (spool: InventorySpool, assignmentMap: Re
     if (s.last_scale_weight == null) return -1;
     const expectedGross = Math.max(0, s.label_weight - s.weight_used) + s.core_weight;
     return Math.abs(s.last_scale_weight - expectedGross);
+  },
+  temperature: (s, _am, lrm) => {
+    const readings = s.location_id ? lrm[s.location_id] : undefined;
+    return readings?.find((r) => r.device_class === 'temperature')?.value ?? -Infinity;
+  },
+  humidity: (s, _am, lrm) => {
+    const readings = s.location_id ? lrm[s.location_id] : undefined;
+    return readings?.find((r) => r.device_class === 'humidity')?.value ?? -Infinity;
+  },
+  battery: (s, _am, lrm) => {
+    const readings = s.location_id ? lrm[s.location_id] : undefined;
+    return readings?.find((r) => r.device_class === 'battery')?.value ?? -Infinity;
   },
 };
 
@@ -479,6 +575,9 @@ export default function InventoryPageRouter() {
 
 function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spoolmanMode?: boolean; spoolmanModeReady?: boolean }) {
   const { t } = useTranslation();
+  // The spool filter below resolves colour names through the catalog; its
+  // memo has to recompute when the catalog finishes loading (#3090).
+  const colorCatalogVersion = useColorCatalogVersion();
   const queryClient = useQueryClient();
   const { showToast } = useToast();
   const { hasPermission, loading: authLoading } = useAuth();
@@ -576,6 +675,14 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
   });
 
   const dateFormat: DateFormat = settings?.date_format || 'system';
+  const locationSensorPollIntervalMs = (settings?.location_sensor_poll_interval || 120) * 1000;
+
+  const {
+    colorize: colorizeLocationSensors,
+    aboveColor: locationSensorAboveColor,
+    belowColor: locationSensorBelowColor,
+    optimalColor: locationSensorOptimalColor,
+  } = useLocationSensorColorPrefs();
 
   // Query key and fetch function differ based on data source
   const spoolsQueryKey = spoolmanMode ? ['spoolman-inventory-spools'] : ['inventory-spools'];
@@ -944,7 +1051,13 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
         await spoolbuddyApi.updateSpoolWeight(spool.id, spool.last_scale_weight);
       }
       queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
-      const spoolName = [spool.brand, spool.material, spool.color_name].filter(Boolean).join(' ');
+      const spoolName = [
+        spool.brand,
+        spool.material,
+        resolveSpoolColorName(spool.color_name, spool.rgba, spool.color_name_is_synthesized),
+      ]
+        .filter(Boolean)
+        .join(' ');
       showToast(`Synced "${spoolName}" to scale weight`, 'success');
     } catch (e) {
       const is404 = e instanceof ApiError && e.status === 404;
@@ -1070,6 +1183,58 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     return map;
   }, [catalogEntries]);
 
+  // Not polled — it only changes via explicit create/edit/delete, all of
+  // which already invalidate this key, and it also seeds the SpoolCard
+  // footers below (same query key, so they share this fetch instead of each
+  // issuing their own).
+  const { data: locationHaSensorsList } = useQuery({
+    queryKey: ['locationHaSensors'],
+    queryFn: () => api.getLocationHASensors(),
+  });
+
+  const locationIdsWithSensors = useMemo(
+    () => new Set((locationHaSensorsList ?? []).map((s) => s.location_id)),
+    [locationHaSensorsList]
+  );
+
+  const usedLocationIds = useMemo(() => {
+    const ids = new Set<number>();
+    for (const s of spools || []) {
+      // Skip locations with no bound sensor at all — polling them would only
+      // ever come back empty, and most installs have far more storage
+      // locations than ones actually wired up to Home Assistant.
+      if (s.location_id && locationIdsWithSensors.has(s.location_id)) ids.add(s.location_id);
+    }
+    return Array.from(ids);
+  }, [spools, locationIdsWithSensors]);
+
+  // Card view always needs readings (the SpoolCard footer below reads this
+  // same cache and filters to show_on_card itself); table view only needs
+  // them when a sensor column is actually visible, since the default
+  // column config hides all three.
+  const needsLocationReadings =
+    viewMode === 'cards' ||
+    (viewMode === 'table' &&
+      columnConfig.some((c) => c.visible && (c.id === 'temperature' || c.id === 'humidity' || c.id === 'battery')));
+
+  const locationReadingsQueries = useQueries({
+    queries: usedLocationIds.map((locationId) => ({
+      queryKey: ['locationHaSensorReadings', locationId],
+      queryFn: () => api.getLocationHASensorReadings(locationId, false),
+      refetchInterval: locationSensorPollIntervalMs,
+      enabled: needsLocationReadings,
+    })),
+  });
+
+  const locationReadingsMap = useMemo(() => {
+    const map: Record<number, LocationHASensorReading[]> = {};
+    usedLocationIds.forEach((locationId, i) => {
+      const data = locationReadingsQueries[i]?.data;
+      if (data) map[locationId] = data;
+    });
+    return map;
+  }, [usedLocationIds, locationReadingsQueries]);
+
   // Top materials by weight for stat card pills
   const topMaterials = useMemo(() => {
     if (!stats) return [];
@@ -1080,6 +1245,11 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
 
   // Filtering pipeline
   const filteredSpools = useMemo(() => {
+    // Named so this memo depends on it: the global search below resolves
+    // colour names through the catalog, which `resolveSpoolColorName` reads
+    // from module state the linter cannot follow. Without it a query typed
+    // before the catalog loads keeps its empty result (#3090).
+    void colorCatalogVersion;
     let filtered = spools || [];
 
     // Archive filter
@@ -1157,7 +1327,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     }
 
     return filtered;
-  }, [spools, archiveFilter, usageFilter, materialFilter, brandFilter, categoryFilter, spoolFilter, stockFilter, storageLocationFilter, search, lowStockThreshold, storageLocations]);
+  }, [spools, archiveFilter, usageFilter, materialFilter, brandFilter, categoryFilter, spoolFilter, stockFilter, storageLocationFilter, search, lowStockThreshold, storageLocations, colorCatalogVersion]);
 
   // Reset page on filter changes
   const resetPage = () => setPageIndex(0);
@@ -1223,14 +1393,14 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     const extractor = columnSortValues[sortState.column];
     if (!extractor) return filteredSpools;
     const sorted = [...filteredSpools].sort((a, b) => {
-      const va = extractor(a, assignmentMap);
-      const vb = extractor(b, assignmentMap);
+      const va = extractor(a, assignmentMap, locationReadingsMap);
+      const vb = extractor(b, assignmentMap, locationReadingsMap);
       if (va < vb) return sortState.direction === 'asc' ? -1 : 1;
       if (va > vb) return sortState.direction === 'asc' ? 1 : -1;
       return 0;
     });
     return sorted;
-  }, [filteredSpools, sortState, assignmentMap]);
+  }, [filteredSpools, sortState, assignmentMap, locationReadingsMap]);
 
   // Group similar spools when toggle is active
   const displayItems = useMemo((): DisplayItem[] => {
@@ -1322,8 +1492,13 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
 
   return (
     <div className="p-4 md:p-8 space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+      {/* Header. Stacks below sm and the actions wrap (#2813): five buttons
+          side by side are ~600px, and nothing in that row can shrink, so on a
+          phone the header pushed past the viewport and took the whole page
+          with it -- <main> is the scroll container, so everything inside it
+          panned sideways. Same pattern the Statistics, Settings and Archives
+          headers use, and the filter bar further down this page. */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold text-white flex items-center gap-3">
             <Package className="w-7 h-7 text-bambu-green" />
@@ -1336,7 +1511,6 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           </h1>
           <p className="text-bambu-gray mt-1 text-sm">{t('inventory.subtitle')}</p>
         </div>
-
         {/* Mobile secondary actions trigger + quick add */}
         <div className="flex sm:hidden items-center gap-2">
           <button
@@ -1365,7 +1539,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
         </div>
 
         {/* Desktop actions */}
-        <div className="hidden sm:flex items-center gap-2">
+        <div className="hidden sm:flex flex-wrap items-center gap-2">
           {/* CSV import/export (#1576). Operates on Bambuddy's local inventory.
               In Spoolman mode the buttons stay visible (feature parity) but are
               disabled with a hint pointing at Spoolman's own CSV export, since
@@ -2036,7 +2210,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                       >
                         <div className="h-10 flex items-center px-4 gap-3" style={groupBannerStyle}>
                           <span className="bg-white/90 text-gray-800 px-3 py-0.5 rounded-full text-sm font-medium">
-                            {resolveSpoolColorName(rep.color_name, rep.rgba) || '-'}
+                            {resolveSpoolColorName(rep.color_name, rep.rgba, rep.color_name_is_synthesized) || '-'}
                           </span>
                         </div>
                         <div className="px-4 py-3 flex items-center justify-between">
@@ -2073,6 +2247,10 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                                 onPrintLabel={() => setLabelPickerSpoolIds([spool.id])}
                                 onCopy={() => setFormModal({ spool: spool, mode: 'copy' })}
                                 t={t}
+                                colorizeLocationSensors={colorizeLocationSensors}
+                                locationSensorAboveColor={locationSensorAboveColor}
+                                locationSensorBelowColor={locationSensorBelowColor}
+                                locationSensorOptimalColor={locationSensorOptimalColor}
                               />
                             );
                           })}
@@ -2094,6 +2272,10 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                     onPrintLabel={() => setLabelPickerSpoolIds([spool.id])}
                     onCopy={() => setFormModal({ spool: spool, mode: 'copy' })}
                     t={t}
+                    colorizeLocationSensors={colorizeLocationSensors}
+                    locationSensorAboveColor={locationSensorAboveColor}
+                    locationSensorBelowColor={locationSensorBelowColor}
+                    locationSensorOptimalColor={locationSensorOptimalColor}
                   />
                 );
               })}
@@ -2219,10 +2401,15 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                           visibleColumns={visibleColumns}
                           assignmentMap={assignmentMap}
                           catalogMap={catalogMap}
+                          locationReadingsMap={locationReadingsMap}
                           currencySymbol={currencySymbol}
                           dateFormat={dateFormat}
                           t={t}
                           onSyncWeight={handleSyncWeight}
+                          colorizeLocationSensors={colorizeLocationSensors}
+                          locationSensorAboveColor={locationSensorAboveColor}
+                          locationSensorBelowColor={locationSensorBelowColor}
+                          locationSensorOptimalColor={locationSensorOptimalColor}
                         />
                       );
                     }
@@ -2247,10 +2434,15 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                         visibleColumns={visibleColumns}
                         assignmentMap={assignmentMap}
                         catalogMap={catalogMap}
+                        locationReadingsMap={locationReadingsMap}
                         currencySymbol={currencySymbol}
                         dateFormat={dateFormat}
                         t={t}
                         onSyncWeight={handleSyncWeight}
+                        colorizeLocationSensors={colorizeLocationSensors}
+                        locationSensorAboveColor={locationSensorAboveColor}
+                        locationSensorBelowColor={locationSensorBelowColor}
+                        locationSensorOptimalColor={locationSensorOptimalColor}
                       />
                     );
                   })}
@@ -2583,6 +2775,7 @@ function PaginationBar({
 /* Spool card for cards view */
 function SpoolCard({
   spool, remaining, pct, onClick, onPrintLabel, onCopy, t,
+  colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor,
 }: {
   spool: InventorySpool;
   remaining: number;
@@ -2591,6 +2784,10 @@ function SpoolCard({
   onPrintLabel?: () => void;
   onCopy?: () => void;
   t: (key: string, opts?: Record<string, unknown>) => string;
+  colorizeLocationSensors: boolean;
+  locationSensorAboveColor: LocationSensorAlertColor;
+  locationSensorBelowColor: LocationSensorAlertColor;
+  locationSensorOptimalColor: LocationSensorAlertColor;
 }) {
   const bannerStyle = buildFilamentBackground({
     rgba: spool.rgba,
@@ -2606,7 +2803,7 @@ function SpoolCard({
     >
       <div className="relative h-14 flex items-center justify-center" style={bannerStyle}>
         <span className="bg-white/90 text-gray-800 px-3 py-0.5 rounded-full text-sm font-medium shadow-sm">
-          {resolveSpoolColorName(spool.color_name, spool.rgba) || '-'}
+          {resolveSpoolColorName(spool.color_name, spool.rgba, spool.color_name_is_synthesized) || '-'}
         </span>
         {onCopy && (
           <button
@@ -2681,9 +2878,20 @@ function SpoolCard({
             </span>
           </div>
         </div>
+        {spool.location_id && (
+          <SpoolLocationFooter
+            locationId={spool.location_id}
+            locationName={spool.storage_location ?? null}
+            isLast={!spool.note}
+            colorize={colorizeLocationSensors}
+            aboveColor={locationSensorAboveColor}
+            belowColor={locationSensorBelowColor}
+            optimalColor={locationSensorOptimalColor}
+          />
+        )}
         {spool.note && (
           <div
-            className="text-xs text-bambu-gray/60 pt-2 border-t border-bambu-dark-tertiary truncate"
+            className="text-xs text-bambu-gray/60 pt-3 border-t border-bambu-dark-tertiary truncate"
             title={spool.note}
           >
             {spool.note}
@@ -2694,11 +2902,132 @@ function SpoolCard({
   );
 }
 
+const LOCATION_SENSOR_CATEGORY_ORDER: Record<string, number> = {
+  temperature: 0,
+  humidity: 1,
+  battery: 2,
+};
+
+function locationSensorIconGapClass(deviceClass: string | null): string {
+  if (deviceClass === 'humidity') return 'mr-[2px]';
+  if (deviceClass === 'battery') return 'mr-[3px]';
+  return '';
+}
+
+// Two decimal places, unlike the printer row's raw value: keeps
+// temperature/humidity/battery cells at a consistent width in the table and
+// card grid (see describeHASensorReading's doc comment).
+function describeLocationSensor(
+  reading: LocationHASensorReading,
+  t: (key: string, opts?: Record<string, unknown>) => string
+): string {
+  return describeHASensorReading(reading, t, { decimals: 2 });
+}
+
+function locationSensorCellColor(
+  reading: LocationHASensorReading,
+  colorize: boolean,
+  aboveColor: LocationSensorAlertColor,
+  belowColor: LocationSensorAlertColor,
+  optimalColor: LocationSensorAlertColor
+): string {
+  if (!colorize) return 'text-bambu-gray';
+  const status = locationSensorReadingAlertStatus(reading);
+  return locationSensorValueColorClass(status, aboveColor, belowColor, optimalColor) || 'text-bambu-gray';
+}
+
+function SpoolLocationFooter({
+  locationId, locationName, isLast, colorize, aboveColor, belowColor, optimalColor,
+}: {
+  locationId: number;
+  locationName: string | null;
+  isLast: boolean;
+  colorize: boolean;
+  aboveColor: LocationSensorAlertColor;
+  belowColor: LocationSensorAlertColor;
+  optimalColor: LocationSensorAlertColor;
+}) {
+  const { t } = useTranslation();
+
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const pollIntervalMs = (settings?.location_sensor_poll_interval || 120) * 1000;
+
+  // Same query key as the list fetch in InventoryPage's body, so this is a
+  // cache read (no extra request) whenever that has already run — which it
+  // has, since card view and this footer only render after spools/locations
+  // are loaded.
+  const { data: sensorsList } = useQuery({
+    queryKey: ['locationHaSensors'],
+    queryFn: () => api.getLocationHASensors(),
+  });
+  const hasSensor = (sensorsList ?? []).some((s) => s.location_id === locationId);
+
+  // Same query key as the table-view columns' fetch in InventoryPage's body
+  // (unfiltered, show_on_card=false) — this is a cache read whenever that
+  // has already run, and the two views never need two different requests
+  // for one location. Filtering to card-visible sensors happens here
+  // instead of on the server.
+  const { data: allReadings } = useQuery({
+    queryKey: ['locationHaSensorReadings', locationId],
+    queryFn: () => api.getLocationHASensorReadings(locationId, false),
+    refetchInterval: pollIntervalMs,
+    enabled: hasSensor,
+  });
+  const readings = allReadings?.filter((r) => r.show_on_card);
+
+  if (!readings?.length) return null;
+
+  const batteryReading = readings.find((r) => r.device_class === 'battery');
+  const otherReadings = readings
+    .filter((r) => r.device_class !== 'battery')
+    .sort(
+      (a, b) =>
+        (LOCATION_SENSOR_CATEGORY_ORDER[a.device_class ?? ''] ?? 99) -
+        (LOCATION_SENSOR_CATEGORY_ORDER[b.device_class ?? ''] ?? 99)
+    );
+
+  return (
+    <div
+      className={`flex items-center gap-2 pt-3 border-t border-bambu-dark-tertiary text-xs text-bambu-gray ${isLast ? '-mb-1' : ''}`}
+    >
+      {locationName && <span className="truncate">{locationName}</span>}
+      <span className="text-bambu-gray/40">|</span>
+      <div className="flex items-center gap-3">
+        {otherReadings.map((reading, index) => {
+          const Icon = iconForHASensor(reading);
+          const firstIconOffsetClass = index === 0 ? 'ml-[-3.6px]' : '';
+          return (
+            <span key={reading.id} title={reading.name} className="flex items-center gap-[3px]">
+              <Icon className={`w-3 h-3 ${locationSensorIconGapClass(reading.device_class)} ${firstIconOffsetClass}`} />
+              <span className={locationSensorCellColor(reading, colorize, aboveColor, belowColor, optimalColor)}>
+                {describeLocationSensor(reading, t)}
+              </span>
+            </span>
+          );
+        })}
+      </div>
+      {batteryReading &&
+        (() => {
+          const Icon = iconForHASensor(batteryReading);
+          return (
+            <span key={batteryReading.id} title={batteryReading.name} className="flex items-center gap-[3px] ml-auto">
+              <Icon className={`w-3 h-3 ${locationSensorIconGapClass(batteryReading.device_class)}`} />
+              <span className={locationSensorCellColor(batteryReading, colorize, aboveColor, belowColor, optimalColor)}>
+                {describeLocationSensor(batteryReading, t)}
+              </span>
+            </span>
+          );
+        })()}
+    </div>
+  );
+}
+
 /* Single spool row for table view */
 function SpoolTableRow({
   spool, remaining, pct, isSelected, onToggleSelected,
   onEdit, onCopy, onRestore, onArchive, onDelete, onPrintLabel, onResetConsumedCounter,
-  visibleColumns, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight,
+  visibleColumns, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight,
+  colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor,
 }: {
   spool: InventorySpool;
   remaining: number;
@@ -2715,10 +3044,15 @@ function SpoolTableRow({
   visibleColumns: string[];
   assignmentMap: Record<number, LocationDisplay>;
   catalogMap: Record<number, SpoolCatalogEntry>;
+  locationReadingsMap: Record<number, LocationHASensorReading[]>;
   currencySymbol: string;
   dateFormat: DateFormat;
   t: TFn;
   onSyncWeight?: (spool: InventorySpool) => void;
+  colorizeLocationSensors: boolean;
+  locationSensorAboveColor: LocationSensorAlertColor;
+  locationSensorBelowColor: LocationSensorAlertColor;
+  locationSensorOptimalColor: LocationSensorAlertColor;
 }) {
   return (
     <tr
@@ -2740,7 +3074,7 @@ function SpoolTableRow({
       </td>
       {visibleColumns.map((colId) => (
         <td key={colId} className="py-3 px-4">
-          {columnCells[colId]?.({ spool, remaining, pct, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight })}
+          {columnCells[colId]?.({ spool, remaining, pct, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor })}
         </td>
       ))}
       <td className="py-3 px-4">
@@ -2789,7 +3123,8 @@ function SpoolTableRow({
 function SpoolTableGroup({
   spools, headerSpool, remaining, pct, isExpanded, onToggle,
   onEdit, onCopy, onArchive, onDelete, onPrintLabel, onResetConsumedCounter,
-  visibleColumns, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight,
+  visibleColumns, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight,
+  colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor,
   selectedIds, onToggleSelected, onToggleGroupSelected,
 }: {
   spools: InventorySpool[];
@@ -2809,10 +3144,15 @@ function SpoolTableGroup({
   visibleColumns: string[];
   assignmentMap: Record<number, LocationDisplay>;
   catalogMap: Record<number, SpoolCatalogEntry>;
+  locationReadingsMap: Record<number, LocationHASensorReading[]>;
   currencySymbol: string;
   dateFormat: DateFormat;
   t: TFn;
   onSyncWeight?: (spool: InventorySpool) => void;
+  colorizeLocationSensors: boolean;
+  locationSensorAboveColor: LocationSensorAlertColor;
+  locationSensorBelowColor: LocationSensorAlertColor;
+  locationSensorOptimalColor: LocationSensorAlertColor;
   selectedIds?: Set<number>;
   onToggleSelected?: (id: number) => void;
   onToggleGroupSelected?: (ids: number[], select: boolean) => void;
@@ -2841,14 +3181,14 @@ function SpoolTableGroup({
             {idx === 0 ? (
               <div className="flex items-center gap-2">
                 <ChevronDown className={`w-4 h-4 text-bambu-gray transition-transform ${isExpanded ? '' : '-rotate-90'}`} />
-                {columnCells[colId]?.({ spool: headerSpool, remaining, pct, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight })}
+                {columnCells[colId]?.({ spool: headerSpool, remaining, pct, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor })}
               </div>
             ) : colId === 'id' ? (
               <span className="text-xs font-medium bg-bambu-green/20 text-bambu-green px-2 py-0.5 rounded-full">
                 {t('inventory.groupedSpools', { count: spools.length })}
               </span>
             ) : (
-              columnCells[colId]?.({ spool: headerSpool, remaining, pct, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight })
+              columnCells[colId]?.({ spool: headerSpool, remaining, pct, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor })
             )}
           </td>
         ))}
@@ -2880,10 +3220,15 @@ function SpoolTableGroup({
             visibleColumns={visibleColumns}
             assignmentMap={assignmentMap}
             catalogMap={catalogMap}
+            locationReadingsMap={locationReadingsMap}
             currencySymbol={currencySymbol}
             dateFormat={dateFormat}
             t={t}
             onSyncWeight={onSyncWeight}
+            colorizeLocationSensors={colorizeLocationSensors}
+            locationSensorAboveColor={locationSensorAboveColor}
+            locationSensorBelowColor={locationSensorBelowColor}
+            locationSensorOptimalColor={locationSensorOptimalColor}
           />
         );
       })}
