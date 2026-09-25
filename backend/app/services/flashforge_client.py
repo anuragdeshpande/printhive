@@ -312,38 +312,38 @@ class FlashforgeClient:
         self.state.stg_cur = 74
         return self._send_command({"cmd": "start_print", "file": filename})
 
-    def stop_print(self) -> bool:
+    def stop_print(self, *args, **kwargs) -> bool:
         """Cancel the active print."""
         return self._send_command({"cmd": "cancel_print"})
 
-    def pause_print(self) -> bool:
+    def pause_print(self, *args, **kwargs) -> bool:
         """Pause the active print."""
         return self._send_command({"cmd": "pause_print"})
 
-    def resume_print(self) -> bool:
+    def resume_print(self, *args, **kwargs) -> bool:
         """Resume the paused print."""
         return self._send_command({"cmd": "resume_print"})
 
-    def set_nozzle_temperature(self, temp: int, nozzle_index: int = 0) -> bool:
+    def set_nozzle_temperature(self, temp: int, nozzle_index: int = 0, *args, **kwargs) -> bool:
         """Set nozzle target temperature for Tool 0 or Tool 1."""
         return self._send_command({"cmd": "set_temperature", "nozzle_index": nozzle_index, "target": temp})
 
-    def set_bed_temperature(self, temp: int) -> bool:
+    def set_bed_temperature(self, temp: int, *args, **kwargs) -> bool:
         """Set heatbed target temperature."""
         return self._send_command({"cmd": "set_temperature", "type": "bed", "target": temp})
 
-    def set_fan_speed(self, fan_id: int, speed_pwm: int) -> bool:
+    def set_fan_speed(self, fan_id: int, speed_pwm: int, *args, **kwargs) -> bool:
         """Set fan speed (pwm 0-255)."""
         pct = max(0, min(100, int((speed_pwm / 255.0) * 100)))
         return self._send_command({"cmd": "set_fan", "fan_id": fan_id, "speed": pct})
 
-    def set_chamber_light(self, on: bool) -> bool:
+    def set_chamber_light(self, on: bool, *args, **kwargs) -> bool:
         """Toggle chamber enclosure light."""
         return self._send_command({"cmd": "set_light", "on": on})
 
-    def select_toolhead(self, tool_index: int) -> bool:
+    def select_toolhead(self, tool_index: int, *args, **kwargs) -> bool:
         """Select active toolhead (0 = Tool 0 / Left, 1 = Tool 1 / Right)."""
         return self._send_command({"cmd": "select_tool", "tool": tool_index})
 
-    def check_staleness(self) -> bool:
+    def check_staleness(self, *args, **kwargs) -> bool:
         return self.state.connected

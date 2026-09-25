@@ -22,7 +22,7 @@ While upstream Bambuddy focuses primarily on Bambu Lab printers, the primary rea
 
 1. **Local Docker Builds Only**:
    - **NEVER** run Docker builds or compile frontend bundles on remote production machines (Proxmox host or LXC containers).
-   - **ALWAYS** build the Docker image locally using OrbStack / Docker (`docker build -t printhive:hardened .`) on the developer machine, then stream the image to Proxmox and load it via `docker load`.
+   - **ALWAYS** build the Docker image locally using OrbStack / Docker (`docker build --platform linux/amd64 -t printhive:hardened .`) on the developer machine, then stream the image to Proxmox and load it via `docker load`.
 2. **Proxmox LXC Lifecycle**:
    - Production runs on LXC 106 (`192.168.1.241`).
    - LXC 105 is the legacy container and must **NEVER** be started or run concurrently with LXC 106.
@@ -30,6 +30,17 @@ While upstream Bambuddy focuses primarily on Bambu Lab printers, the primary rea
 3. **Printer IPs & Network**:
    - BambuLab X2D: `192.168.1.113` (MQTT port 8883, FTPS port 990, RTSP camera).
    - Elegoo Centauri Carbon (CC1): `192.168.1.235` (SDCP WebSocket port 3030, HTTP upload port 80/chunked).
+4. **Client Polymorphism & Parameter Forward-Compatibility (NON-NEGOTIABLE)**:
+   - Every printer client (`ElegooCentauriClient`, `FlashforgeClient`, and future vendor clients) **MUST** accept `*args, **kwargs` on `start_print` and ALL control methods (`stop_print`, `pause_print`, `resume_print`, `set_print_speed`, `set_nozzle_temperature`, `set_bed_temperature`, `set_chamber_temperature`, `set_fan_speed`).
+   - Upstream Bambuddy constantly adds new Bambu-specific dispatch parameters (e.g. `nozzle_slot_extruders`, `nozzle_mapping`, `bed_type`). Declaring methods with strict signatures causes instant `TypeError` regressions when upstream calls them.
+   - Enforced automatically by `backend/tests/unit/services/test_printer_client_contract.py`.
+5. **Scheduler Dispatch Safety & Anti-Cascade Rules (NON-NEGOTIABLE)**:
+   - `printer_manager.start_print()` in `PrintScheduler._start_print()` **MUST ALWAYS** be wrapped in a `try...except Exception` block so dispatch errors fail safely without crashing the background task.
+   - `self._terminal_since.pop(item.printer_id, None)` **MUST ALWAYS** be called immediately prior to starting dispatch. If a printer has been idle for $>300\text{s}$, a stale `_terminal_since` timestamp will cause the stranded-item reaper to immediately cancel the job, pop the next item, and cascade-cancel the entire print queue.
+   - In `PrintScheduler._check_stranded_printing_items()`, newly dispatched jobs with `item.started_at` within `_STRANDED_PRINTING_GRACE_SECONDS` (300s) **MUST NEVER** be closed as stranded while the physical printer transitions from idle through preparation and heating.
+   - Enforced automatically by `backend/tests/unit/services/test_scheduler_dispatch_safety.py` and `backend/tests/integration/test_stranded_printing_recovery_2829.py`.
+6. **File Format Resilience**:
+   - Extraction logic in `filament_requirements.py` and `archives.py` must bypass 3MF zip extraction on `.gcode` files (standard on Elegoo Centauri) to prevent `BadZipFile` crashes.
 
 ---
 
@@ -61,9 +72,11 @@ for f in files:
    - Guard `_last_message_time` checks using `getattr(client, "_last_message_time", None)`.
    - Preserve `PREPARE` state handling for cover URLs and active print status restoration on restart.
 2. **`backend/app/services/elegoo_client.py` & `pycentauri/`**:
+   - Must accept `*args, **kwargs` on all control and dispatch methods.
    - Must remain fully intact with `_last_message_time`, `last_connect_error`, and `force_reconnect_stale_session`.
    - PyCentauri package directory must be preserved and copied into Docker image (`COPY pycentauri/ /app/pycentauri/`).
 3. **`backend/app/services/flashforge_client.py`**:
+   - Must accept `*args, **kwargs` on all control and dispatch methods.
    - Must remain intact for Creator 5 multi-toolhead printer support.
 4. **`backend/app/services/virtual_printer/elegoo_sdcp_server.py`**:
    - Port 3030 WebSocket server must remain initialized and listening for OrcaSlicer virtual printer communication.
@@ -71,10 +84,15 @@ for f in files:
    - Must preserve `upload_elegoo_file_async` (1MB chunked multipart upload).
    - Must preserve `derive_elegoo_remote_filename` (`.gcode` extension for Elegoo CC1 vs `.3mf` for Bambu).
    - Must preserve Elegoo SDCP bed type resolution.
-6. **`backend/app/schemas/printer.py`**:
+   - Must preserve `try...except` wrapper around `printer_manager.start_print()`.
+   - Must preserve `self._terminal_since.pop(item.printer_id, None)` on dispatch.
+   - Must preserve `item.started_at` grace period check in `_check_stranded_printing_items()`.
+6. **`backend/app/services/filament_requirements.py` & `backend/app/api/routes/archives.py`**:
+   - Must guard against parsing `.gcode` files as zip archives.
+7. **`backend/app/schemas/printer.py`**:
    - `access_code` on `PrinterCreate` must remain optional for Elegoo models (`model_validator`).
    - `plate_detection_enabled` must be included on `PrinterBase`.
-7. **`backend/app/utils/printer_models.py`**:
+8. **`backend/app/utils/printer_models.py`**:
    - Must include `CC1`, `CC2`, and `Creator 5` mappings in `PRINTER_MODEL_MAP` and `PRINTER_MODEL_ID_MAP`.
 
 #### B. Frontend Pages & Modals
@@ -101,13 +119,16 @@ for f in files:
 
 ## 4. Verification Checklist Before Marking Merge Complete
 
-- [ ] All 31 multi-vendor tests pass:
+- [ ] All multi-vendor client contract, scheduler safety, and vendor tests pass:
   ```bash
-  pytest backend/tests/unit/services/test_elegoo_client.py \
+  pytest backend/tests/unit/services/test_printer_client_contract.py \
+         backend/tests/unit/services/test_scheduler_dispatch_safety.py \
+         backend/tests/unit/services/test_elegoo_client.py \
          backend/tests/unit/services/test_flashforge_client.py \
          backend/tests/unit/services/test_elegoo_upload.py \
          backend/tests/unit/test_scheduler_elegoo_bed_type.py \
          backend/tests/integration/test_elegoo_link_api.py \
+         backend/tests/integration/test_stranded_printing_recovery_2829.py \
          backend/tests/unit/services/baseline/test_elegoo_adapter.py
   ```
 - [ ] Preflight UI tests pass:
@@ -123,3 +144,4 @@ for f in files:
   - Both BambuLab (`192.168.1.113`) and Elegoo (`192.168.1.235`) report `connected: True`.
   - Watchdog does not log port 8883 errors or crash on Elegoo.
   - Browser UI shows custom models and camera/plate options in Add & Edit modals.
+  - Test print queue dispatch to Elegoo Centauri Carbon (`192.168.1.235`) executes upload, begins print, and leaves queue intact.

@@ -226,3 +226,52 @@ class TestTheSweep:
         )
 
         await scheduler._close_stranded_printing_items()  # must not raise
+
+    async def test_recently_started_item_protected_against_stale_terminal_clock(
+        self, scheduler, db_session, printer_factory, monkeypatch
+    ):
+        """Regression test for queue wipeout bug:
+        If a printer was idle for a long time (so _terminal_since is already old),
+        a newly started print (started_at < grace period) must NOT be closed as stranded
+        while the printer transitions from idle to preparing/heating.
+        """
+        from datetime import datetime, timezone
+        printer = await printer_factory()
+        item = await self._item(db_session, printer)
+        item.started_at = datetime.now(timezone.utc)
+        await db_session.commit()
+
+        monkeypatch.setattr(
+            "backend.app.services.print_scheduler.printer_manager.get_status", lambda _pid: _state("IDLE")
+        )
+        # Simulate stale terminal clock that was running before this item was started
+        scheduler._terminal_since[printer.id] = 0.0
+
+        await scheduler._close_stranded_printing_items()
+
+        # Must still be printing! Must NOT have been cancelled/completed.
+        assert await self._status_of(db_session, item.id) == "printing"
+
+    async def test_aged_started_item_is_closed_after_grace_period_expires(
+        self, scheduler, db_session, printer_factory, monkeypatch
+    ):
+        """When an item was started long ago (> grace period) and printer has been idle,
+        it should be cleaned up as stranded.
+        """
+        from datetime import datetime, timezone, timedelta
+        from backend.app.services.print_scheduler import _STRANDED_PRINTING_GRACE_SECONDS
+        printer = await printer_factory()
+        item = await self._item(db_session, printer)
+        item.started_at = datetime.now(timezone.utc) - timedelta(seconds=_STRANDED_PRINTING_GRACE_SECONDS + 10)
+        await db_session.commit()
+
+        monkeypatch.setattr(
+            "backend.app.services.print_scheduler.printer_manager.get_status", lambda _pid: _state("IDLE")
+        )
+        scheduler._terminal_since[printer.id] = 0.0
+
+        await scheduler._close_stranded_printing_items()
+
+        # In IDLE, terminal status resolves to cancelled
+        assert await self._status_of(db_session, item.id) == "cancelled"
+
