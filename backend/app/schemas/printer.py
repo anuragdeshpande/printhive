@@ -39,13 +39,21 @@ class PrinterBase(BaseModel):
     external_camera_enabled: bool = False
     external_camera_snapshot_url: str | None = None  # Optional single-frame override; #1177
     camera_rotation: int = 0  # 0, 90, 180, 270 degrees
+    plate_detection_enabled: bool = False
 
 
 class PrinterCreate(PrinterBase):
     # access_code lives on the input shapes only — never on the default
     # PrinterResponse. Direct exposure on PRINTERS_READ would let a Viewer
     # connect to the printer's MQTT and bypass Bambuddy's RBAC.
-    access_code: str = Field(..., min_length=1, max_length=20)
+    access_code: str = Field(default="", max_length=20)
+
+    @model_validator(mode="after")
+    def _validate_access_code(self) -> "PrinterCreate":
+        from backend.app.services.elegoo_client import is_elegoo_model
+        if not is_elegoo_model(self.model) and not self.access_code.strip():
+            raise ValueError("access_code must not be blank")
+        return self
 
 
 class PlateDetectionROI(BaseModel):
