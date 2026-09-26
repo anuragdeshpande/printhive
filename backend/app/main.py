@@ -4604,6 +4604,7 @@ async def on_print_start(printer_id: int, data: dict):
                         # Step 1: Try to locate the local file inside printBuddy server directories first
                         # (since the printer's HTTP server blocks requests with '500 device busy' during prints)
                         local_gcode_path = None
+                        thumb_bytes = False
                         
                         # Check expected prints cache or database archives to find the local file path
                         expected_archive = None
