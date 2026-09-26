@@ -120,4 +120,40 @@ describe('Dispatch toast (inside ToastContext)', () => {
     fireEvent.click(screen.getByTestId('dispatch-toast-dismiss'));
     expect(screen.queryByTestId('dispatch-toast-wrapper')).toBeNull();
   });
+
+  it('bambuddy:printer-active marks stuck processing jobs for that printer completed and auto-dismisses', () => {
+    render(<div />);
+    emit({ type: 'queue_item_uploading', queue_item_id: 42, printer_id: 1, printer_name: 'H2D-1', file_name: 'cube.3mf', total_bytes: 100 });
+    expect(screen.getByTestId('dispatch-toast-status-42')).toHaveTextContent(/processing/i);
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('bambuddy:printer-active', { detail: { printer_id: 1 } }));
+    });
+    expect(screen.getByTestId('dispatch-toast-status-42')).toHaveTextContent(/completed/i);
+
+    act(() => { vi.advanceTimersByTime(3501); });
+    expect(screen.queryByTestId('dispatch-toast-wrapper')).toBeNull();
+  });
+
+  it('stale processing watchdog auto-completes jobs older than 45s and auto-dismisses', () => {
+    render(<div />);
+    emit({ type: 'queue_item_uploading', queue_item_id: 88, printer_id: 2, printer_name: 'CC1', file_name: 'benchy.gcode', total_bytes: 500 });
+    expect(screen.getByTestId('dispatch-toast-status-88')).toHaveTextContent(/processing/i);
+
+    // Advance beyond 45s (plus interval check)
+    act(() => { vi.advanceTimersByTime(50000); });
+    expect(screen.getByTestId('dispatch-toast-status-88')).toHaveTextContent(/completed/i);
+
+    act(() => { vi.advanceTimersByTime(3501); });
+    expect(screen.queryByTestId('dispatch-toast-wrapper')).toBeNull();
+  });
+
+  it('hard max lifetime auto-dismisses toast after 90s even if stuck', () => {
+    render(<div />);
+    emit({ type: 'queue_item_uploading', queue_item_id: 99, printer_id: 3, printer_name: 'X1', file_name: 'stuck.3mf', total_bytes: 1000 });
+    expect(screen.getByTestId('dispatch-toast-wrapper')).toBeInTheDocument();
+
+    act(() => { vi.advanceTimersByTime(91000); });
+    expect(screen.queryByTestId('dispatch-toast-wrapper')).toBeNull();
+  });
 });

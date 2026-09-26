@@ -46,6 +46,23 @@ async def test_broadcast_to_user_filters_by_principal_user_id():
 
 
 @pytest.mark.asyncio
+async def test_broadcast_to_user_delivers_to_admins():
+    """A targeted broadcast reaches the targeted user AND any connected admins."""
+    mgr = ConnectionManager()
+    alice = _mock_conn(7)
+    bob = _mock_conn(8)
+    admin = _mock_conn(99)
+    admin.state.bambuddy_is_admin = True
+    mgr.active_connections = [alice, bob, admin]
+
+    await mgr.broadcast_to_user(7, {"type": "queue_item_uploading", "queue_item_id": 1})
+
+    alice.send_text.assert_awaited_once()
+    admin.send_text.assert_awaited_once()
+    bob.send_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_broadcast_to_user_none_fans_out_to_all():
     """Auth-disabled installs route ``user_id=None`` to every connection
     via the regular broadcast — matches the legacy single-user toast

@@ -307,6 +307,12 @@ export function useWebSocket() {
       case 'printer_status':
         if (message.printer_id !== undefined && message.data) {
           throttledPrinterStatusUpdate(message.printer_id, message.data);
+          const st = (message.data as Record<string, unknown>).state;
+          if (typeof st === 'string' && ['RUNNING', 'PREPARE', 'SLICING', 'FINISH'].includes(st.toUpperCase())) {
+            window.dispatchEvent(new CustomEvent('bambuddy:printer-active', {
+              detail: { printer_id: message.printer_id }
+            }));
+          }
         }
         break;
 
@@ -314,6 +320,9 @@ export function useWebSocket() {
         // Refetch printer status immediately when print starts to get printable_objects_count
         if (message.printer_id !== undefined) {
           queryClient.invalidateQueries({ queryKey: ['printerStatus', message.printer_id] });
+          window.dispatchEvent(new CustomEvent('bambuddy:printer-active', {
+            detail: { printer_id: message.printer_id }
+          }));
         }
         break;
 

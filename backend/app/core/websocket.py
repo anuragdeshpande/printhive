@@ -68,7 +68,8 @@ class ConnectionManager:
             disconnected = []
             for connection in self.active_connections:
                 conn_uid = getattr(connection.state, "bambuddy_principal_user_id", None)
-                if conn_uid != user_id:
+                is_admin = getattr(connection.state, "bambuddy_is_admin", False)
+                if conn_uid != user_id and not is_admin:
                     continue
                 try:
                     await connection.send_text(data)

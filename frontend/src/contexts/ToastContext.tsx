@@ -17,9 +17,11 @@ type DispatchJobStatus = 'processing' | 'completed' | 'failed';
 
 interface DispatchToastJob {
   jobId: number;
+  printerId?: number | null;
   sourceName: string;
   printerName: string;
   status: DispatchJobStatus;
+  startedAt?: number;
   uploadBytes?: number;
   uploadTotalBytes?: number;
   uploadProgressPct?: number;
@@ -235,9 +237,11 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             // Materialization point — job appears here, never on queue-add.
             nextJob = {
               jobId,
+              printerId: detail.printer_id ?? null,
               sourceName,
               printerName,
               status: 'processing',
+              startedAt: Date.now(),
               uploadBytes: 0,
               uploadTotalBytes: detail.total_bytes,
               uploadProgressPct: 0,
@@ -303,6 +307,97 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     window.addEventListener('bambuddy:dispatch-toast', onDispatchEvent);
     return () => window.removeEventListener('bambuddy:dispatch-toast', onDispatchEvent);
   }, [t]);
+
+  // Printer activity listener: if the printer has moved to an active state
+  // (RUNNING / PREPARE / SLICING / FINISH), any dispatch jobs for that printer that
+  // are still in 'processing' status must have successfully landed on the printer.
+  useEffect(() => {
+    const onPrinterActive = (event: Event) => {
+      if (!isMountedRef.current) return;
+      const detail = (event as CustomEvent<{ printer_id?: number }>).detail;
+      if (!detail || typeof detail.printer_id !== 'number') return;
+      const activePrinterId = detail.printer_id;
+
+      setToasts((prev) => {
+        const existing = prev.find((toastItem) => toastItem.id === DISPATCH_TOAST_ID);
+        if (!existing?.dispatchData) return prev;
+        const existingJobs = existing.dispatchData.jobs;
+        let changed = false;
+        const updatedJobs = existingJobs.map((job) => {
+          if (job.status === 'processing' && job.printerId === activePrinterId) {
+            changed = true;
+            return {
+              ...job,
+              status: 'completed' as DispatchJobStatus,
+              uploadProgressPct: 100,
+            };
+          }
+          return job;
+        });
+
+        if (!changed) return prev;
+        const dispatchData = recomputeAggregate(updatedJobs);
+        return prev.map((toastItem) =>
+          toastItem.id === DISPATCH_TOAST_ID
+            ? { ...toastItem, dispatchData }
+            : toastItem,
+        );
+      });
+    };
+
+    window.addEventListener('bambuddy:printer-active', onPrinterActive);
+    return () => window.removeEventListener('bambuddy:printer-active', onPrinterActive);
+  }, []);
+
+  // Safety watchdog: ensure no dispatch toast job stays stuck in 'processing' indefinitely.
+  // If a job has been processing for > 45 seconds, resolve it to completed so the toast can auto-dismiss.
+  useEffect(() => {
+    const dispatchToast = toasts.find((tst) => tst.id === DISPATCH_TOAST_ID);
+    if (!dispatchToast?.dispatchData || dispatchToast.dispatchData.processing === 0) return;
+
+    const interval = setInterval(() => {
+      if (!isMountedRef.current) return;
+      const now = Date.now();
+      const STALE_JOB_THRESHOLD_MS = 45000;
+      setToasts((prev) => {
+        const existing = prev.find((tst) => tst.id === DISPATCH_TOAST_ID);
+        if (!existing?.dispatchData || existing.dispatchData.processing === 0) return prev;
+        let changed = false;
+        const updatedJobs = existing.dispatchData.jobs.map((job) => {
+          if (job.status === 'processing' && job.startedAt && now - job.startedAt >= STALE_JOB_THRESHOLD_MS) {
+            changed = true;
+            return {
+              ...job,
+              status: 'completed' as DispatchJobStatus,
+              uploadProgressPct: 100,
+            };
+          }
+          return job;
+        });
+        if (!changed) return prev;
+        const dispatchData = recomputeAggregate(updatedJobs);
+        return prev.map((tst) =>
+          tst.id === DISPATCH_TOAST_ID
+            ? { ...tst, dispatchData }
+            : tst,
+        );
+      });
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, [toasts]);
+
+  // Hard maximum lifetime: under no circumstances should the dispatch toast stay pinned
+  // for longer than 90 seconds from when it first appears.
+  const hasDispatchToast = toasts.some((tst) => tst.id === DISPATCH_TOAST_ID);
+  useEffect(() => {
+    if (!hasDispatchToast) return;
+    const maxLifetimeTimeout = setTimeout(() => {
+      if (!isMountedRef.current) return;
+      setToasts((prev) => prev.filter((tst) => tst.id !== DISPATCH_TOAST_ID));
+    }, 90000);
+    return () => clearTimeout(maxLifetimeTimeout);
+  }, [hasDispatchToast]);
 
   // Auto-dismiss the wrapper once every job has reached a terminal state.
   useEffect(() => {

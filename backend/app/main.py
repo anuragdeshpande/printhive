@@ -3494,6 +3494,26 @@ async def on_print_start(printer_id: int, data: dict):
     except Exception as e:
         logger.warning("Smart plug on_print_start failed: %s", e)
 
+    # Release dispatch hold and ack any queue items in 'printing' state for this printer
+    try:
+        from backend.app.services.print_scheduler import scheduler
+        scheduler._release_dispatch_hold(printer_id)
+        async with async_session() as db:
+            from backend.app.models.print_queue import PrintQueueItem
+            q_res = await db.execute(
+                select(PrintQueueItem)
+                .where(PrintQueueItem.printer_id == printer_id)
+                .where(PrintQueueItem.status == "printing")
+            )
+            for q_item in q_res.scalars().all():
+                await ws_manager.send_queue_item_acked(
+                    user_id=q_item.created_by_id,
+                    queue_item_id=q_item.id,
+                    printer_id=printer_id,
+                )
+    except Exception as e:
+        logger.debug("Failed to release dispatch hold or ack queue items on print start: %s", e)
+
     async with async_session() as db:
         from backend.app.models.printer import Printer
         from backend.app.services.bambu_ftp import list_files_async

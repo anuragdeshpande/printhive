@@ -7372,18 +7372,17 @@ class PrintScheduler:
             # check avoids false reverts on slow H2D FINISH→PREPARE transitions
             # that would otherwise cause the item to re-dispatch as a reprint
             # of the just-finished job (#1078).
-            if pre_state:
-                spawn_background_task(
-                    self._watchdog_print_start(
-                        item.id,
-                        item.printer_id,
-                        pre_state,
-                        pre_subtask_id,
-                        pre_gcode_file,
-                        created_by_id=toast_uid,
-                    ),
-                    name=f"watchdog-print-start-{item.id}",
-                )
+            spawn_background_task(
+                self._watchdog_print_start(
+                    item.id,
+                    item.printer_id,
+                    pre_state or "",
+                    pre_subtask_id,
+                    pre_gcode_file,
+                    created_by_id=toast_uid,
+                ),
+                name=f"watchdog-print-start-{item.id}",
+            )
 
             # Get estimated time for notification.
             #
@@ -7743,6 +7742,15 @@ class PrintScheduler:
             # other path) already moved the item past 'printing', don't run the
             # MQTT session-recovery logic below — a forced reconnect on a healthy
             # session breaks ongoing prints on the same printer.
+            scheduler._release_dispatch_hold(printer_id)
+            try:
+                await ws_manager.send_queue_item_acked(
+                    user_id=created_by_id,
+                    queue_item_id=queue_item_id,
+                    printer_id=printer_id,
+                )
+            except Exception:
+                pass
             return
 
         total_timeout = timeout + (phase_b_timeout if landed_on_subtask else 0.0)
@@ -7777,6 +7785,15 @@ class PrintScheduler:
             )
             await scheduler._notify_dispatch_gave_up(queue_item_id, printer_id, created_by_id)
         elif revert_outcome == "reverted":
+            try:
+                await ws_manager.send_queue_item_failed(
+                    user_id=created_by_id,
+                    queue_item_id=queue_item_id,
+                    printer_id=printer_id,
+                    reason="start_unacknowledged",
+                )
+            except Exception:
+                pass
             if landed_on_subtask:
                 logger.warning(
                     "Queue item %s: printer %d accepted project_file (subtask_id "

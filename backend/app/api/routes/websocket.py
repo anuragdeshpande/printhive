@@ -92,16 +92,20 @@ async def websocket_endpoint(websocket: WebSocket, token: str | None = Query(def
     # ``ws_manager.broadcast_to_user()`` can filter without re-querying
     # per message. Auth-disabled path keeps None (broadcast_to_user fans
     # out to all when target is None — matches the legacy single-user
-    # toast behaviour). API-keyed principal is empty string → None.
     principal_user_id: int | None = None
+    is_admin: bool = False
     if principal:
         try:
             async with async_session() as db:
-                row = await db.execute(select(User.id).where(User.username == principal))
-                principal_user_id = row.scalar_one_or_none()
+                row = await db.execute(select(User).where(User.username == principal))
+                user = row.scalar_one_or_none()
+                if user:
+                    principal_user_id = user.id
+                    is_admin = user.is_admin
         except Exception:  # SEC-AUTH-EXC: resolution failure is non-fatal — degrades to no per-user routing
             logger.warning("WebSocket principal resolve failed for %s", principal, exc_info=True)
     websocket.state.bambuddy_principal_user_id = principal_user_id
+    websocket.state.bambuddy_is_admin = is_admin
     logger.info("WebSocket client connected")
 
     try:
