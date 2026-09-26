@@ -9,6 +9,7 @@ from pycentauri.discovery import discover as elegoo_discover
 from pycentauri.models import Status, Attributes, CanvasStatus
 
 from backend.app.services.bambu_mqtt import PrinterState, NozzleInfo, PrintOptions
+from backend.app.services.printer_state_machine import PrinterStateMachine
 
 logger = logging.getLogger(__name__)
 
@@ -108,20 +109,29 @@ class ElegooCentauriClient:
         self.on_print_running_observed = on_print_running_observed
         self.on_finish_photo_moment = on_finish_photo_moment
 
-        self.state = PrinterState()
+        self.state_machine = PrinterStateMachine(
+            serial_number=serial_number,
+            on_state_change=on_state_change,
+            on_print_start=on_print_start,
+            on_print_complete=on_print_complete,
+            on_print_running_observed=on_print_running_observed,
+            on_layer_change=on_layer_change,
+            on_bed_temp_update=on_bed_temp_update,
+            on_finish_photo_moment=on_finish_photo_moment,
+        )
+        self.state = self.state_machine.state
         self._printer: Printer | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connect_task: asyncio.Task[None] | None = None
         self._watcher_task: asyncio.Task[None] | None = None
         
-        self._was_running = False
-        self._completion_triggered = False
-        self._last_known_job_name = ""
-        self._last_layer_num = 0
-        self._last_bed_temp = 0.0
         self._drying_targets = {}
         self._last_message_time: float | None = time.time()
         self.last_connect_error: str | None = None
+
+    @property
+    def last_dispatch_subtask_id(self) -> str | None:
+        return self.state_machine.last_dispatch_subtask_id
 
     @property
     def connected(self) -> bool:
@@ -251,12 +261,8 @@ class ElegooCentauriClient:
                 self._printer = None
 
             if self.state.connected:
-                self.state.connected = False
-                if self.on_state_change:
-                    self.on_state_change(self.state)
+                self.state_machine.set_connected(False)
             await asyncio.sleep(2.0)
-
-
 
     def _update_state(self, status: Status):
         self._last_message_time = time.time()
@@ -278,19 +284,17 @@ class ElegooCentauriClient:
         # Map light status (SecondLight represents the enclosure LED on CC2 FDM)
         self.state.chamber_light = bool(status.light.get("SecondLight", 0))
 
+        current_file = None
+        total_layers = 0
         if status.print_info:
-            if status.print_info.filename:
-                self.state.current_print = status.print_info.filename
-                self.state.subtask_name = status.print_info.filename
-                self.state.gcode_file = status.print_info.filename
-                self._last_known_job_name = status.print_info.filename
+            current_file = status.print_info.filename
             self.state.progress = float(status.print_info.progress or 0)
-
             self.state.layer_num = status.print_info.current_layer or 0
             self.state.total_layers = status.print_info.total_layer or 0
-            
+            total_layers = self.state.total_layers
+
             # Map remaining time from ticks if available (ticks are in seconds).
-            # We divide by 60 to store in minutes to match expected schema.
+            # Stored in minutes on state to match expected schema.
             cur_ticks = status.print_info.current_ticks or 0.0
             tot_ticks = status.print_info.total_ticks or 0.0
             if tot_ticks > cur_ticks:
@@ -314,100 +318,52 @@ class ElegooCentauriClient:
             else:
                 self.state.speed_level = 2
 
-            # Map print status code to Bambu-compatible string and stage
-            print_status_code = status.print_status
+        # Map print status code to Bambu-compatible string and stage
+        print_status_code = status.print_status
+        state_str = "IDLE"
+        stg_cur = -1
+
+        if print_status_code == 0:
             state_str = "IDLE"
-            stg_cur = -1
+        elif print_status_code in (5, 6):
+            state_str = "PAUSE"
+            stg_cur = 16
+        elif print_status_code in (7, 8):
+            state_str = "IDLE"
+        elif print_status_code == 9:
+            state_str = "FINISH"
+        elif print_status_code == 14:
+            state_str = "FAILED"
+        elif print_status_code in (1, 12, 13, 27, 28, 29):
+            state_str = "RUNNING"
+            stg_cur = 0
+        elif print_status_code is not None and print_status_code != 0:
+            state_str = "PREPARE"
+            # Map Elegoo preparation sub-states to Bambu stage codes for granular UI stage names
+            ELEGOO_PREP_STAGES = {
+                10: 52,  # File Checking / Checking Material
+                11: 44,  # Printer Checking / Auto Check: Platform
+                15: 1,   # Auto Bed Leveling
+                16: 2,   # Heatbed / Nozzle Preheating
+                17: 3,   # Resonance Testing / Vibration Compensation
+                18: 74,  # Starting Print / Preparing
+            }
+            stg_cur = ELEGOO_PREP_STAGES.get(print_status_code, 74)
 
-            if print_status_code == 0:
-                state_str = "IDLE"
-            elif print_status_code in (5, 6):
-                state_str = "PAUSE"
-                stg_cur = 16
-            elif print_status_code in (7, 8):
-                state_str = "IDLE"
-            elif print_status_code == 9:
-                state_str = "FINISH"
-            elif print_status_code == 14:
-                state_str = "FAILED"
-            elif print_status_code in (1, 12, 13, 27, 28, 29):
-                state_str = "RUNNING"
-                stg_cur = 0
-            elif print_status_code is not None and print_status_code != 0:
-                state_str = "PREPARE"
-                # Map Elegoo preparation sub-states to Bambu stage codes for granular UI stage names
-                ELEGOO_PREP_STAGES = {
-                    10: 52,  # File Checking / Checking Material
-                    11: 44,  # Printer Checking / Auto Check: Platform
-                    15: 1,   # Auto Bed Leveling
-                    16: 2,   # Heatbed / Nozzle Preheating
-                    17: 3,   # Resonance Testing / Vibration Compensation
-                    18: 74,  # Starting Print / Preparing
-                }
-                stg_cur = ELEGOO_PREP_STAGES.get(print_status_code, 74)
-
-            self.state.state = state_str
-            self.state.stg_cur = stg_cur
-
-            if state_str == "FINISH" and not self.state.subtask_name:
-                if self._last_known_job_name:
-                    self.state.subtask_name = self._last_known_job_name
-                    self.state.current_print = self._last_known_job_name
-                    self.state.gcode_file = self._last_known_job_name
-                else:
-                    asyncio.create_task(self._recover_finished_job_name())
-
-            # Trigger state callbacks
-            if state_str in ("RUNNING", "PREPARE") and not self._was_running:
-                self._was_running = True
-                self._completion_triggered = False
-                if self.on_print_start:
-                    self.on_print_start({
-                        "filename": self.state.current_print,
-                        "subtask_name": self.state.subtask_name,
-                        "remaining_time": self.state.remaining_time,
-                    })
-
-            if state_str == "FINISH" and not self._completion_triggered:
-                self._completion_triggered = True
-                self._was_running = False
-                if self.on_print_complete:
-                    self.on_print_complete({
-                        "filename": self.state.current_print,
-                        "subtask_name": self.state.subtask_name or self.state.current_print,
-                        "status": "completed",
-                    })
-
-            if state_str in ("IDLE", "FAILED"):
-                self._was_running = False
-                self._completion_triggered = False
-                self.state.current_print = ""
-                self.state.subtask_name = ""
-                self.state.gcode_file = ""
-            elif state_str == "FINISH":
-                self._was_running = False
-                # Do NOT clear current_print or subtask_name in FINISH state (waiting for plate clear)
-                # and do NOT reset _completion_triggered to false to avoid repeated callbacks.
-
-
-
-            if self.state.layer_num != self._last_layer_num:
-                self._last_layer_num = self.state.layer_num
-                if self.on_layer_change:
-                    self.on_layer_change(self.state.layer_num)
-
-        bed_temp = self.state.temperatures.get("bed", 0.0)
-        if abs(bed_temp - self._last_bed_temp) > 0.1:
-            self._last_bed_temp = bed_temp
-            if self.on_bed_temp_update:
-                self.on_bed_temp_update(bed_temp)
+        if state_str == "FINISH" and not self.state.subtask_name and not self.state_machine._last_known_job_name:
+            asyncio.create_task(self._recover_finished_job_name())
 
         # Trigger AMS/Canvas state updates
         if hasattr(self._printer, "canvas_status") and self._loop:
             self._loop.create_task(self._update_canvas_status())
 
-        if self.on_state_change:
-            self.on_state_change(self.state)
+        # Delegate lifecycle evaluation & callbacks to shared state machine
+        self.state_machine.process_transition(
+            state_str=state_str,
+            current_file=current_file,
+            stage_code=stg_cur,
+            total_layers_from_frame=total_layers,
+        )
 
     async def _recover_finished_job_name(self):
         if not self._printer or not hasattr(self._printer, "print_history"):
@@ -495,10 +451,8 @@ class ElegooCentauriClient:
         if not self._printer:
             logger.error("ElegooCentauriClient: cannot start_print on %s — printer client not connected", self.ip_address)
             return False
-        # Optimistically record filename on state so current_print is available during PREPARE
-        self.state.current_print = filename
-        self.state.subtask_name = filename
-        self.state.gcode_file = filename
+        # Optimistically record dispatch on state_machine
+        self.state_machine.record_dispatch(filename=filename)
         auto_level = bed_levelling != "off" if isinstance(bed_levelling, str) else bool(bed_levelling)
         platform_type = map_bed_type_to_elegoo_platform_type(bed_type)
         logger.info(

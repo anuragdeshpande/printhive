@@ -68,6 +68,43 @@ class TestElegooClientContract:
         except TypeError as exc:
             pytest.fail(f"ElegooCentauriClient.{method_name} failed with unexpected kwargs: {exc}")
 
+    def test_elegoo_update_state_when_print_info_is_none(self, client):
+        """Elegoo status updates must process print_status even if print_info is None."""
+        on_start = MagicMock()
+        client.state_machine.on_print_start = on_start
+        client.state_machine.record_dispatch(filename="bench.gcode")
+
+        # Fake Status with print_info = None and print_status = 15 (auto bed leveling -> PREPARE)
+        fake_status = MagicMock()
+        fake_status.print_info = None
+        fake_status.print_status = 15
+        fake_status.temp_nozzle = 210.0
+        fake_status.temp_nozzle_target = 210.0
+        fake_status.temp_bed = 60.0
+        fake_status.temp_bed_target = 60.0
+        fake_status.temp_chamber = 0.0
+        fake_status.temp_chamber_target = 0.0
+        fake_status.fan_speed = {}
+        fake_status.light = {}
+
+        client._update_state(fake_status)
+
+        assert client.state.state == "PREPARE"
+        assert client.state.stg_cur == 1  # 15 mapped to Bambu stage 1 (bed leveling)
+        assert client.state.current_print == "bench.gcode"
+        assert client.state.subtask_id == client.last_dispatch_subtask_id
+        on_start.assert_called_once()
+        assert on_start.call_args[0][0]["filename"] == "bench.gcode"
+
+    def test_elegoo_start_print_records_subtask_id(self, client):
+        """start_print must mint a subtask_id on client and state_machine."""
+        assert client.last_dispatch_subtask_id is None
+        res = client.start_print("my_print.gcode")
+        assert res is True
+        assert client.last_dispatch_subtask_id is not None
+        assert client.state.subtask_id == client.last_dispatch_subtask_id
+        assert client.state.current_print == "my_print.gcode"
+
 
 class TestFlashforgeClientContract:
     @pytest.fixture

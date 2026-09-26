@@ -7,6 +7,7 @@ import urllib.request
 import urllib.parse
 
 from backend.app.services.bambu_mqtt import PrinterState, NozzleInfo, PrintOptions
+from backend.app.services.printer_state_machine import PrinterStateMachine
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,17 @@ class FlashforgeClient:
         self.on_print_running_observed = on_print_running_observed
         self.on_finish_photo_moment = on_finish_photo_moment
 
-        self.state = PrinterState()
+        self.state_machine = PrinterStateMachine(
+            serial_number=serial_number,
+            on_state_change=on_state_change,
+            on_print_start=on_print_start,
+            on_print_complete=on_print_complete,
+            on_print_running_observed=on_print_running_observed,
+            on_layer_change=on_layer_change,
+            on_bed_temp_update=on_bed_temp_update,
+            on_finish_photo_moment=on_finish_photo_moment,
+        )
+        self.state = self.state_machine.state
         # Ensure multi-toolhead nozzle objects (default 2 nozzles for Creator 5 IDEX)
         self.state.nozzles = [
             NozzleInfo(nozzle_type="hardened_steel", nozzle_diameter="0.4"),
@@ -64,11 +75,11 @@ class FlashforgeClient:
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._poll_task: asyncio.Task | None = None
-        self._was_running = False
-        self._completion_triggered = False
-        self._last_layer_num = 0
-        self._last_bed_temp = 0.0
         self.port = 8898
+
+    @property
+    def last_dispatch_subtask_id(self) -> str | None:
+        return self.state_machine.last_dispatch_subtask_id
 
     @property
     def connected(self) -> bool:
@@ -96,9 +107,7 @@ class FlashforgeClient:
         """Clean up tasks and set connected = False."""
         if self._poll_task:
             self._poll_task.cancel()
-        self.state.connected = False
-        if self.on_state_change:
-            self.on_state_change(self.state)
+        self.state_machine.set_connected(False)
 
     async def _async_poll_loop(self):
         """Poll Flashforge printer status endpoint periodically."""
@@ -260,54 +269,18 @@ class FlashforgeClient:
             else:
                 stg_cur = 74  # Preparing
 
-        self.state.state = state_str
-        self.state.stg_cur = stg_cur
-
-        # Callbacks
-        if state_str in ("RUNNING", "PREPARE") and not self._was_running:
-            self._was_running = True
-            if self.on_print_start:
-                self.on_print_start({
-                    "filename": self.state.current_print,
-                    "subtask_name": self.state.subtask_name,
-                    "remaining_time": self.state.remaining_time,
-                })
-
-        if state_str == "FINISH" and not self._completion_triggered:
-            self._completion_triggered = True
-            if self.on_print_complete:
-                self.on_print_complete({
-                    "filename": self.state.current_print,
-                    "subtask_name": self.state.subtask_name or self.state.current_print,
-                    "status": "completed",
-                })
-
-
-        if state_str in ("IDLE", "FINISH", "FAILED"):
-            self._was_running = False
-            self._completion_triggered = False
-            self.state.current_print = ""
-            self.state.subtask_name = ""
-            self.state.gcode_file = ""
-
-        if self.state.layer_num != self._last_layer_num:
-            self._last_layer_num = self.state.layer_num
-            if self.on_layer_change:
-                self.on_layer_change(self.state.layer_num)
-
-        if abs(bed - self._last_bed_temp) > 0.1:
-            self._last_bed_temp = bed
-            if self.on_bed_temp_update:
-                self.on_bed_temp_update(bed)
-
-        if self.on_state_change:
-            self.on_state_change(self.state)
+        # Delegate lifecycle evaluation & callbacks to shared state machine
+        self.state_machine.process_transition(
+            state_str=state_str,
+            current_file=filename,
+            stage_code=stg_cur,
+            raw_data=data,
+            total_layers_from_frame=self.state.total_layers,
+        )
 
     def start_print(self, filename: str, **kwargs) -> bool:
         """Start printing a file on the Flashforge printer."""
-        self.state.current_print = filename
-        self.state.subtask_name = filename
-        self.state.gcode_file = filename
+        self.state_machine.record_dispatch(filename=filename)
         self.state.state = "PREPARE"
         self.state.stg_cur = 74
         return self._send_command({"cmd": "start_print", "file": filename})
