@@ -271,3 +271,134 @@ class TestElegooCentauriClient:
         # Ensure pong handling does not crash or raise JSONDecodeError
         p._handle_frame("pong")
         p._handle_frame(b"PONG")
+
+    @pytest.mark.asyncio
+    async def test_wait_for_upload_ready_waits_for_file_checking(self, client, monkeypatch):
+        """Regression test: wait_for_upload_ready must poll while CurrentStatus contains 8 (FILE_CHECKING)
+        or PrintStatus == 10, matching OrcaSlicer ElegooLink::checkResult."""
+        monkeypatch.setattr("backend.app.services.elegoo_client.asyncio.sleep", AsyncMock())
+
+        status_checking_1 = Status.from_payload({"CurrentStatus": [8], "PrintInfo": {"Status": 0}})
+        status_checking_2 = Status.from_payload({"CurrentStatus": [0], "PrintInfo": {"Status": 10}})
+        status_ready = Status.from_payload({"CurrentStatus": [0], "PrintInfo": {"Status": 0}})
+
+        mock_printer = MagicMock()
+        mock_printer.status = AsyncMock(side_effect=[status_checking_1, status_checking_2, status_ready])
+        client._printer = mock_printer
+
+        await client.wait_for_upload_ready("job.gcode", timeout=10.0, settle_delay=0.1)
+
+        assert mock_printer.status.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_start_print_async_retries_on_ack2_file_not_found(self, client, monkeypatch):
+        """Regression test: if CC1 rejects START_PRINT with Ack=2 ('File not found on printer (/local/ storage)')
+        immediately after HTTP upload while moving the file into /local/, start_print_async must retry and succeed."""
+        from pycentauri import PrinterError
+
+        monkeypatch.setattr("backend.app.services.elegoo_client.asyncio.sleep", AsyncMock())
+
+        mock_printer = MagicMock()
+        mock_printer.start_print = AsyncMock(
+            side_effect=[
+                PrinterError("Start print rejected by printer: File not found on printer (/local/ storage)"),
+                PrinterError("Start print rejected by printer: File not found on printer (/local/ storage)"),
+                MagicMock(),
+            ]
+        )
+        client._printer = mock_printer
+        client.state.connected = True
+
+        result = await client.start_print_async("job.gcode", bed_type="Cool Plate", retry_delay=0.01)
+
+        assert result is True
+        assert mock_printer.start_print.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_start_print_async_waits_for_inflight_reconnect(self, client):
+        """Regression test: if _printer is temporarily None during a reconnect when start_print_async
+        is called, it must wait for the reconnect to complete instead of immediately failing."""
+        mock_printer = MagicMock()
+        mock_printer.start_print = AsyncMock(return_value=MagicMock())
+
+        client._printer = None
+        client.state.connected = False
+
+        async def _DelayedReconnect():
+            await asyncio.sleep(0.05)
+            client._printer = mock_printer
+            client.state.connected = True
+
+        reconnect_task = asyncio.create_task(_DelayedReconnect())
+        client._connect_task = reconnect_task
+
+        result = await client.start_print_async("job.gcode")
+        await reconnect_task
+
+        assert result is True
+        mock_printer.start_print.assert_awaited_once()
+
+    @patch("backend.app.services.elegoo_client.elegoo_discover", new_callable=AsyncMock)
+    @patch("backend.app.services.elegoo_client.connect_auto", new_callable=AsyncMock)
+    @pytest.mark.asyncio
+    async def test_force_reconnect_closes_previous_websocket_and_preserves_mainboard_id(
+        self, mock_connect, mock_discover, client
+    ):
+        """Regression test: force_reconnect_stale_session must close the old Printer WebSocket
+        before opening a new connection (preventing leaked sockets and HTTP 500) and reuse cached mainboard_id."""
+        close_order = []
+
+        old_printer = MagicMock()
+        old_printer.mainboard_id = "mb-cached-123"
+
+        async def _old_close():
+            close_order.append("old_closed")
+
+        old_printer.close = AsyncMock(side_effect=_old_close)
+
+        new_printer = MagicMock()
+        new_printer.mainboard_id = "mb-cached-123"
+        new_printer.close = AsyncMock()
+
+        async def _new_watch():
+            if False:
+                yield
+            raise asyncio.CancelledError()
+
+        new_printer.watch = _new_watch
+
+        async def _connect_side_effect(*args, **kwargs):
+            close_order.append("new_connected")
+            return new_printer
+
+        mock_connect.side_effect = _connect_side_effect
+
+        client._loop = asyncio.get_running_loop()
+        client._cached_mainboard_id = "mb-cached-123"
+        client._printer = old_printer
+        client.state.connected = True
+
+        async def _stuck_task():
+            try:
+                await asyncio.sleep(60)
+            finally:
+                await client._close_printer(old_printer)
+
+        client._connect_task = asyncio.create_task(_stuck_task())
+        await asyncio.sleep(0)
+
+        client.force_reconnect_stale_session("test reconnect")
+        assert client.state.connected is False
+        await client._connect_task
+
+        assert close_order == ["old_closed", "new_connected"]
+        old_printer.close.assert_awaited_once()
+        mock_discover.assert_not_called()
+        mock_connect.assert_awaited_once_with(
+            "192.168.1.150",
+            access_code="Abcd12",
+            connect_timeout=5.0,
+            enable_control=True,
+            mainboard_id="mb-cached-123",
+        )
+

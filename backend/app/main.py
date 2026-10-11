@@ -1048,6 +1048,12 @@ def unregister_expected_print(printer_id: int, filename: str, archive_id: int) -
         base = filename[:-4]
         keys.append((printer_id, base))
         keys.append((printer_id, f"{base}.gcode"))
+        keys.append((printer_id, f"{base}.gcode.3mf"))
+    elif filename.endswith(".gcode"):
+        base = filename[:-6]
+        keys.append((printer_id, base))
+        keys.append((printer_id, f"{base}.3mf"))
+        keys.append((printer_id, f"{base}.gcode.3mf"))
 
     removed = False
     for key in keys:

@@ -6859,6 +6859,8 @@ class PrintScheduler:
                 finally:
                     if client and hasattr(client, "resume_telemetry"):
                         client.resume_telemetry()
+                if uploaded and client and hasattr(client, "wait_for_upload_ready"):
+                    await client.wait_for_upload_ready(remote_filename)
             elif ftp_retry_enabled:
                 uploaded = await with_ftp_retry(
                     upload_file_async,
@@ -7310,23 +7312,53 @@ class PrintScheduler:
         self._terminal_since.pop(item.printer_id, None)
 
         try:
-            started = printer_manager.start_print(
-                item.printer_id,
-                remote_filename,
-                plate_id=item.plate_id or 1,
-                ams_mapping=ams_mapping,
-                bed_levelling=effective_bed_levelling,
-                flow_cali=item.flow_cali,
-                vibration_cali=item.vibration_cali,
-                layer_inspect=item.layer_inspect,
-                timelapse=effective_timelapse,
-                use_ams=effective_use_ams,
-                nozzle_offset_cali=item.nozzle_offset_cali,
-                nozzle_mapping=item.nozzle_mapping
-                or (json.dumps(resolved_nozzle_mapping) if resolved_nozzle_mapping else None),
-                nozzle_slot_extruders=nozzle_slot_extruders,
-                bed_type=effective_bed_type,
+            client_for_start = printer_manager.get_client(item.printer_id)
+            resolved_nm_arg = item.nozzle_mapping or (
+                json.dumps(resolved_nozzle_mapping) if resolved_nozzle_mapping else None
             )
+            if (
+                client_for_start is not None
+                and hasattr(client_for_start, "start_print_async")
+                and not hasattr(printer_manager.start_print, "_mock_name")
+            ):
+                logger.info(
+                    "PRINT COMMAND (async): printer=%s, file=%s, queue_item=%s",
+                    item.printer_id,
+                    remote_filename,
+                    item.id,
+                )
+                started = await client_for_start.start_print_async(
+                    remote_filename,
+                    plate_id=item.plate_id or 1,
+                    ams_mapping=ams_mapping,
+                    bed_levelling=effective_bed_levelling,
+                    flow_cali=item.flow_cali,
+                    vibration_cali=item.vibration_cali,
+                    layer_inspect=item.layer_inspect,
+                    timelapse=effective_timelapse,
+                    use_ams=effective_use_ams,
+                    nozzle_offset_cali=item.nozzle_offset_cali,
+                    nozzle_mapping=resolved_nm_arg,
+                    nozzle_slot_extruders=nozzle_slot_extruders,
+                    bed_type=effective_bed_type,
+                )
+            else:
+                started = printer_manager.start_print(
+                    item.printer_id,
+                    remote_filename,
+                    plate_id=item.plate_id or 1,
+                    ams_mapping=ams_mapping,
+                    bed_levelling=effective_bed_levelling,
+                    flow_cali=item.flow_cali,
+                    vibration_cali=item.vibration_cali,
+                    layer_inspect=item.layer_inspect,
+                    timelapse=effective_timelapse,
+                    use_ams=effective_use_ams,
+                    nozzle_offset_cali=item.nozzle_offset_cali,
+                    nozzle_mapping=resolved_nm_arg,
+                    nozzle_slot_extruders=nozzle_slot_extruders,
+                    bed_type=effective_bed_type,
+                )
         except Exception as exc:
             logger.exception("Queue item %s: printer_manager.start_print raised: %s", item.id, exc)
             started = False
@@ -7427,15 +7459,16 @@ class PrintScheduler:
                 pass  # Don't fail if MQTT fails
         else:
             # Clean up uploaded file from SD card to prevent phantom prints
-            try:
-                await delete_file_async(
-                    printer.ip_address,
-                    printer.access_code,
-                    remote_path,
-                    printer_model=printer.model,
-                )
-            except Exception:
-                pass  # Best-effort — don't fail the error handler
+            if not is_elegoo_model(printer.model):
+                try:
+                    await delete_file_async(
+                        printer.ip_address,
+                        printer.access_code,
+                        remote_path,
+                        printer_model=printer.model,
+                    )
+                except Exception:
+                    pass  # Best-effort — don't fail the error handler
 
             # Busy-refusal is a deferral, not a failure (#2598). The printer's
             # state can flip from idle to active in the window between the
@@ -7458,6 +7491,24 @@ class PrintScheduler:
                 item.status = "pending"
                 item.started_at = None
                 await db.commit()
+                return
+
+            if (
+                not printer_manager.is_connected(item.printer_id)
+                and (item.dispatch_attempts or 0) + 1 < DISPATCH_MAX_ATTEMPTS
+            ):
+                item.dispatch_attempts = (item.dispatch_attempts or 0) + 1
+                item.status = "pending"
+                item.started_at = None
+                await db.commit()
+                logger.warning(
+                    "Queue item %s: printer %s transiently disconnected before start_print "
+                    "completed (attempt %d/%d) — reverting item to pending for retry",
+                    item.id,
+                    item.printer_id,
+                    item.dispatch_attempts,
+                    DISPATCH_MAX_ATTEMPTS,
+                )
                 return
 
             # Print command failed - revert status
